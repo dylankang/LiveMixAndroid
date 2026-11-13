@@ -1,0 +1,22 @@
+{
+  "name": "live-mix-assistant",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "vite build",
+    "build:app": "vite build --mode app",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview --host"
+  },
+  "dependencies": {
+    "@evenrealities/even_hub_sdk": "latest"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-basic-ssl": "latest",
+    "mqtt": "5.10.1",
+    "typescript": "~5.6.3",
+    "vite": "^5.4.11"
+  }
+}

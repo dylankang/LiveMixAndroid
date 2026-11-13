@@ -62,3 +62,12 @@ android {
     }
 }
 // 외부 라이브러리 없이 안드로이드 기본 API만 사용
+
+// 웹앱이 앱에 포함되어 있지 않으면 빈 앱이 만들어지므로 빌드 전에 중단 (tools/build-web.sh 로 생성)
+tasks.matching { it.name == 'preBuild' }.configureEach {
+    doFirst {
+        if (!file('src/main/assets/www/index.html').exists() || !file('src/main/assets/www/mqtt.min.js').exists()) {
+            throw new GradleException('웹앱이 아직 포함되지 않았습니다. 먼저 `bash tools/build-web.sh` 를 실행하세요 (GitHub Actions 는 자동 실행).')
+        }
+    }
+}

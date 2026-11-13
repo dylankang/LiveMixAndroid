@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Live Mix Assistant</title>
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#000000" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <link rel="apple-touch-icon" href="/icon-192.png" />
+  <!-- MQTT.js CDN: 공개 브로커(WebSocket)로 크롬 분석기 ↔ Even Hub 수신기 자동 연결 -->
+  <script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+</head>
+<body>
+  <main id="app">
+    <header>
+      <h1>Live Mix Assistant <small>G2</small></h1>
+      <div id="status" class="status">대기 중</div>
+    </header>
+
+    <section class="card">
+      <div class="row">
+        <label>AI 서비스
+          <select id="provider"></select>
+        </label>
+        <label>모델
+          <select id="model"></select>
+        </label>
+      </div>
+      <input id="customModel" type="text" placeholder="모델 ID 직접 입력" hidden />
+      <label>API Key
+        <input id="apiKey" type="password" autocomplete="off" placeholder="선택한 AI의 API Key" />
+      </label>
+      <div class="hint">키는 이 기기의 브라우저(localStorage)에만 저장되며 제조사 API로 직접 전송됩니다.</div>
+    </section>
+
+    <section class="card">
+      <label>오디오 입력 장치
+        <div class="devrow">
+          <select id="device"></select>
+          <button id="findBtn" type="button">🔄 장치 찾기</button>
+        </div>
+      </label>
+      <div class="row">
+        <button id="startBtn" class="primary">시작</button>
+        <button id="resetBtn">쿨다운 초기화</button>
+      </div>
+      <div id="inputInfo" class="hint"></div>
+    </section>
+
+    <section class="card">
+      <h2>스테레오 레벨 미터 <small>-60 ~ 0 dBFS</small></h2>
+      <div class="meter" data-ch="L">
+        <span class="ch">L</span>
+        <div class="bar"><div class="rms"></div><div class="peak"></div>
+          <i style="left:0%">-60</i><i style="left:50%">-30</i><i style="left:75%">-15</i><i style="left:90%">-6</i>
+        </div>
+        <span class="clip">CLIP</span>
+        <span class="val">-∞</span>
+      </div>
+      <div class="meter" data-ch="R">
+        <span class="ch">R</span>
+        <div class="bar"><div class="rms"></div><div class="peak"></div></div>
+        <span class="clip">CLIP</span>
+        <span class="val">-∞</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>HUD (G2 동기화 · 5줄)</h2>
+      <div id="hud">
+        <div class="hud-line fb" id="hud0"></div>
+        <div class="hud-line" id="hud1"></div>
+        <div class="hud-line" id="hud2"></div>
+        <div class="hud-line" id="hud3"></div>
+        <div class="hud-line" id="hud4"></div>
+      </div>
+      <div id="cooldownInfo" class="hint"></div>
+    </section>
+
+    <section class="card">
+      <h2>밴드 (최근 20초)</h2>
+      <table id="bandTable"></table>
+    </section>
+  </main>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

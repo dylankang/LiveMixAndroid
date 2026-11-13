@@ -11,3 +11,8 @@ captures/
 # 서명 키 (절대 커밋 금지)
 *.jks
 *.keystore
+
+# 웹 빌드 산출물 (빌드 때마다 새로 생성)
+web/node_modules
+web/dist
+app/src/main/assets/www
