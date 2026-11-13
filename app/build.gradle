@@ -1,0 +1,64 @@
+plugins {
+    id 'com.android.application'
+}
+
+// ── 버전: version.properties 한 곳에서 관리 (필요하면 -PversionName=1.2.3 -PversionCode=5 로 덮어쓰기)
+def versionProps = new Properties()
+rootProject.file('version.properties').withInputStream { versionProps.load(it) }
+def appVersionName = (project.findProperty('versionName') ?: versionProps.getProperty('VERSION_NAME', '1.0.0')).toString().trim()
+def appVersionCode = (project.findProperty('versionCode') ?: versionProps.getProperty('VERSION_CODE', '1')).toString().trim().toInteger()
+
+// ── Release 서명 키: 환경변수로만 받음 (키 파일·비밀번호는 저장소에 절대 넣지 않음. GitHub Secrets → 워크플로가 주입)
+def ksPath = System.getenv('KEYSTORE_FILE')
+def hasReleaseKey = ksPath && file(ksPath).exists() &&
+        System.getenv('KEYSTORE_PASSWORD') && System.getenv('KEY_ALIAS') && System.getenv('KEY_PASSWORD')
+
+android {
+    namespace 'com.livemix.g2'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.livemix.g2'
+        minSdk 26
+        targetSdk 34
+        versionCode appVersionCode
+        versionName appVersionName
+    }
+
+    signingConfigs {
+        if (hasReleaseKey) {
+            release {
+                storeFile file(ksPath)
+                storePassword System.getenv('KEYSTORE_PASSWORD')
+                keyAlias System.getenv('KEY_ALIAS')
+                keyPassword System.getenv('KEY_PASSWORD')
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (hasReleaseKey) {
+                signingConfig signingConfigs.release
+            } else if (project.findProperty('debugSignRelease') == 'true') {
+                signingConfig signingConfigs.debug   // 로컬 테스트용 (-PdebugSignRelease=true)
+            }
+            // 키가 없으면 서명 안 된 APK(app-release-unsigned)가 만들어짐 → CI는 이 경우 빌드 전에 중단
+        }
+    }
+
+    // APK 파일명: LiveMixAssistant-v<버전>.apk (Release) / LiveMixAssistant-v<버전>-debug.apk (Debug)
+    applicationVariants.all { variant ->
+        variant.outputs.all {
+            def suffix = variant.buildType.name == 'release' ? '' : "-${variant.buildType.name}"
+            outputFileName = "LiveMixAssistant-v${variant.versionName}${suffix}.apk"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+// 외부 라이브러리 없이 안드로이드 기본 API만 사용

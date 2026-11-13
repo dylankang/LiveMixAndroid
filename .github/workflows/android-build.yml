@@ -1,0 +1,166 @@
+# Live Mix Assistant — Android 자동 빌드 (Debug / Release)
+#  · 브랜치 Push            → Debug APK 빌드
+#  · 태그 Push (v1.0.1 등)  → Release APK 빌드(서명) + GitHub Releases 에 APK 첨부
+#  · 수동 실행(Run workflow) → debug / release / both 선택
+# 버전은 version.properties 한 곳에서만 관리 → APK 파일명 LiveMixAssistant-v<버전>.apk 에 자동 반영
+name: Android Build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '빌드 종류'
+        type: choice
+        options: [debug, release, both]
+        default: debug
+
+permissions:
+  contents: write   # 태그 빌드 시 GitHub Release 생성에 필요
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # 서명 정보는 GitHub Secrets 에서만 가져옴 (로그에는 자동 마스킹됨)
+      KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      KS_KEYPASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Decide what to build + read version
+        id: plan
+        run: |
+          set -e
+          NAME=$(grep -E '^VERSION_NAME=' version.properties | cut -d= -f2 | tr -d '[:space:]')
+          CODE=$(grep -E '^VERSION_CODE=' version.properties | cut -d= -f2 | tr -d '[:space:]')
+          [ -n "$NAME" ] && [ -n "$CODE" ] || { echo "::error::version.properties 에 VERSION_NAME / VERSION_CODE 가 필요합니다"; exit 1; }
+
+          DEBUG=false; RELEASE=false; PUBLISH=false
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            T="${{ github.event.inputs.build_type }}"
+            [ "$T" = "debug" ] || [ "$T" = "both" ] && DEBUG=true || true
+            [ "$T" = "release" ] || [ "$T" = "both" ] && RELEASE=true || true
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            RELEASE=true; PUBLISH=true
+            TAG="${GITHUB_REF_NAME#v}"
+            if [ "$TAG" != "$NAME" ]; then
+              echo "::error::태그(v$TAG)와 version.properties 의 VERSION_NAME($NAME)이 다릅니다. 파일의 버전을 올린 뒤 같은 번호로 태그하세요."
+              exit 1
+            fi
+          else
+            DEBUG=true
+          fi
+          {
+            echo "name=$NAME"; echo "code=$CODE"
+            echo "debug=$DEBUG"; echo "release=$RELEASE"; echo "publish=$PUBLISH"
+          } >> "$GITHUB_OUTPUT"
+          echo "버전 $NAME (code $CODE) · debug=$DEBUG release=$RELEASE publish=$PUBLISH"
+
+      - name: Check release signing secrets
+        if: steps.plan.outputs.release == 'true'
+        run: |
+          for v in KS_B64 KS_PASS KS_ALIAS KS_KEYPASS; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Release 서명용 GitHub Secret 이 없습니다 (${v}). README 의 'Release 서명 키 설정'을 먼저 진행하세요."
+              exit 1
+            fi
+          done
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      - name: Set up Gradle (cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Build Debug APK
+        if: steps.plan.outputs.debug == 'true'
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Build signed Release APK
+        if: steps.plan.outputs.release == 'true'
+        run: |
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          export KEYSTORE_FILE="$RUNNER_TEMP/release.jks"
+          export KEYSTORE_PASSWORD="$KS_PASS" KEY_ALIAS="$KS_ALIAS" KEY_PASSWORD="$KS_KEYPASS"
+          ./gradlew assembleRelease --stacktrace --no-daemon
+
+      - name: Verify Release APK signature
+        if: steps.plan.outputs.release == 'true'
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -n1)
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$APK"
+
+      - name: Remove keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks"
+
+      - name: Upload Debug APK
+        id: up_debug
+        if: steps.plan.outputs.debug == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveMixAssistant-v${{ steps.plan.outputs.name }}-debug
+          path: app/build/outputs/apk/debug/LiveMixAssistant-v${{ steps.plan.outputs.name }}-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Release APK
+        id: up_release
+        if: steps.plan.outputs.release == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveMixAssistant-v${{ steps.plan.outputs.name }}
+          path: app/build/outputs/apk/release/LiveMixAssistant-v${{ steps.plan.outputs.name }}.apk
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release (tag builds)
+        id: gh_release
+        if: steps.plan.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/release/LiveMixAssistant-v${{ steps.plan.outputs.name }}.apk
+          generate_release_notes: true
+
+      - name: Download links summary
+        if: always()
+        run: |
+          {
+            echo "## 📦 Live Mix Assistant v${{ steps.plan.outputs.name }} (versionCode ${{ steps.plan.outputs.code }})"
+            echo
+            if [ -n "${{ steps.up_debug.outputs.artifact-url }}" ]; then
+              echo "- 🧪 **Debug APK** (LiveMixAssistant-v${{ steps.plan.outputs.name }}-debug.apk): [다운로드](${{ steps.up_debug.outputs.artifact-url }})"
+            fi
+            if [ -n "${{ steps.up_release.outputs.artifact-url }}" ]; then
+              echo "- 🚀 **Release APK** (LiveMixAssistant-v${{ steps.plan.outputs.name }}.apk): [다운로드](${{ steps.up_release.outputs.artifact-url }})"
+            fi
+            if [ -n "${{ steps.gh_release.outputs.url }}" ]; then
+              echo "- 🔗 **GitHub Release 페이지** (로그인 없이 받을 수 있는 영구 링크): ${{ steps.gh_release.outputs.url }}"
+            fi
+            echo
+            echo "> Artifact 다운로드는 GitHub 로그인이 필요하고 zip 으로 내려받아집니다. 폰에 바로 받으려면 태그 빌드의 Releases 링크를 쓰세요."
+          } >> "$GITHUB_STEP_SUMMARY"
