@@ -45,6 +45,7 @@ import java.util.Map;
 public class MainActivity extends Activity {
     private static final String PREFS = "livemix";
         private static final String KEY_BATTERY_ASKED = "batteryAsked";
+    private static final String KEY_RECEIVER_ON = "receiverOn";
     private static final int REQ_AUDIO = 1;
     private static final int REQ_NOTIFY = 2;
     private static final int REQ_FILE = 3;
@@ -128,7 +129,8 @@ public class MainActivity extends Activity {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIFY);
         }
 
-        LocalServer.ensureStarted(this);   // Even 앱(수신기)용 폰 내부 주소
+        // 수신기용 폰 내부 서버는 사용자가 [G2 수신기 주소] 메뉴를 한 번 연 뒤부터만 켠다 (기본은 꺼짐)
+        if (getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_RECEIVER_ON, false)) LocalServer.ensureStarted(this);
         if (savedInstanceState != null) webView.restoreState(savedInstanceState);
         else webView.loadUrl(WebAssets.BASE);
     }
@@ -204,23 +206,23 @@ public class MainActivity extends Activity {
         p.edit().putBoolean(KEY_BATTERY_ASKED, true).apply();
         new AlertDialog.Builder(this)
                 .setTitle("화면이 꺼져도 분석 유지")
-                .setMessage("안드로이드가 화면 꺼짐 중에 앱을 멈추지 않도록 배터리 최적화에서 이 앱을 제외할까요?")
-                .setPositiveButton("제외하기", (d, w) -> openBatterySettings())
+                .setMessage("화면이 꺼진 동안에도 분석을 계속하려면 배터리 설정 목록에서 'Live Mix Assistant'를 찾아 '최적화 안 함'으로 바꿔 주세요. (선택 사항)")
+                .setPositiveButton("설정 열기", (d, w) -> openBatterySettings())
                 .setNegativeButton("나중에", null)
                 .show();
     }
 
-    @SuppressLint("BatteryLife")
+    // 특수 권한(REQUEST_IGNORE_BATTERY_OPTIMIZATIONS) 없이 시스템 배터리 최적화 목록만 연다
     private void openBatterySettings() {
-        try {
-            startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName())));
-        } catch (Exception e) {
-            try { startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)); } catch (Exception ignored) { }
+        try { startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)); }
+        catch (Exception e) {
+            try { startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName()))); } catch (Exception ignored) { }
         }
     }
 
     // ───────── Even 앱(수신기)에 입력할 주소 ─────────
     private void showReceiverUrl() {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_RECEIVER_ON, true).apply();
         LocalServer.ensureStarted(this);
         final String url = LocalServer.receiverUrl();
         if (url == null) { Toast.makeText(this, "수신기 서버를 시작하지 못했습니다", Toast.LENGTH_LONG).show(); return; }
