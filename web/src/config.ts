@@ -42,8 +42,8 @@ export const FB = {
   levelDropDb: 2,       // 최대 레벨 대비 이만큼 떨어지면 "레벨 하락"으로 보고 리셋
 } as const;
 
-export const MAX_LINE_CHARS = 20;   // 프롬프트에 전달되는 글자 수 규칙
-export const HARD_CAP_CHARS = 22;   // 모델이 규칙을 어길 때 HUD 폭 보호용 절단선
+export const MAX_LINE_CHARS = 22;   // 프롬프트에 전달되는 글자 수 규칙 (G2 HUD 한 줄)
+export const HARD_CAP_CHARS = 22;   // 모델이 규칙을 어길 때 HUD 폭 보호용 절단선 (22자 초과분은 자름)
 export const QUEUE_SIZE = 4;
 
 /** 피드백 민감도 슬라이더 t(0=둔감 … 1=예민) → 판정 파라미터. t=0.5가 기본(돌출 20dB / 1.5초 / -35dBFS) */

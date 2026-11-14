@@ -1,5 +1,5 @@
 import { AudioEngine, KeepAliveAudio, type BandStat, type InputMode, listInputs, requestMicPermission, systemCaptureSupported, DEFAULT_INPUT_ID, TRIM } from './audio';
-import { AdviceManager } from './advice';
+import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
 import { callAI, parseReply, buildSystemPrompt, isQuotaError, type Genre } from './ai';
 import { evaluateBalance, TOL_RANGE } from './balance';
 import { fbParamsFor } from './config';
@@ -144,6 +144,33 @@ let intervalSec = clamp(Math.round(parseFloat(ls.get('lm.interval', String(INTER
   paintTol(); paintFb(); paintInt();
 }
 
+// ───────── ⚙️ 설정: 쿨다운 상세 설정 ─────────
+{
+  const hold = $<HTMLInputElement>('cdHold'), trig = $<HTMLSelectElement>('cdTrigger'), scope = $<HTMLSelectElement>('cdScope');
+  const holdSec = clamp(parseFloat(ls.get('lm.cdHold', String(COOLDOWN_DEFAULT.holdSec))), 0, 600);
+  const trigger = (['1', '2', '3'].includes(ls.get('lm.cdTrig', '')) ? +ls.get('lm.cdTrig') : COOLDOWN_DEFAULT.trigger) as 1 | 2 | 3;
+  const sc = (ls.get('lm.cdScope', COOLDOWN_DEFAULT.scope) === 'strict' ? 'strict' : 'standard') as CooldownScope;
+  hold.value = String(holdSec); trig.value = String(trigger); scope.value = sc;
+  const fmt = (v: number) => (v <= 0 ? '끄기 (쿨다운 미적용)' : v < 60 ? `${v}초` : `${Math.floor(v / 60)}분${v % 60 ? ` ${v % 60}초` : ''} (${v}초)`);
+  const paint = () => { $('cdHoldInfo').textContent = fmt(+hold.value); };
+  hold.oninput = () => { ls.set('lm.cdHold', hold.value); advice.setCooldown({ holdSec: +hold.value }); paint(); renderCooldown(); };
+  trig.onchange = () => { ls.set('lm.cdTrig', trig.value); advice.setCooldown({ trigger: +trig.value as 1 | 2 | 3 }); };
+  scope.onchange = () => { ls.set('lm.cdScope', scope.value); advice.setCooldown({ scope: scope.value as CooldownScope }); renderCooldown(); };
+  advice.setCooldown({ holdSec, trigger, scope: sc });
+  paint();
+}
+
+// ───────── ⚙️ 설정: 노이즈 게이트 (실시간 재생음 모드) ─────────
+let gateDb = clamp(parseFloat(ls.get('lm.gate', '-38')), -55, -20);
+{
+  const g = $<HTMLInputElement>('gateSlider');
+  g.value = String(gateDb);
+  const paint = () => { $('gateInfo').textContent = `${gateDb} dBFS`; };
+  g.oninput = () => { gateDb = +g.value; ls.set('lm.gate', String(gateDb)); applyGate(); paint(); };
+  paint();
+}
+function applyGate() { engine.setGate(mode === 'monitor', gateDb); }
+
 // ───────── 2) 오디오 입력 모드: 🎛️ 콘솔 2-Track (1순위·기본) / ▶️ 실시간 유튜브·재생음 (2순위) ─────────
 let mode: InputMode = ls.get('lm.inmode', 'console') === 'monitor' ? 'monitor' : 'console';
 /** Auto-Trim 은 모드별로 따로 기억: 콘솔 기본 OFF(Raw dBFS) · 모니터링 기본 ON */
@@ -156,7 +183,7 @@ const findBtn = $<HTMLButtonElement>('findBtn');
 function monitorHintText(): string {
   return systemCaptureSupported()
     ? '🖥️ 시작을 누르면 공유 창이 열립니다. 유튜브 탭(또는 전체 화면)을 고르고 "오디오 공유"를 켜 주세요. 재생 중인 소리를 디지털로 직접 분석합니다.'
-    : '📱 모바일 브라우저는 다른 앱의 재생음을 직접 받을 수 없어, 폰 마이크로 지금 들리는 소리를 수음해 분석합니다. Auto-Trim이 폰 볼륨 차이를 자동 보정합니다. (스피커·마이크 특성에 따른 음색 차이는 남을 수 있어요)';
+    : '📱 USB 인터페이스(ZOOM AMS-24 등)가 연결돼 있으면 그 입력(루프백)을 먼저 열고, 없으면 폰 마이크로 들리는 소리를 수음합니다. Auto-Trim이 볼륨 차이를 보정하고, 노이즈 게이트가 무음일 때 방 소음 분석을 막습니다.';
 }
 
 function paintMode() {
@@ -178,6 +205,7 @@ document.querySelectorAll<HTMLButtonElement>('#modeSeg button').forEach(b => {
     if (m === mode || starting) return;
     mode = m; ls.set('lm.inmode', m);
     engine.setAutoTrim(trimFor(m));
+    applyGate();
     paintMode();
     if (!running) return;
     // 분석 중 모드 전환: 이 클릭(사용자 동작) 안에서 바로 새 입력을 연다 (공유 창/권한 팝업 허용)
@@ -269,6 +297,7 @@ $('trimBtn').onclick = () => {
 };
 engine.setAutoTrim(trimFor(mode));
 engine.setThru(false);
+applyGate();
 paintMode();
 
 $('resetBtn').onclick = () => { advice.resetCooldown(); renderCooldown(); setStatus('쿨다운 초기화됨'); };
@@ -276,12 +305,19 @@ $('resetBtn').onclick = () => { advice.resetCooldown(); renderCooldown(); setSta
 // ───────── 렌더링 (폰 + 글래스 5줄 동기화) ─────────
 function genreLabel(): string {
   if (!genre) return '';
-  const c = genre.category;
-  return c.startsWith('단일 악기') ? `🎧 감지된 상태: ${genre.instrument || '단일 악기'} Solo`
-    : c.startsWith('스피치') ? '🎤 감지된 상태: 스피치/설교'
-    : `🎵 감지된 장르: ${c} (Full Mix)`;
+  return genre.kind === 'solo' ? `🎧 감지된 상태: ${genre.instrument || '단일 악기'} Solo`
+    : genre.kind === 'speech' ? '🎤 감지된 상태: 스피치/설교'
+    : `🎵 감지된 장르: ${genre.category}`;
 }
-function paintGenre() { if (!mirroring) $('genreBadge').textContent = genreText(genreLabel(), genreAt); }
+const IDLE_TEXT = '⏸️ 신호 대기 중 (음악이 재생되면 자동 분석)';
+function paintGenre() {
+  if (mirroring) return;
+  const b = $('genreBadge');
+  b.classList.toggle('idle', running && engine.idle);
+  b.textContent = running && engine.idle ? IDLE_TEXT : genreText(genreLabel(), genreAt);
+}
+/** 수신기에 보내는 배지 문구 (무음 대기 중이면 대기 표시) */
+const badgeForSend = () => (engine.idle ? IDLE_TEXT : genreLabel());
 
 function hudLines(): string[] {
   const lines = [fbText, ...advice.lines()];
@@ -298,9 +334,26 @@ function render() {
   paintHud(lines);
   glasses.update(lines);
 }
+/** HUD 아래 쿨다운 태그: [건반 EQ] 85s × — 터치하면 개별 해제 */
 function renderCooldown() {
-  const tags = advice.cooldownTags(Date.now());
-  $('cooldownInfo').textContent = tags.length ? `쿨다운(5분): ${tags.join(', ')}` : '';
+  const box = $('cdTags');
+  const now = Date.now();
+  const list = advice.cooldownList(now);
+  const sig = list.map(c => c.key).join('|');
+  if (box.dataset.sig !== sig) {
+    box.dataset.sig = sig;
+    box.innerHTML = '';
+    for (const c of list) {
+      const b = document.createElement('button');
+      b.type = 'button'; b.dataset.key = c.key; b.title = '터치하면 쿨다운 해제';
+      b.onclick = () => { advice.removeCooldown(c.key); renderCooldown(); setStatus(`쿨다운 해제: ${c.label}`); };
+      box.appendChild(b);
+    }
+  }
+  box.querySelectorAll<HTMLButtonElement>('button').forEach((b, i) => {
+    const c = list[i];
+    if (c) b.textContent = `${c.label} ${Math.max(0, Math.ceil((c.until - now) / 1000))}s ×`;
+  });
 }
 
 // ───────── 오디오 시작/정지 ─────────
@@ -321,6 +374,8 @@ async function startAudio() {
   const parts: string[] = [];
   if (mode === 'monitor' && systemCaptureSupported()) parts.push('🖥️ 시스템/탭 오디오 캡처 중 (공유를 끝내면 분석이 정지됩니다)');
   else parts.push(`${modeName()} · ${info?.label || '기본 장치'} · ${ch || '?'}ch · ${info?.step ?? 1}차 방식으로 열림`);
+  if (info?.usb) parts.push('🔌 USB 오디오 인터페이스를 내장 마이크보다 우선 연결했습니다');
+  if (mode === 'monitor') parts.push(`🚪 노이즈 게이트 ${gateDb} dBFS · 1.5초 이상 무음이면 대기`);
   if (ch === 1) parts.push('⚠ 모노로 열렸습니다 (R = L 복제)');
   if (info?.step === 3) parts.push('⚠ 기본 모드로 열림: OS 음성 보정(에코 제거/노이즈 억제/AGC)이 켜져 있을 수 있습니다');
   else if (st && (st.echoCancellation || st.noiseSuppression || st.autoGainControl)) parts.push('⚠ 브라우저가 음성 보정을 끄지 못했습니다 (EC/NS/AGC 일부 ON)');
@@ -384,6 +439,19 @@ async function stop() {
   startBtn.textContent = '시작'; startBtn.classList.remove('on');
   setStatus('정지');
 }
+engine.onIdleChange = idle => {
+  const now = Date.now();
+  if (idle) {
+    localLevels = [{ rmsDb: -120, peakDb: -120, clip: false }, { rmsDb: -120, peakDb: -120, clip: false }];
+    showBands(null);
+    setStatus('⏸️ 신호 대기 중 · 게이트 아래 무음 (Auto-Trim 0dB 동결)');
+  } else {
+    lastCollectAt = now; lastAnalyzeAt = now;        // 음악이 다시 나오면 새 구간부터 분석
+    setStatus(`실행 중 · ${modeName()} · 신호 감지 → 분석 재개`);
+  }
+  paintGenre(); paintToggles();
+  sender.update({ genre: badgeForSend(), genreAt: idle ? 0 : genreAt, levels: localLevels }, true);
+};
 engine.onEnded = () => { if (running) { setStatus('입력이 종료되었습니다 (오디오 공유 종료/장치 분리)'); void stop(); } };
 
 // ───────── 4) 백그라운드에서도 멈추지 않는 단일 100ms 틱 ─────────
@@ -423,7 +491,8 @@ function masterTick() {
   render();
   if (tickN % 2 === 0 && localLevels) sender.sendLevels(localLevels[0], localLevels[1]);   // 0.2초: 레벨
   if (now - lastSecondAt >= 1000) { lastSecondAt = now; secondTick(); }
-  if (!aiPaused && now - lastAnalyzeAt >= intervalSec * 1000) { lastAnalyzeAt = now; void analyze(); }
+  if (engine.idle) lastAnalyzeAt = now;           // 무음 대기: AI 호출 일시 중지
+  else if (!aiPaused && now - lastAnalyzeAt >= intervalSec * 1000) { lastAnalyzeAt = now; void analyze(); }
 }
 
 function secondTick() {
@@ -433,12 +502,13 @@ function secondTick() {
   updateLiveBands();
   paintToggles();
   if (mode === 'console' && keepAudio.active && !keepAudio.playing) void keepAudio.start();   // 시스템이 멈춘 무음 루프 재개
-  sender.update({ genre: genreLabel(), genreAt, levels: localLevels });
+  sender.update({ genre: badgeForSend(), genreAt: engine.idle ? 0 : genreAt, levels: localLevels });
   sender.publish();                           // 1초마다 전체 상태 retain 발행
   $('bandInfo').textContent = `${engine.autoTrim ? 'Auto-Trim 기준' : 'Raw'} · 엔진 ${engine.state}${recoverCount ? ` · 자동 복구 ${recoverCount}회` : ''}`;
 }
 
 function updateLiveBands() {
+  if (engine.idle) { showBands(null); return; }
   const b = engine.peekBands();
   if (Object.values(b).every(x => x.avgDb < -70)) { showBands(bandRows(b, null)); return; }
   const ev = evaluateBalance(b, tolDb);
@@ -471,7 +541,7 @@ async function analyze() {
   const nowMs = Date.now();
   const windowSec = Math.max(1, Math.round((nowMs - lastCollectAt) / 1000));
   lastCollectAt = nowMs;
-  if (!running || aiPaused) return;
+  if (!running || aiPaused || engine.idle) return;
   const silent = Object.values(bands).every(b => b.avgDb < -70);
   if (silent) { showBands(bandRows(bands, null)); return; }
 
@@ -506,18 +576,32 @@ async function analyze() {
     toleranceDb: tol,
     inputMode: mode === 'console' ? 'console-2track-raw' : 'playback-monitor-autotrim',
     levelReference: engine.autoTrim ? `auto-trim normalized to ${TRIM.targetDb} dBFS (absolute level not meaningful)` : 'raw dBFS from console',
+    captureNote: captureNote(),
     signal: ev.signal,
-    metrics: { ...dyn, subVsMidDb: spec.subVsMidDb, sub20to80SharePct: spec.sub20to80SharePct, voiceBandSharePct: spec.voiceBandSharePct },
+    features: {
+      relativeSpectralBalanceDb: Object.fromEntries(Object.entries(bands).map(([n, b]) => [n, b.relDb])),
+      bandCrestDb: Object.fromEntries(Object.entries(bands).map(([n, b]) => [n, b.crestDb])),
+      transientDensityPerMin: dyn.transientDensityPerMin,
+      transientFluxDb: dyn.transientFluxDb,
+      spectralCentroidHz: spec.spectralCentroidHz,
+      decayTail: dyn.decayTail,
+      fullCrestDb: dyn.fullCrestDb,
+      fullRmsDb: dyn.fullRmsDb,
+      subVsMidDb: spec.subVsMidDb,
+      sub20to80SharePct: spec.sub20to80SharePct,
+      voiceBandSharePct: spec.voiceBandSharePct,
+      measuredSec: dyn.activeSec,
+    },
     bands: bandData,
     peaks,
     currentDisplay: advice.displayList().map(i => i.text),
-    cooldown5min: advice.cooldownTags(nowMs),
+    cooldownList: advice.cooldownTags(nowMs),
   };
   try {
     const raw = await callAI(provider(), currentModel(), key, buildSystemPrompt(tol),
       `최근 ${windowSec}초 분석 데이터(JSON):\n${JSON.stringify(payload)}`);
     const res = parseReply(raw);
-    if (res.genre) { genre = res.genre; genreAt = Date.now(); paintGenre(); sender.update({ genre: genreLabel(), genreAt }); }
+    if (res.genre) { genre = res.genre; genreAt = Date.now(); paintGenre(); sender.update({ genre: badgeForSend(), genreAt }); }
     const added = advice.ingest(res.advice, Date.now());
     const text = raw.trim().replace(/\s+/g, ' ');
     setAiLast(`${gateInfo}\nAI 응답(${new Date().toLocaleTimeString()}): ${text || '(빈 응답)'}`);
@@ -530,6 +614,15 @@ async function analyze() {
   } finally { inFlight = false; }
 }
 
+/** AI 에 알려 줄 수음 경로 특성 */
+function captureNote(): string {
+  const o = engine.openInfo;
+  if (mode === 'console') return o?.usb ? 'USB 오디오 인터페이스 2트랙 직결 (Raw)' : '콘솔 2트랙 입력 (Raw)';
+  if (systemCaptureSupported()) return '데스크탑 시스템/탭 오디오 디지털 캡처 (레벨 정규화됨)';
+  return o?.usb ? 'USB 인터페이스 루프백 입력 (레벨 정규화됨)'
+    : '스마트폰 내장 마이크로 스피커 재생음을 수음 — 저역(특히 Sub/Low)이 실제보다 크게 깎이고 방 울림이 섞임. 상대 비율·리듬 어택 위주로 판단';
+}
+
 function bandRows(b: Record<string, BandStat>, deltas: Record<string, number> | null): BandRow[] {
   return BANDS.map(x => {
     const s = b[x.name];
@@ -537,7 +630,7 @@ function bandRows(b: Record<string, BandStat>, deltas: Record<string, number> | 
     return { name: x.name, avgDb: s.avgDb, crestDb: s.crestDb, deltaDb: d, character: s.character, over: d !== null && Math.abs(d) > tolDb };
   });
 }
-function showBands(rows: BandRow[]) {
+function showBands(rows: BandRow[] | null) {
   lastRows = rows;
   sender.update({ bands: rows });
   if (!mirroring) renderBandTable($('bandTable'), rows);

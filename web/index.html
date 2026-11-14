@@ -79,7 +79,7 @@
         <div class="hud-line" id="hud3"></div>
         <div class="hud-line" id="hud4"></div>
       </div>
-      <div id="cooldownInfo" class="hint"></div>
+      <div id="cdTags" class="cdtags" aria-label="쿨다운 중인 조언 (터치하면 해제)"></div>
     </section>
 
     <!-- 6) 6밴드 실시간 분석 -->
@@ -120,11 +120,38 @@
       <input id="intSlider" type="range" />
       <div class="scale"><span id="intLo"></span><span id="intHi"></span></div>
 
+      <h3>쿨다운 (중복 조언 방지) 상세 설정</h3>
+      <label>쿨다운 유지 시간 <small id="cdHoldInfo"></small>
+        <input id="cdHold" type="range" min="0" max="600" step="10" />
+      </label>
+      <div class="scale"><span>0초(끄기)</span><span>5분</span><span>10분</span></div>
+      <div class="row">
+        <label>발동 조건 (같은 조언 횟수)
+          <select id="cdTrigger">
+            <option value="1">1회 즉시 등록</option>
+            <option value="2">2회 연속 발생 시 등록</option>
+            <option value="3">3회 연속 발생 시 등록</option>
+          </select>
+        </label>
+        <label>판정 범위
+          <select id="cdScope">
+            <option value="standard">표준 (같은 악기 + 비슷한 주파수/조치만)</option>
+            <option value="strict">엄격 (같은 악기 + 같은 항목 전체)</option>
+          </select>
+        </label>
+      </div>
+      <div class="hint">쿨다운 중인 조언은 HUD 아래 태그로 표시되며, 태그를 누르면 개별 해제됩니다.</div>
+
       <h3>입력 신호</h3>
       <button id="thruBtn" class="toggle" type="button"></button>
       <div id="thruHint" class="hint"></div>
       <button id="trimBtn" class="toggle" type="button"></button>
       <div id="trimHint" class="hint"></div>
+      <label>노이즈 게이트 (실시간 유튜브/재생음 모드) <small id="gateInfo"></small>
+        <input id="gateSlider" type="range" min="-55" max="-20" step="1" />
+      </label>
+      <div class="scale"><span>-55 dBFS (예민)</span><span>-20 dBFS (둔감)</span></div>
+      <div class="hint">보정 전 원본 레벨이 이 값 아래로 1.5초 이상 머물면 '무음 대기'로 전환합니다. Auto-Trim을 0dB로 동결하고, 미터를 내리고, 밴드 누적과 AI 호출을 멈춰 방 안 소음이 분석되지 않게 합니다.</div>
 
       <h3>최근 AI 응답</h3>
       <div id="aiLast" class="hint">아직 없음</div>

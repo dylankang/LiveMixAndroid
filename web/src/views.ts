@@ -55,6 +55,7 @@ export function paintHud(lines: string[]) {
 
 export function genreText(genre: string, genreAt: number): string {
   if (!genre) return '🎵 장르 판별 대기 중';
+  if (!genreAt) return genre;          // 시각이 없는 상태 문구 (예: 무음 대기)
   return `${genre} · ${Math.max(0, Math.round((Date.now() - genreAt) / 1000))}초 전`;
 }
 

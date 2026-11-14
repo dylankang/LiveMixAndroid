@@ -77,7 +77,21 @@ export async function requestMicPermission(): Promise<void> {
   s.getTracks().forEach(t => t.stop());
 }
 
-export interface OpenInfo { step: 1 | 2 | 3; label: string; settings: MediaTrackSettings }
+export interface OpenInfo { step: 1 | 2 | 3; label: string; settings: MediaTrackSettings; usb?: boolean }
+
+/** USB 오디오 인터페이스로 보이는 입력 이름 (ZOOM AMS-24 등) */
+const USB_RE = /usb|zoom|ams-?\d|interface|focusrite|scarlett|steinberg|\bur\d|behringer|umc|motu|presonus|roland|tascam|irig|rode|audient|ssl\s?\d|apogee|yamaha ag|mackie/i;
+const BUILTIN_RE = /built-?in|내장|internal|headset|핸즈프리|bluetooth|블루투스|default|기본/i;
+
+/** 연결된 USB 인터페이스를 찾는다 (이름을 읽으려면 마이크 권한이 필요하므로 없으면 한 번 요청) */
+export async function findUsbInput(): Promise<MediaDeviceInfo | null> {
+  let devs = await listInputs();
+  if (devs.length && devs.every(d => !d.label)) {
+    try { await requestMicPermission(); devs = await listInputs(); } catch { return null; }
+  }
+  const real = devs.filter(d => d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications');
+  return real.find(d => USB_RE.test(d.label) && !BUILTIN_RE.test(d.label)) ?? null;
+}
 
 /**
  * 3단계 Fallback 으로 입력을 연다.
@@ -112,8 +126,17 @@ export interface ChannelLevel { rmsDb: number; peakDb: number; clip: boolean }
 export interface BandStat { avgDb: number; peakDb: number; crestDb: number; relDb: number; character: 'transient' | 'sustained' | 'mixed' | 'none' }
 export interface SpecPeak { hz: number; levelDb: number; prominenceDb: number }
 export interface FbHit { hz: number; db: number }
-export interface SpecStats { peaks: SpecPeak[]; subVsMidDb: number; sub20to80SharePct: number; voiceBandSharePct: number }
-export interface DynStats { fullRmsDb: number; fullPeakDb: number; fullCrestDb: number; lowFluxDb: number; lowOnsetsPerSec: number }
+export interface SpecStats { peaks: SpecPeak[]; subVsMidDb: number; sub20to80SharePct: number; voiceBandSharePct: number; spectralCentroidHz: number }
+export interface DynStats {
+  fullRmsDb: number; fullPeakDb: number; fullCrestDb: number;
+  /** 분당 어택 수 (low 60-250Hz · mid 500Hz-2kHz · highMid 2-6kHz) */
+  transientDensityPerMin: { low: number; mid: number; highMid: number };
+  /** 대역 단기 레벨 변동폭 (dB 표준편차) */
+  transientFluxDb: { low: number; mid: number; highMid: number };
+  /** 잔향 지속도: 골짜기/피크 에너지 비율(%) · 어택 직후 감쇠 속도(dB/s, 작을수록 잔향 김) */
+  decayTail: { ratioPct: number; decayDbPerSec: number | null };
+  activeSec: number;
+}
 
 const toDb = (x: number) => (x > 1e-7 ? 20 * Math.log10(x) : -120);
 const r1 = (x: number) => Math.round(x * 10) / 10;
@@ -156,10 +179,19 @@ export class AudioEngine {
   private startedAt = 0;
   trimDb = 0;                            // 현재 적용 중인 오프셋 게인 (dB)
   mode: InputMode = 'console';
+  usbPicked = false;
   /** 오디오 스레드 콜백 (ScriptProcessor) — 분석기에서 Worker 틱 대체용으로 연결 */
   onAudioBeat: () => void = () => {};
   private fullAcc = { sumSq: 0, n: 0, peak: 0 };
-  private lowSeries: number[] = [];
+  /** 100ms 마다 쌓는 대역별 단기 레벨(dB) 시리즈: [low, mid, highMid] */
+  private series: number[][] = [[], [], []];
+  /** 노이즈 게이트 (실시간 재생음 모드): Raw RMS 가 임계값 아래로 1.5초 이상이면 무음 대기 */
+  private gateOn = false;
+  gateDb = -38;
+  idle = false;
+  private belowSince = 0;
+  private aboveCount = 0;
+  onIdleChange: (idle: boolean) => void = () => {};
   onEnded: () => void = () => {};     // 시스템 오디오 공유가 사용자에 의해 종료될 때
   channels = 0;
   running = false;
@@ -196,15 +228,23 @@ export class AudioEngine {
       this.stream = ds;
       label = '🖥️ 시스템/탭 오디오 캡처';
     } else {
-      // 콘솔: 선택한 USB 인터페이스 / 모바일 모니터링: 기본 입력(폰 마이크 수음)
-      const o = await openInput(mode === 'console' ? deviceId : undefined);
+      // 콘솔: 선택한 장치 / 기본값이거나 모바일 모니터링이면 연결된 USB 인터페이스(루프백 포함)를 내장 마이크보다 먼저 연다
+      let id = mode === 'console' ? deviceId : undefined;
+      let usb = false;
+      if (!id || id === DEFAULT_INPUT_ID) {
+        const u = await findUsbInput().catch(() => null);
+        if (u) { id = u.deviceId; usb = true; }
+      }
+      const o = await openInput(id);
       this.stream = o.stream; step = o.step;
+      if (usb && step === 1) label = '';
+      this.usbPicked = usb && step === 1;
     }
     const track = this.stream!.getAudioTracks()[0];
     track.addEventListener('ended', () => { if (this.running) this.onEnded(); });
     const settings = track.getSettings();
     this.channels = settings.channelCount ?? 0;
-    this.openInfo = { step, label: label || track.label || '', settings };
+    this.openInfo = { step, label: label || track.label || '', settings, usb: this.usbPicked };
 
     const ctx = new AudioContext({ latencyHint: 'interactive' });
     // resume() 이 자동재생 정책 때문에 끝나지 않는 경우에도 시작이 멈추지 않도록 1.5초만 기다림
@@ -274,7 +314,8 @@ export class AudioEngine {
       return bandAn;
     });
     this.bandAcc = BANDS.map(() => ({ sumSq: 0, n: 0, peak: 0 }));
-    this.fullAcc = { sumSq: 0, n: 0, peak: 0 }; this.lowSeries = [];
+    this.fullAcc = { sumSq: 0, n: 0, peak: 0 }; this.series = [[], [], []];
+    this.idle = false; this.belowSince = 0; this.aboveCount = 0;
     // AudioContext 내부 무음 노드(15Hz -50dBFS) + ScriptProcessor 하트비트: <audio> 태그 없이 백그라운드 오디오 처리 유지
     try { this.startKeepNodes(src); } catch (e) { console.warn('백그라운드 유지 노드 실패 (분석은 계속)', e); }
     this.specAcc.fill(0); this.specN = 0;
@@ -322,6 +363,33 @@ export class AudioEngine {
     try { if (on) this.src.connect(this.ctx.destination); else this.src.disconnect(this.ctx.destination); } catch { /* ignore */ }
   }
 
+  /** 노이즈 게이트 설정 (실시간 재생음 모드에서만 켬). 끄면 즉시 무음 대기 해제 */
+  setGate(on: boolean, db: number) {
+    this.gateOn = on; this.gateDb = db;
+    this.belowSince = 0; this.aboveCount = 0;
+    if (!on && this.idle) this.exitIdle();
+  }
+  private resetAccum() {
+    this.bandAcc = BANDS.map(() => ({ sumSq: 0, n: 0, peak: 0 }));
+    this.fullAcc = { sumSq: 0, n: 0, peak: 0 };
+    this.series = [[], [], []];
+    this.specAcc.fill(0); this.specN = 0;
+    this.fbTrack = { bin: -1, n: 0, maxDb: -200 };
+  }
+  private enterIdle() {
+    this.idle = true;
+    // Auto-Trim 동결: 게인을 즉시 0.0dB 로 (방 소음을 키우지 않음), 다음 음악에서 처음부터 다시 학습
+    this.trimDb = 0; this.trimInit = false; this.trimIntDb = -120;
+    if (this.trim && this.ctx) { this.trim.gain.cancelScheduledValues(this.ctx.currentTime); this.trim.gain.setValueAtTime(1, this.ctx.currentTime); }
+    this.resetAccum();                 // 게이트 닫히기 전 1.5초 동안 쌓인 소음도 버림
+    this.onIdleChange(true);
+  }
+  private exitIdle() {
+    this.idle = false;
+    this.resetAccum();
+    this.onIdleChange(false);
+  }
+
   /** 🎚️ Auto-Trim ON/OFF. OFF 면 게인 1.0 (콘솔의 실제 Raw dBFS 그대로) */
   setAutoTrim(on: boolean) {
     this.trimOn = on;
@@ -348,11 +416,22 @@ export class AudioEngine {
       pw += sq / this.rawBuf.length / this.anRaw.length;
     }
     const rawDb = toDb(Math.sqrt(pw));
-    if (!this.trimOn) return rawDb;
     const now = performance.now();
+    if (this.gateOn) {
+      if (rawDb < this.gateDb) {
+        this.aboveCount = 0;
+        if (!this.belowSince) this.belowSince = now;
+        if (!this.idle && now - this.belowSince >= 1500) this.enterIdle();
+      } else {
+        this.belowSince = 0;
+        if (this.idle && ++this.aboveCount >= 2) this.exitIdle();   // 0.2초 연속 신호 → 자동 분석 재개
+      }
+      if (this.idle) return rawDb;                                  // 무음 대기: 보정 게인 동결(0dB)
+    }
+    if (!this.trimOn) return rawDb;
     const dt = this.trimLastAt ? Math.min(1, (now - this.trimLastAt) / 1000) : 0.1;
     this.trimLastAt = now;
-    if (rawDb < TRIM.gateDb || now - this.startedAt < 600) return rawDb;   // 무음·입력 시작 직후(램프) 제외 → 게인 유지
+    if (rawDb < TRIM.gateDb || (this.gateOn && rawDb < this.gateDb) || now - this.startedAt < 600) return rawDb;   // 무음·입력 시작 직후(램프) 제외 → 게인 유지
     // dB 영역 지수 평균: 볼륨을 올릴 때와 내릴 때 같은 속도로 따라감 (파워 평균은 큰 소리 이력이 오래 남음)
     if (!this.trimInit) { this.trimIntDb = rawDb; this.trimInit = true; }
     else this.trimIntDb += (1 - Math.exp(-dt / TRIM.tauSec)) * (rawDb - this.trimIntDb);
@@ -384,6 +463,7 @@ export class AudioEngine {
   /** L/R 입력 레벨 (rAF/타이머에서 호출) */
   readLevels(): [ChannelLevel, ChannelLevel] | null {
     if (!this.anL || !this.anR) return null;
+    if (this.idle) return [{ rmsDb: -120, peakDb: -120, clip: false }, { rmsDb: -120, peakDb: -120, clip: false }];   // 무음 대기: 미터 -∞
     const now = performance.now();
     const out = [this.anL, this.anR].map((an, i) => {
       an.getFloatTimeDomainData(this.buf);
@@ -405,6 +485,7 @@ export class AudioEngine {
 
   /** 100ms 틱마다 호출: 6밴드·전대역 누적 */
   pollBands() {
+    if (this.idle) return;                       // 무음 대기 중에는 누적하지 않음
     this.bandAn.forEach((an, i) => {
       an.getFloatTimeDomainData(this.buf);
       const acc = this.bandAcc[i];
@@ -417,9 +498,11 @@ export class AudioEngine {
       }
       acc.sumSq += sq;
       acc.n += this.buf.length;
-      if (i === 1) {   // Low(60~250Hz) 단시간 레벨 시리즈 → 저역 트랜지언트(리듬 타격감) 분석
-        this.lowSeries.push(toDb(Math.sqrt(sq / this.buf.length)));
-        if (this.lowSeries.length > 1200) this.lowSeries.splice(0, 200);
+      const si = i === 1 ? 0 : i === 3 ? 1 : i === 4 ? 2 : -1;   // Low / Mid / High-Mid 단시간 레벨 → 트랜지언트·잔향 분석
+      if (si >= 0) {
+        const ser = this.series[si];
+        ser.push(toDb(Math.sqrt(sq / this.buf.length)));
+        if (ser.length > 1200) ser.splice(0, 200);
       }
     });
     // 전 대역 Crest Factor (L+R 합산, Peak 대비 RMS)
@@ -442,23 +525,44 @@ export class AudioEngine {
     const f = this.fullAcc;
     const rms = toDb(f.n ? Math.sqrt(f.sumSq / f.n) : 0);
     const peak = toDb(f.peak);
-    const s = this.lowSeries;
-    const v = s.filter(x => x > -80);
-    let std = 0;
-    if (v.length) {
-      const mean = v.reduce((p, c) => p + c, 0) / v.length;
-      std = Math.sqrt(v.reduce((p, c) => p + (c - mean) * (c - mean), 0) / v.length);
-    }
-    let onsets = 0, last = -100;
-    for (let i = 1; i < s.length; i++) {
-      if (s[i] > -55 && s[i] - s[i - 1] >= 6 && i - last >= 3) { onsets++; last = i; }   // 0.1초 사이 6dB↑ 급상승, 0.3초 불응기
-    }
-    const sec = s.length * 0.1;
+    const STEP = 0.1;   // 시리즈 간격(초) = 100ms 틱
+    const onsetIdx = (s: number[]) => {
+      const out: number[] = []; let last = -100;
+      for (let i = 1; i < s.length; i++) if (s[i] > -55 && s[i] - s[i - 1] >= 6 && i - last >= 3) { out.push(i); last = i; }   // 0.1초 사이 6dB↑, 0.3초 불응기
+      return out;
+    };
+    const std = (s: number[]) => {
+      const v = s.filter(x => x > -80);
+      if (!v.length) return 0;
+      const m = v.reduce((p, c) => p + c, 0) / v.length;
+      return Math.sqrt(v.reduce((p, c) => p + (c - m) * (c - m), 0) / v.length);
+    };
+    const [low, mid, hm] = this.series;
+    const sec = Math.max(low.length, mid.length, hm.length) * STEP;
+    const perMin = (s: number[]) => (sec > 0 ? Math.round((onsetIdx(s).length / sec) * 60) : 0);
+
+    // 잔향 지속도 (Mid 500Hz-2kHz 기준)
+    const act = mid.filter(x => x > -70).slice().sort((a, b) => a - b);
+    const pct = (q: number) => act[Math.min(act.length - 1, Math.floor(q * act.length))];
+    const ratioPct = act.length >= 10 ? r1(Math.pow(10, (pct(0.2) - pct(0.9)) / 10) * 100) : 0;
+    const rates: number[] = [];
+    const on = onsetIdx(mid);
+    on.forEach((i, k) => {
+      const next = on[k + 1] ?? Infinity;
+      const pk = Math.max(mid[i], mid[i + 1] ?? -120);
+      if (i + 4 < mid.length && next > i + 4) rates.push((pk - mid[i + 4]) / (3 * STEP));   // 피크 후 0.3초 감쇠량
+    });
+    rates.sort((a, b) => a - b);
+    const decay = rates.length >= 3 ? r1(rates[Math.floor(rates.length / 2)]) : null;
+
     this.fullAcc = { sumSq: 0, n: 0, peak: 0 };
-    this.lowSeries = [];
+    this.series = [[], [], []];
     return {
       fullRmsDb: r1(rms), fullPeakDb: r1(peak), fullCrestDb: r1(Math.max(0, peak - rms)),
-      lowFluxDb: r1(std), lowOnsetsPerSec: sec > 0 ? r1(onsets / sec) : 0,
+      transientDensityPerMin: { low: perMin(low), mid: perMin(mid), highMid: perMin(hm) },
+      transientFluxDb: { low: r1(std(low)), mid: r1(std(mid)), highMid: r1(std(hm)) },
+      decayTail: { ratioPct, decayDbPerSec: decay },
+      activeSec: r1(sec),
     };
   }
 
@@ -492,7 +596,7 @@ export class AudioEngine {
   /** 평균 스펙트럼: 협대역 피크 상위 4개 + 서브베이스 비율(20~80Hz vs 중역) + 음성 대역 점유율. 집계 후 초기화 */
   collectSpectrum(): SpecStats {
     const n = this.specN;
-    const empty: SpecStats = { peaks: [], subVsMidDb: 0, sub20to80SharePct: 0, voiceBandSharePct: 0 };
+    const empty: SpecStats = { peaks: [], subVsMidDb: 0, sub20to80SharePct: 0, voiceBandSharePct: 0, spectralCentroidHz: 0 };
     if (!this.ctx || !n) return empty;
     const N = this.specAcc.length;
     const binHz = this.ctx.sampleRate / FB.fftSize;
@@ -505,6 +609,8 @@ export class AudioEngine {
       return s;
     };
     const sub = energy(20, 80), mid = energy(250, 4000), voice = energy(120, 4000), all = energy(20, 16000);
+    let cw = 0, cs = 0;   // 스펙트럼 무게중심 (20Hz~16kHz)
+    for (let k = Math.max(1, Math.floor(20 / binHz)); k <= Math.min(N - 1, Math.ceil(16000 / binHz)); k++) { cw += k * binHz * pw[k]; cs += pw[k]; }
 
     const lo = Math.ceil(60 / binHz), hi = Math.min(N - 16, Math.floor(12000 / binHz));
     const found: SpecPeak[] = [];
@@ -525,6 +631,7 @@ export class AudioEngine {
       subVsMidDb: r1(10 * Math.log10((sub + 1e-20) / (mid + 1e-20))),
       sub20to80SharePct: r1((sub / (all || 1)) * 100),
       voiceBandSharePct: r1((voice / (all || 1)) * 100),
+      spectralCentroidHz: cs > 0 ? Math.round(cw / cs) : 0,
     };
   }
 
@@ -534,7 +641,7 @@ export class AudioEngine {
    *  같은 주파수(±1bin)에서 레벨 하락 없이 15회(1.5초) 연속 유지될 때
    */
   scanFeedback(): FbHit | null {
-    if (!this.ctx || !this.anFb) return null;
+    if (!this.ctx || !this.anFb || this.idle) return null;
     const d = this.fbBuf;
     this.anFb.getFloatFrequencyData(d);
     for (let k = 0; k < d.length; k++) this.specAcc[k] += Math.pow(10, d[k] / 10); // 평균 스펙트럼 누적
