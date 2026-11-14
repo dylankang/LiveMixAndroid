@@ -73,7 +73,11 @@ export function clampText(s: string): string {
   return chars.length > HARD_CAP_CHARS ? chars.slice(0, HARD_CAP_CHARS).join('') : chars.join('');
 }
 
-export interface CooldownEntry { key: string; label: string; until: number }
+export interface CooldownEntry {
+  key: string; label: string; until: number;
+  inst: string; item: string; detail: string;   // 화면 표시용: [악기] 항목 · 세부(대역/방향)
+  count: number; trigger: number;                 // 등록 시점의 연속 횟수 / 설정된 발동 조건
+}
 
 export class AdviceManager {
   items: AdviceItem[] = [];
@@ -138,13 +142,21 @@ export class AdviceManager {
       this.history.set(key, { count, last: now });
       accepted.push({ ...c, text: clampText(c.text), key, at: now });
       if (this.cfg.holdSec > 0 && count >= this.cfg.trigger) {
-        this.cool.set(key, { key, label: labelOf(c.tag), until: now + this.cfg.holdSec * 1000 });
+        const a = splitAdvice(c.tag);
+        this.cool.set(key, {
+          key, label: labelOf(c.tag), until: now + this.cfg.holdSec * 1000,
+          inst: a?.inst ?? '', item: a?.item ?? c.tag.slice(0, 12), detail: key.split('|')[2] ?? '',
+          count, trigger: this.cfg.trigger,
+        });
         this.history.delete(key);
       }
     }
     if (accepted.length) this.items = [...this.items, ...accepted].slice(-QUEUE_SIZE);
     return accepted;
   }
+
+  /** 신호 대기에서 돌아올 때: 대기 중 유지된 조언의 만료 시계를 지금부터 다시 시작 */
+  refreshAge(now: number) { this.items.forEach(i => { i.at = now; }); }
 
   /** 오래된 조언을 가장 오래된 것부터 한 줄씩 제거. 변경되면 true */
   tick(now: number): boolean {

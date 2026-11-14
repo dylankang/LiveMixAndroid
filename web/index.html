@@ -37,7 +37,7 @@
       </div>
       <div class="row">
         <button id="startBtn" class="primary" type="button">시작</button>
-        <button id="resetBtn" type="button">쿨다운 초기화</button>
+        <button id="resetBtn" type="button">쿨다운 전체 초기화</button>
       </div>
       <div id="keepState" class="hint"></div>
       <div id="inputInfo" class="hint"></div>
@@ -77,6 +77,13 @@
         <div class="hud-line" id="hud3"></div>
         <div class="hud-line" id="hud4"></div>
       </div>
+    </section>
+
+    <!-- 5-1) 현재 쿨다운 목록 (본체 화면 전용 · HUD 수신기에는 표시되지 않음) -->
+    <section class="card">
+      <h2>⏳ 현재 쿨다운 목록 <small id="cdCount">(0개)</small></h2>
+      <div id="cdList" class="cdlist"></div>
+      <div class="hint">✕ 로 개별 해제 · 위쪽 [쿨다운 전체 초기화]로 전체 해제 · 만료되면 자동으로 사라집니다.</div>
     </section>
 
     <!-- 6) 6밴드 실시간 분석 -->
@@ -137,17 +144,18 @@
           </select>
         </label>
       </div>
-      <div class="hint">쿨다운 중인 조언은 화면에 따로 표시하지 않고 같은 조언만 걸러 냅니다. 메인 화면의 [쿨다운 초기화]로 전체 해제할 수 있습니다.</div>
+      <div class="hint">쿨다운 중인 조언은 HUD에 나오지 않고, 분석기 화면의 [⏳ 현재 쿨다운 목록]에서 확인·해제할 수 있습니다.</div>
 
       <h3>입력 신호</h3>
       <button id="trimBtn" class="toggle" type="button"></button>
       <div id="trimHint" class="hint"></div>
-      <div class="hint">백그라운드 유지: 시작하면 비가청 파일럿 톤(19kHz -43dBFS + 저역 + 디더)을 볼륨 100%로 재생하고 알림창에 미디어 컨트롤러를 띄웁니다. 입력 신호는 스피커로 나가지 않습니다. 폰 출력이 믹서/스피커에 연결돼 있으면 파일럿이 들어가지 않게 출력 연결을 확인하세요.</div>
-      <label>노이즈 게이트 (무음 대기) <small id="gateInfo"></small>
-        <input id="gateSlider" type="range" min="-55" max="-20" step="1" />
+      <div class="hint">백그라운드 유지: 시작하면 비가청 파일럿 톤(19kHz -43dBFS + 저역 + 디더)을 볼륨 100%로 재생하고 알림창에 미디어 컨트롤러를 띄웁니다. 입력 신호는 -100dBFS(들리지 않는 수준)로만 WebRTC 루프백에 실립니다. 폰 출력이 믹서/스피커에 연결돼 있으면 파일럿이 들어가지 않게 출력 연결을 확인하세요.</div>
+      <button id="gateBtn" class="toggle" type="button"></button>
+      <label>노이즈 게이트 임계값 <small id="gateInfo"></small>
+        <input id="gateSlider" type="range" min="-70" max="-20" step="1" />
       </label>
-      <div class="scale"><span>-55 dBFS (예민)</span><span>-20 dBFS (둔감)</span></div>
-      <div class="hint">보정 전 원본 레벨이 이 값 아래로 2.5초 이상 머물면 '무음 대기'로 전환합니다. 미터를 내리고 밴드 누적과 AI 호출을 멈춰 무음 구간의 불필요한 API 호출을 막습니다. 조용한 연주 구간에서 자꾸 대기로 넘어가면 값을 더 낮추세요(기본 -45 dBFS).</div>
+      <div class="scale"><span>-70 dBFS (예민)</span><span>-20 dBFS (둔감)</span></div>
+      <div class="hint">보정 전 원본 레벨이 이 값 아래로 2.5초 이상 머물면 '무음 대기'로 전환합니다. 미터를 내리고 밴드 누적과 AI 호출을 멈춰 무음 구간의 불필요한 API 호출을 막습니다. 콘솔 입력은 원본 레벨이 낮을 수 있어 기본값은 -55 dBFS입니다. 조용한 구간에서 자꾸 대기로 넘어가면 값을 더 낮추거나 스위치를 OFF로 하세요. 대기 중에도 HUD의 마지막 조언은 유지됩니다.</div>
 
       <h3>최근 AI 응답</h3>
       <div id="aiLast" class="hint">아직 없음</div>

@@ -4,7 +4,8 @@
 //  A. WebRTC 루프백: AudioContext 가 만든 '파일럿 톤' 스트림(입력 신호 아님)을 pc1 → pc2 → <audio> 로 재생
 //  B. 파일럿 WAV <audio loop> (+ audioSession 'playback' · MediaSession 알림 컨트롤러에 마지막 조언 표시)
 //  C. Picture-in-Picture 미니 모니터: 캔버스(미터 + HUD 5줄)를 PiP 창으로 띄워 크롬을 화면 표시 상태로 유지
-// 입력(USB) 스트림은 어떤 경로로도 스피커/출력/WebRTC 로 보내지 않는다 (하울링 방지).
+// 입력(USB) 스트림은 스피커로 직접 보내지 않고, -100dBFS(gain 0.00001)로만 파일럿 스트림에 섞어 WebRTC 루프백에 태운다
+// (크롬이 입력 트랙을 '실시간 전송 중'으로 보게 해 백그라운드 캡처 음소거를 막음 · 출력은 들리지 않는 수준).
 import type { LevelPkt } from './link';
 
 export type KaState = 'off' | 'starting' | 'on' | 'failed' | 'unsupported';

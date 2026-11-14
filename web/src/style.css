@@ -85,3 +85,6 @@ dialog#settings::backdrop { background:rgba(0,0,0,.7); }
 #pipBtn { margin-top:8px; width:100%; padding:12px; font-size:1rem; font-weight:700; border:2px solid #4da3ff; background:#0b2a4a; color:#cfe6ff; border-radius:10px; }
 #pipBtn.active { border-color:#39ff7a; background:#0a2a14; color:#b9ffd0; }
 #pipBtn:disabled { opacity:.6; }
+.cdlist { display:flex; flex-wrap:wrap; gap:6px; margin:6px 0; }
+.cdtag { display:inline-flex; align-items:center; gap:6px; padding:4px 4px 4px 10px; border:1px solid #6b5a1e; background:#2a2208; color:#ffe9a0; border-radius:999px; font-size:.82rem; }
+.cdtag button { border:0; background:#5a4a12; color:#fff; border-radius:50%; width:22px; height:22px; line-height:22px; padding:0; cursor:pointer; }

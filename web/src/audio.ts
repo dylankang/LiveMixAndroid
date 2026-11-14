@@ -14,15 +14,35 @@ export const TRIM = {
 const NO_MIC_MSG = '이 페이지에서는 마이크를 사용할 수 없습니다 (HTTPS 주소가 아니거나 브라우저/웹뷰가 차단함)';
 export const micAvailable = () => !!navigator.mediaDevices?.getUserMedia;
 /** 노이즈 게이트: 기본 임계값(dBFS)과 무음 대기 진입 시간 */
-export const GATE = { defaultDb: -45, minDb: -55, maxDb: -20, enterMs: 2500, exitTicks: 2 } as const;
+export const GATE = { defaultDb: -55, minDb: -70, maxDb: -20, enterMs: 2500, exitTicks: 2 } as const;
 
 /** 마스터 클럭 AudioWorklet (오디오 렌더 스레드에서 100ms 마다 메인 스레드에 박동을 보냄) */
 const CLOCK_SRC = `
 class LmClock extends AudioWorkletProcessor {
-  constructor() { super(); this.acc = 0; this.every = Math.round(sampleRate / 10); }
-  process() {
+  constructor() { super(); this.acc = 0; this.every = Math.round(sampleRate / 10); this.sq = [0, 0]; this.pk = [0, 0]; this.n = 0; }
+  process(inputs) {
+    // 입력(L/R)의 RMS·Peak 를 오디오 스레드에서 직접 측정 (백그라운드에서 메인 스레드 AnalyserNode 가 멈춰도 유효)
+    const inp = inputs[0];
+    if (inp && inp.length) {
+      const L = inp[0], R = inp[1] || inp[0];
+      for (let i = 0; i < L.length; i++) {
+        const a = L[i], b = R[i];
+        this.sq[0] += a * a; this.sq[1] += b * b;
+        const pa = a < 0 ? -a : a, pb = b < 0 ? -b : b;
+        if (pa > this.pk[0]) this.pk[0] = pa;
+        if (pb > this.pk[1]) this.pk[1] = pb;
+      }
+      this.n += L.length;
+    }
     this.acc += 128;
-    if (this.acc >= this.every) { this.acc -= this.every; this.port.postMessage({ type: 'tick' }); }
+    if (this.acc >= this.every) {
+      this.acc -= this.every;
+      const db = x => (x > 1e-7 ? 20 * Math.log10(x) : -120), n = this.n || 1;
+      this.port.postMessage({ type: 'tick',
+        rms: [db(Math.sqrt(this.sq[0] / n)), db(Math.sqrt(this.sq[1] / n))],
+        peak: [db(this.pk[0]), db(this.pk[1])] });
+      this.sq[0] = this.sq[1] = 0; this.pk[0] = this.pk[1] = 0; this.n = 0;
+    }
     return true;
   }
 }
@@ -130,6 +150,8 @@ export class AudioEngine {
   private clockNode?: AudioWorkletNode;  // 마스터 클럭 (오디오 스레드 100ms 박동)
   private pilotDest?: MediaStreamAudioDestinationNode;   // 파일럿 톤 출력 스트림 (WebRTC 루프백용 · 입력 신호는 섞지 않음)
   private pilotSrc: AudioScheduledSourceNode[] = [];
+  /** AudioWorklet 이 직접 측정한 입력 레벨 (dBFS) · 100ms 마다 갱신 */
+  private wk: { rms: [number, number]; peak: [number, number]; at: number } | null = null;
   /** 마스터 클럭 종류 */
   clockKind: 'worklet' | 'scriptprocessor' | 'none' = 'none';
   private trimOn = false;
@@ -139,6 +161,8 @@ export class AudioEngine {
   private startedAt = 0;
   trimDb = 0;                            // 현재 적용 중인 오프셋 게인 (dB)
   usbPicked = false;
+  /** 최근 측정한 원본(보정 전) RMS dBFS — 신호 대기 중 HUD 안내용 */
+  lastRawDb = -120;
   /** 오디오 스레드 박동 (AudioWorklet 100ms) — 분석기의 마스터 틱 */
   onAudioBeat: () => void = () => {};
   private fullAcc = { sumSq: 0, n: 0, peak: 0 };
@@ -204,6 +228,10 @@ export class AudioEngine {
     const sink = ctx.createGain();
     sink.gain.value = 0;
     sink.connect(mix);
+    // 입력 → -100dBFS(gain 0.00001) → mix: 크롬이 입력 트랙을 'WebRTC 로 실시간 전송 중'으로 보게 해 백그라운드 캡처 음소거를 막는다 (출력은 들리지 않는 수준)
+    const inGain = ctx.createGain();
+    inGain.gain.value = 0.00001;
+    src.connect(inGain); inGain.connect(mix);
 
     // 원본 L/R 을 따로 측정 (Analyser 는 스테레오를 모노로 평균내 레벨이 낮게 나오므로 Splitter 로 분리)
     const rawSplit = ctx.createChannelSplitter(2);
@@ -351,8 +379,14 @@ export class AudioEngine {
       for (let k = 0; k < this.rawBuf.length; k++) sq += this.rawBuf[k] * this.rawBuf[k];
       pw += sq / this.rawBuf.length / this.anRaw.length;
     }
-    const rawDb = toDb(Math.sqrt(pw));
+    let rawDb = toDb(Math.sqrt(pw));
     const now = performance.now();
+    // 백그라운드에서 AnalyserNode 가 갱신되지 않아도 AudioWorklet 이 잰 값이 있으면 더 큰(유효한) 값을 기준으로 삼는다
+    if (this.wk && now - this.wk.at < 600) {
+      const wkDb = 10 * Math.log10((Math.pow(10, this.wk.rms[0] / 10) + Math.pow(10, this.wk.rms[1] / 10)) / 2 + 1e-20);
+      if (wkDb > rawDb) rawDb = wkDb;
+    }
+    this.lastRawDb = rawDb;
     if (this.gateOn) {
       if (rawDb < this.gateDb) {
         this.aboveCount = 0;
@@ -388,7 +422,12 @@ export class AudioEngine {
       const url = URL.createObjectURL(new Blob([CLOCK_SRC], { type: 'text/javascript' }));
       try { await ctx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
       const node = new AudioWorkletNode(ctx, 'lm-clock', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
-      node.port.onmessage = ev => { if (ev.data?.type !== 'tick') return; try { this.onAudioBeat(); } catch { /* ignore */ } };
+      node.port.onmessage = ev => {
+        const d = ev.data;
+        if (d?.type !== 'tick') return;
+        if (Array.isArray(d.rms) && Array.isArray(d.peak)) this.wk = { rms: [d.rms[0], d.rms[1]], peak: [d.peak[0], d.peak[1]], at: performance.now() };
+        try { this.onAudioBeat(); } catch { /* ignore */ }
+      };
       src.connect(node); node.connect(sink);
       this.clockNode = node; this.clockKind = 'worklet';
     } catch (e) {
@@ -437,8 +476,10 @@ export class AudioEngine {
         const v = Math.abs(this.buf[k]);
         sum += v * v; if (v > peak) peak = v;
       }
-      const rmsDb = toDb(Math.sqrt(sum / this.buf.length));
-      const peakDb = toDb(peak);
+      let rmsDb = toDb(Math.sqrt(sum / this.buf.length));
+      let peakDb = toDb(peak);
+      // AnalyserNode 가 죽어 있는데(-100 미만) AudioWorklet 은 신호를 보면 워클릿 값으로 대체
+      if (rmsDb < -100 && this.wk && now - this.wk.at < 600 && this.wk.rms[i] > -100) { rmsDb = this.wk.rms[i]; peakDb = this.wk.peak[i]; }
       if (peak >= 0.99 && !this.trimOn) this.clipUntil[i] = now + 2000;   // Auto-Trim 중에는 보정 후 값이라 CLIP 판정 안 함
       if (peakDb >= this.peakHold[i] || now - this.peakHoldAt[i] > 1200) {
         this.peakHold[i] = peakDb; this.peakHoldAt[i] = now;

@@ -1,6 +1,6 @@
 import { AudioEngine, type BandStat, listInputs, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE } from './audio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
-import { callAI, parseReply, buildSystemPrompt, isQuotaError, type Genre } from './ai';
+import { callAI, parseReply, buildSystemPrompt, isQuotaError, type Genre, type SanitizeCtx } from './ai';
 import { evaluateBalance, TOL_RANGE } from './balance';
 import { fbParamsFor } from './config';
 import { Glasses } from './glasses';
@@ -163,15 +163,24 @@ let intervalSec = clamp(Math.round(parseFloat(ls.get('lm.interval', String(INTER
 }
 
 // ───────── ⚙️ 설정: 노이즈 게이트 (무음 대기) ─────────
-let gateDb = clamp(parseFloat(ls.get('lm.gate2', String(GATE.defaultDb))), GATE.minDb, GATE.maxDb);
+let gateDb = clamp(parseFloat(ls.get('lm.gate3', String(GATE.defaultDb))), GATE.minDb, GATE.maxDb);
+let gateOn = ls.get('lm.gateOn', '1') !== '0';
 {
   const g = $<HTMLInputElement>('gateSlider');
+  g.min = String(GATE.minDb); g.max = String(GATE.maxDb);
   g.value = String(gateDb);
-  const paint = () => { $('gateInfo').textContent = `${gateDb} dBFS`; };
-  g.oninput = () => { gateDb = +g.value; ls.set('lm.gate2', String(gateDb)); applyGate(); paint(); };
+  const paint = () => {
+    $('gateInfo').textContent = `${gateDb} dBFS`;
+    const b = $('gateBtn');
+    b.textContent = `🚪 무음 시 신호 대기(게이트) 사용 : ${gateOn ? 'ON' : 'OFF'}`;
+    b.classList.toggle('active', gateOn);
+    g.disabled = !gateOn;
+  };
+  g.oninput = () => { gateDb = +g.value; ls.set('lm.gate3', String(gateDb)); applyGate(); paint(); };
+  $('gateBtn').onclick = () => { gateOn = !gateOn; ls.set('lm.gateOn', gateOn ? '1' : '0'); applyGate(); paint(); };
   paint();
 }
-function applyGate() { engine.setGate(true, gateDb); }
+function applyGate() { engine.setGate(gateOn, gateDb); }
 
 // ───────── 2) 오디오 입력: 🎛️ 콘솔 2-Track (USB 인터페이스) 단일 경로 ─────────
 /** Auto-Trim 기본 OFF (Raw dBFS). 설정에서 켜면 기억 */
@@ -256,7 +265,7 @@ engine.setAutoTrim(trimSaved());
 applyGate();
 paintToggles();
 
-$('resetBtn').onclick = () => { advice.resetCooldown(); renderCooldown(); setStatus('쿨다운 초기화됨'); };
+$('resetBtn').onclick = () => { advice.resetCooldown(); renderCooldown(); setStatus('쿨다운 전체 초기화됨'); };
 
 // ───────── 🛡️ 백그라운드 유지 상태 · 📌 PiP 버튼 ─────────
 const KA_ICON: Record<KaState, string> = { off: '–', starting: '…', on: '✔', failed: '✖', unsupported: '미지원' };
@@ -295,8 +304,18 @@ function paintGenre() {
 /** 수신기에 보내는 배지 문구 (무음 대기 중이면 대기 표시) */
 const badgeForSend = () => (engine.idle ? IDLE_TEXT : genreLabel());
 
+/** 아직 조언이 하나도 없을 때 HUD 1번째 조언 줄에 보여 줄 시스템 안내 (22자 이내) */
+let sysLine = '';
+function updateSysLine() {
+  if (!running) { sysLine = ''; return; }
+  if (engine.idle) {
+    const db = engine.lastRawDb;
+    sysLine = `[시스템] 신호 대기중 (${db <= -100 ? '<-100' : Math.round(db)}dB)`;
+  } else sysLine = '[시스템] AI 분석 대기중...';
+}
 function hudLines(): string[] {
   const lines = [fbText, ...advice.lines()];
+  if (running && !advice.items.length && sysLine) lines[1] = sysLine;   // 빈 화면 방지: 조언이 생기면 자동으로 사라짐
   if (aiPaused) lines[4] = QUOTA_MSG;
   return lines;
 }
@@ -316,8 +335,33 @@ function nowPlaying(lines: string[]) {
   const last = [...lines].reverse().find(l => l.trim()) ?? '';
   keep.setNowPlaying(last || 'Live Mix Assistant 분석 중', engine.idle ? '⏸️ 신호 대기 중' : genreLabel() || 'G2 HUD');
 }
-/** 쿨다운은 화면에 표시하지 않음 (내부 목록만 유지 · AI 에 전달) */
-function renderCooldown() { /* 표시 없음 */ }
+/** ⏳ 현재 쿨다운 목록 (분석기 본체 화면 전용 · HUD 수신기에는 보내지 않음) */
+const esc = (t: string) => t.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
+let cdSig = '\u0000';
+function renderCooldown() {
+  const now = Date.now();
+  const list = advice.cooldownList(now);
+  $('cdCount').textContent = `(${list.length}개)`;
+  const box = $('cdList');
+  const sig = list.map(e => e.key).join('\n');
+  const label = (e: (typeof list)[number]) =>
+    `[${e.inst}] ${e.item}${e.detail ? ' ' + (e.detail === '-' ? '↓' : e.detail === '+' ? '↑' : e.detail) : ''} · ${Math.max(0, Math.ceil((e.until - now) / 1000))}초 남음 (${Math.min(e.count, e.trigger)}/${e.trigger}회)`;
+  if (sig === cdSig) {                       // 목록이 같으면 남은 시간 글자만 갱신 (누르는 도중 버튼이 바뀌지 않게)
+    box.querySelectorAll<HTMLElement>('.cdt').forEach((el, i) => { if (list[i]) el.textContent = label(list[i]); });
+    return;
+  }
+  cdSig = sig;
+  box.innerHTML = list.length
+    ? list.map(e => `<span class="cdtag"><span class="cdt">${esc(label(e))}</span><button type="button" data-key="${esc(e.key)}" aria-label="쿨다운 해제">✕</button></span>`).join('')
+    : '<div class="hint">쿨다운 중인 조언이 없습니다</div>';
+}
+$('cdList').addEventListener('click', e => {
+  const b = (e.target as HTMLElement).closest('button[data-key]') as HTMLElement | null;
+  if (!b) return;
+  advice.removeCooldown(b.dataset.key!);
+  renderCooldown();
+  setStatus('쿨다운 항목 해제됨');
+});
 
 // ───────── 오디오 시작/정지 ─────────
 const modeName = () => '🎛️ 콘솔 2-Track (USB)';
@@ -336,7 +380,7 @@ async function startAudio() {
   const parts: string[] = [];
   parts.push(`${modeName()} · ${info?.label || '기본 장치'} · ${ch || '?'}ch · ${info?.step ?? 1}차 방식으로 열림`);
   if (info?.usb) parts.push('🔌 USB 오디오 인터페이스를 내장 마이크보다 우선 연결했습니다');
-  parts.push(`🚪 노이즈 게이트 ${gateDb} dBFS · ${GATE.enterMs / 1000}초 이상 무음이면 대기`);
+  parts.push(gateOn ? `🚪 노이즈 게이트 ${gateDb} dBFS · ${GATE.enterMs / 1000}초 이상 무음이면 대기` : '🚪 노이즈 게이트 OFF (무음에도 계속 분석)');
   if (ch === 1) parts.push('⚠ 모노로 열렸습니다 (R = L 복제)');
   if (info?.step === 3) parts.push('⚠ 기본 모드로 열림: OS 음성 보정(에코 제거/노이즈 억제/AGC)이 켜져 있을 수 있습니다');
   else if (st && (st.echoCancellation || st.noiseSuppression || st.autoGainControl)) parts.push('⚠ 브라우저가 음성 보정을 끄지 못했습니다 (EC/NS/AGC 일부 ON)');
@@ -423,12 +467,14 @@ engine.onIdleChange = idle => {
   if (idle) {
     localLevels = [{ rmsDb: -120, peakDb: -120, clip: false }, { rmsDb: -120, peakDb: -120, clip: false }];
     showBands(null);
-    setStatus('⏸️ 신호 대기 중 · 게이트 아래 무음' + (engine.autoTrim ? ' (Auto-Trim 0dB 동결)' : ''));
+    setStatus('⏸️ 신호 대기 중 · 마지막 조언은 HUD에 유지' + (engine.autoTrim ? ' (Auto-Trim 0dB 동결)' : ''));
   } else {
     lastCollectAt = now; lastAnalyzeAt = now;        // 음악이 다시 나오면 새 구간부터 분석
+    advice.refreshAge(now);                          // 대기 중 유지된 조언의 만료 시계 재시작
     setStatus(`실행 중 · ${modeName()} · 신호 감지 → 분석 재개`);
   }
   paintGenre(); paintToggles();
+  updateSysLine(); lastRendered = ''; render();      // 조언 줄은 지우지 않고 그대로 (비어 있을 때만 시스템 안내)
   sender.update({ genre: badgeForSend(), genreAt: idle ? 0 : genreAt, levels: localLevels }, true);
 };
 engine.onEnded = () => { if (running) { setStatus('입력이 종료되었습니다 (오디오 공유 종료/장치 분리)'); void stop(); } };
@@ -484,7 +530,8 @@ function masterTick() {
 }
 
 function secondTick() {
-  if (advice.tick(Date.now())) render();
+  updateSysLine();
+  if (!engine.idle && advice.tick(Date.now())) render();   // 신호 대기 중에는 조언을 만료시키지 않고 그대로 유지
   renderCooldown();
   paintGenre();
   updateLiveBands();
@@ -590,7 +637,13 @@ async function analyze() {
   try {
     const raw = await callAI(provider(), currentModel(), key, buildSystemPrompt(tol),
       `최근 ${windowSec}초 분석 데이터(JSON):\n${JSON.stringify(payload)}`);
-    const res = parseReply(raw);
+    const sctx: SanitizeCtx = {
+      voiceSharePct: spec.voiceBandSharePct, centroidHz: spec.spectralCentroidHz,
+      rel: Object.fromEntries(Object.entries(bands).map(([n, b]) => [n, b.relDb])),
+      crest: Object.fromEntries(Object.entries(bands).map(([n, b]) => [n, b.crestDb])),
+      density: dyn.transientDensityPerMin,
+    };
+    const res = parseReply(raw, sctx);
     if (res.genre) { genre = res.genre; genreAt = Date.now(); paintGenre(); sender.update({ genre: badgeForSend(), genreAt }); }
     const added = advice.ingest(res.advice, Date.now());
     const text = raw.trim().replace(/\s+/g, ' ');
