@@ -8,11 +8,14 @@ export function buildSystemPrompt(tolDb: number): string {
   return `너는 라이브 FOH와 스튜디오 믹싱을 모두 해 본 시니어 음향 엔지니어다. 꼭 필요할 때만 말한다.
 
 [최우선 규칙 — [대상] 표기]
-- 절대 \`[]\` 대괄호 안에 \`[서브]\`, \`[로우]\`, \`[로우-미드]\`, \`[미드]\`, \`[하이-미드]\`, \`[하이]\`, \`[저역]\`, \`[중역]\`, \`[고역]\`, \`[전체]\`, \`[마스터]\` 같은 주파수 대역명이나 추상적 명칭을 넣지 마라.
-- 반드시 분석된 주파수 에너지와 지표를 바탕으로 가장 유력한 구체적 악기 또는 남/여 보컬을 특정해서 적어라.
-- 허용되는 [대상] 예시: [남성보컬], [여성보컬], [메인보컬], [코러스], [킥], [스네어], [하이햇], [탐], [오버헤드], [베이스], [일렉기타], [어쿠스틱기타], [피아노], [건반], [신스], [브라스], [스트링]
-- 남/여 보컬 구분: voiceBandSharePct 가 높게 활성화돼 있을 때 spectralCentroidHz 와 relativeSpectralBalanceDb 의 Low-Mid(150~350Hz) 대비 Mid·High-Mid 비율을 본다. 기본음/포먼트가 낮아 Low-Mid 우세·무게중심이 낮으면 [남성보컬], Mid·High-Mid 우세·무게중심이 높으면 [여성보컬]로 적극 추정하라. 도저히 가를 수 없고 보컬이 하나뿐일 때만 [메인보컬].
-- 이 규칙을 어긴 줄은 시스템이 자동 치환하지만 정확도가 떨어지므로 처음부터 정확한 악기/보컬명을 써라.
+- \`[]\` 안에는 실제로 콘솔에서 조절해야 할 대상(채널·그룹·버스)을 적어라. 무엇을 적을지는 분석 지표를 근거로 네가 판단해라.
+  · 개별 악기: 예) [킥], [스네어], [하이햇], [탐], [오버헤드], [베이스], [일렉기타], [어쿠스틱기타], [피아노], [건반], [신스], [브라스], [스트링]
+  · 보컬: 가능하면 남/여를 구분해라. 예) [남성보컬], [여성보컬], [메인보컬], [코러스]
+  · 그룹/버스/마스터: 특정 악기가 아니라 묶음이나 전체 출력을 만져야 할 때. 예) [드럼버스], [보컬그룹], [마스터]
+  · 위 예시는 참고일 뿐 목록 밖 대상도 허용한다.
+- \`[]\` 안에 \`[서브]\`, \`[로우]\`, \`[로우-미드]\`, \`[미드]\`, \`[하이-미드]\`, \`[하이]\`, \`[저역]\`, \`[중역]\`, \`[고역]\` 같은 주파수 대역명을 넣지 마라. 대역은 조절 대상이 아니라 조치 내용(예: EQ:250Hz -3dB)에 적는다.
+- 남/여 보컬 구분 참고: voiceBandSharePct 가 높게 활성화돼 있을 때 spectralCentroidHz 와 relativeSpectralBalanceDb 의 Low-Mid(150~350Hz) 대비 Mid·High-Mid 비율을 본다. Low-Mid 우세·무게중심이 낮으면 남성, Mid·High-Mid 우세·무게중심이 높으면 여성 쪽이다. 가를 수 없으면 [메인보컬].
+
 일반적인 다이내믹 변화나 편곡상 악기가 치고 나오는 자연스러운 강조는 문제로 지적하지 마라. 밸런스가 무난하거나 완성된 음원 수준이면 억지로 조언을 짜내지 말고 \`NONE\`을 출력해라. 애매하면 \`NONE\`.
 
 입력은 2트랙(스테레오 믹스) 분석 JSON이다:
@@ -56,7 +59,7 @@ deltaDb 는 "일반 음악" 타겟 기준이므로, 판별한 장르 특성(힙�
 출력 형식(엄수):
 1줄: \`GENRE:<장르/세부 스타일>\` (Solo는 \`GENRE:Solo|<악기이름>\`)
 2줄부터: \`NONE\` 또는 조언 최대 4줄 (중요한 순서대로, 보통 1~2줄이면 충분)
-- 각 조언 줄 형식: \`[대상악기 또는 남/여 보컬] 항목:조치내용\` (대상에 대역명 금지) · 공백 포함 ${MAX_LINE_CHARS}자 이내 단문 (G2 안경 HUD 한 줄)
+- 각 조언 줄 형식: \`[조절 대상] 항목:조치내용\` (대상 = 악기·보컬·그룹/마스터, 대역명 금지) · 공백 포함 ${MAX_LINE_CHARS}자 이내 단문 (G2 안경 HUD 한 줄)
 - currentDisplay 나 cooldownList 와 같은 악기·같은 항목의 지적은 출력하지 마라.
 - 그 밖의 설명, 번호, 마크다운은 출력하지 마라.`;
 }
@@ -156,54 +159,7 @@ function parseGenre(cat: string, inst?: string): Genre {
  * 응답 파싱: 첫 줄 `GENRE:장르[|악기]`, 이어서 `NONE` 또는 조언 최대 4줄
  * 조언 형식: `[대상악기] 항목:조치` — 항목은 Level/EQ/Comp 뿐 아니라 HPF/LPF/Reverb/Delay/De-Esser/Gate/DynEQ/Pan… 모두 허용
  */
-/** [대상]에 대역명이 나왔을 때 악기/보컬로 바꾸기 위한 분석 지표 */
-export interface SanitizeCtx {
-  voiceSharePct: number;            // 120Hz-4kHz 점유율
-  centroidHz: number;               // 스펙트럼 무게중심
-  rel: Record<string, number>;      // 6밴드 상대 에너지(dB)
-  crest: Record<string, number>;    // 6밴드 Crest(dB)
-  density: { low: number; mid: number; highMid: number };   // 분당 어택 수
-}
-/** 음성대역 비율이 이 값 이상이면 '음성이 두드러진 상태'로 본다 (현장에서 조정 가능) */
-export const VOICE_HIGH_PCT = 88;
-const LOW_TRANSIENT_PER_MIN = 25, HIGHMID_TRANSIENT_PER_MIN = 40, MID_TRANSIENT_PER_MIN = 30, KICK_CREST_DB = 18;
-
-type BandKey = 'sub' | 'low' | 'lowmid' | 'mid' | 'highmid' | 'high' | 'whole';
-/** 대괄호 안 이름이 주파수 대역명/추상 명칭이면 어떤 대역인지 */
-export function bandAlias(inst: string): BandKey | null {
-  const t = inst.toLowerCase().replace(/[\s\-_/·]+/g, '');
-  if (/^(서브|초저역|초저음|서브베이스|sub|subbass|subs)$/.test(t)) return 'sub';
-  if (/^(로우미드|중저역|중저음|저중역|lowmid|lowmids|lowmidrange)$/.test(t)) return 'lowmid';
-  if (/^(하이미드|중고역|중고음|고중역|highmid|highmids|himid|hmid)$/.test(t)) return 'highmid';
-  if (/^(로우|저역|저음|저음역|저주파|low|lows|bass?end)$/.test(t)) return 'low';
-  if (/^(미드|중역|중음|중음역|미들|mid|mids|midrange|middle)$/.test(t)) return 'mid';
-  if (/^(하이|고역|고음|고음역|고주파|에어|트레블|high|highs|air|treble)$/.test(t)) return 'high';
-  if (/^(전체|전대역|마스터|마스터링|믹스|메인믹스|합|스테레오|master|mix|full|all|overall)$/.test(t)) return 'whole';
-  return null;
-}
-
-/** 지표로 남/여 보컬을 추정: Low-Mid 대비 Mid·High-Mid 가 크고 무게중심이 높으면 여성 */
-function vocalFor(c: SanitizeCtx): string {
-  const score = ((c.rel['Mid'] ?? 0) + (c.rel['High-Mid'] ?? 0)) / 2 - (c.rel['Low-Mid'] ?? 0);
-  return score >= 3 || c.centroidHz >= 2000 ? '여성보컬' : '남성보컬';
-}
-
-/** 대역명 [대상] → 악기/보컬명으로 강제 치환 (모델이 규칙을 어긴 경우의 안전장치) */
-export function instrumentForBand(band: BandKey, c: SanitizeCtx): string {
-  const voice = c.voiceSharePct >= VOICE_HIGH_PCT;
-  const kickLike = (crest: number) => c.density.low >= LOW_TRANSIENT_PER_MIN || crest >= KICK_CREST_DB;
-  switch (band) {
-    case 'sub': return kickLike(c.crest['Sub'] ?? 0) ? '킥' : '베이스';
-    case 'low': return kickLike(c.crest['Low'] ?? 0) ? '킥' : '베이스';
-    case 'lowmid': return voice ? '남성보컬' : c.density.mid >= MID_TRANSIENT_PER_MIN ? '일렉기타' : '건반';
-    case 'mid': return voice ? vocalFor(c) : '일렉기타';
-    case 'highmid': return voice ? '여성보컬' : c.density.highMid >= HIGHMID_TRANSIENT_PER_MIN ? '스네어' : '일렉기타';
-    case 'high': return voice ? '여성보컬' : c.density.highMid >= HIGHMID_TRANSIENT_PER_MIN ? '하이햇' : '오버헤드';
-    case 'whole': return voice ? vocalFor(c) : '건반';
-  }
-}
-
-export function parseReply(raw: string, ctx?: SanitizeCtx): ParsedReply {
+export function parseReply(raw: string): ParsedReply {
   let genre: Genre | null = null;
   const advice: Candidate[] = [];
   let sawNone = false;
@@ -215,10 +171,7 @@ export function parseReply(raw: string, ctx?: SanitizeCtx): ParsedReply {
     if (/^NONE$/i.test(s)) { sawNone = true; continue; }
     const a = splitAdvice(s);
     if (a && advice.length < 4) {
-      // 2중 방어: [로우-미드] 같은 대역명이 나오면 지표로 악기/보컬명으로 치환
-      const band = bandAlias(a.inst);
-      const inst = band && ctx ? instrumentForBand(band, ctx) : band ? (band === 'low' || band === 'sub' ? '베이스' : '건반') : a.inst;
-      const text = clampText(`[${inst}] ${a.item}:${a.action}`);
+      const text = clampText(`[${a.inst}] ${a.item}:${a.action}`);
       if (!advice.some(x => x.tag === text)) advice.push({ tag: text, text });
     }
   }

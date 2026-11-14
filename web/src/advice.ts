@@ -155,9 +155,6 @@ export class AdviceManager {
     return accepted;
   }
 
-  /** 신호 대기에서 돌아올 때: 대기 중 유지된 조언의 만료 시계를 지금부터 다시 시작 */
-  refreshAge(now: number) { this.items.forEach(i => { i.at = now; }); }
-
   /** 오래된 조언을 가장 오래된 것부터 한 줄씩 제거. 변경되면 true */
   tick(now: number): boolean {
     this.purge(now);

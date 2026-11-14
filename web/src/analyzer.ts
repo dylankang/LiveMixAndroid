@@ -1,6 +1,6 @@
 import { AudioEngine, type BandStat, listInputs, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE } from './audio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
-import { callAI, parseReply, buildSystemPrompt, isQuotaError, type Genre, type SanitizeCtx } from './ai';
+import { callAI, parseReply, buildSystemPrompt, isQuotaError, type Genre } from './ai';
 import { evaluateBalance, TOL_RANGE } from './balance';
 import { fbParamsFor } from './config';
 import { Glasses } from './glasses';
@@ -304,7 +304,7 @@ function paintGenre() {
 /** 수신기에 보내는 배지 문구 (무음 대기 중이면 대기 표시) */
 const badgeForSend = () => (engine.idle ? IDLE_TEXT : genreLabel());
 
-/** 아직 조언이 하나도 없을 때 HUD 1번째 조언 줄에 보여 줄 시스템 안내 (22자 이내) */
+/** HUD 시스템 안내 (22자 이내) — 신호 대기 중: 맨 윗줄 / 분석 중인데 조언이 아직 없을 때: 첫 조언 줄 */
 let sysLine = '';
 function updateSysLine() {
   if (!running) { sysLine = ''; return; }
@@ -315,7 +315,8 @@ function updateSysLine() {
 }
 function hudLines(): string[] {
   const lines = [fbText, ...advice.lines()];
-  if (running && !advice.items.length && sysLine) lines[1] = sysLine;   // 빈 화면 방지: 조언이 생기면 자동으로 사라짐
+  if (running && engine.idle && sysLine && !fbText) lines[0] = sysLine;          // 신호 대기: 맨 윗줄에 항상 표시 (조언은 그대로 시간에 맞춰 사라짐)
+  else if (running && !advice.items.length && sysLine) lines[1] = sysLine;       // 빈 화면 방지: 조언이 생기면 자동으로 사라짐
   if (aiPaused) lines[4] = QUOTA_MSG;
   return lines;
 }
@@ -467,14 +468,13 @@ engine.onIdleChange = idle => {
   if (idle) {
     localLevels = [{ rmsDb: -120, peakDb: -120, clip: false }, { rmsDb: -120, peakDb: -120, clip: false }];
     showBands(null);
-    setStatus('⏸️ 신호 대기 중 · 마지막 조언은 HUD에 유지' + (engine.autoTrim ? ' (Auto-Trim 0dB 동결)' : ''));
+    setStatus('⏸️ 신호 대기 중 · 게이트 아래 무음' + (engine.autoTrim ? ' (Auto-Trim 0dB 동결)' : ''));
   } else {
     lastCollectAt = now; lastAnalyzeAt = now;        // 음악이 다시 나오면 새 구간부터 분석
-    advice.refreshAge(now);                          // 대기 중 유지된 조언의 만료 시계 재시작
     setStatus(`실행 중 · ${modeName()} · 신호 감지 → 분석 재개`);
   }
   paintGenre(); paintToggles();
-  updateSysLine(); lastRendered = ''; render();      // 조언 줄은 지우지 않고 그대로 (비어 있을 때만 시스템 안내)
+  updateSysLine(); lastRendered = ''; render();      // 신호 대기 안내 표시/해제
   sender.update({ genre: badgeForSend(), genreAt: idle ? 0 : genreAt, levels: localLevels }, true);
 };
 engine.onEnded = () => { if (running) { setStatus('입력이 종료되었습니다 (오디오 공유 종료/장치 분리)'); void stop(); } };
@@ -531,7 +531,7 @@ function masterTick() {
 
 function secondTick() {
   updateSysLine();
-  if (!engine.idle && advice.tick(Date.now())) render();   // 신호 대기 중에는 조언을 만료시키지 않고 그대로 유지
+  if (advice.tick(Date.now())) render();      // 조언은 신호 대기 중에도 지정된 시간이 지나면 사라짐
   renderCooldown();
   paintGenre();
   updateLiveBands();
@@ -637,13 +637,7 @@ async function analyze() {
   try {
     const raw = await callAI(provider(), currentModel(), key, buildSystemPrompt(tol),
       `최근 ${windowSec}초 분석 데이터(JSON):\n${JSON.stringify(payload)}`);
-    const sctx: SanitizeCtx = {
-      voiceSharePct: spec.voiceBandSharePct, centroidHz: spec.spectralCentroidHz,
-      rel: Object.fromEntries(Object.entries(bands).map(([n, b]) => [n, b.relDb])),
-      crest: Object.fromEntries(Object.entries(bands).map(([n, b]) => [n, b.crestDb])),
-      density: dyn.transientDensityPerMin,
-    };
-    const res = parseReply(raw, sctx);
+    const res = parseReply(raw);
     if (res.genre) { genre = res.genre; genreAt = Date.now(); paintGenre(); sender.update({ genre: badgeForSend(), genreAt }); }
     const added = advice.ingest(res.advice, Date.now());
     const text = raw.trim().replace(/\s+/g, ' ');
