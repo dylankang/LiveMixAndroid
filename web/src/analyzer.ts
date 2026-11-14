@@ -1,4 +1,4 @@
-import { AudioEngine, KeepAliveAudio, type BandStat, type InputMode, listInputs, requestMicPermission, systemCaptureSupported, DEFAULT_INPUT_ID, TRIM } from './audio';
+import { AudioEngine, type BandStat, type InputMode, listInputs, requestMicPermission, systemCaptureSupported, DEFAULT_INPUT_ID, TRIM } from './audio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
 import { callAI, parseReply, buildSystemPrompt, isQuotaError, type Genre } from './ai';
 import { evaluateBalance, TOL_RANGE } from './balance';
@@ -7,6 +7,7 @@ import { Glasses } from './glasses';
 import { HudSender, HudReceiver, linesToShow, type BandRow, type LevelPkt, type MixState, type ReceiverInfo } from './link';
 import { renderBandTable, paintMeters, paintHud, genreText, clock } from './views';
 import { setTicker, clearTicker } from './ticker';
+import { KeepAlive, PipMonitor, type KaState } from './keepalive';
 import { BANDS, PROVIDERS, INTERVAL_RANGE, type ProviderId } from './config';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -16,7 +17,8 @@ const ls = {
 };
 
 const engine = new AudioEngine();
-const keepAudio = new KeepAliveAudio();
+const keep = new KeepAlive();
+const pip = new PipMonitor();
 const advice = new AdviceManager();
 const glasses = new Glasses();
 const sender = new HudSender();
@@ -302,6 +304,36 @@ paintMode();
 
 $('resetBtn').onclick = () => { advice.resetCooldown(); renderCooldown(); setStatus('쿨다운 초기화됨'); };
 
+// ───────── 🛡️ 백그라운드 유지 상태 · 📌 PiP 버튼 · WAV 유지 설정 ─────────
+const KA_ICON: Record<KaState, string> = { off: '–', starting: '…', on: '✔', failed: '✖', unsupported: '미지원' };
+/** 모니터링 모드에서 WAV 유지 사용 여부 (유튜브가 멈추면 끔). 콘솔 모드는 항상 사용 */
+let wavInMonitor = ls.get('lm.wavMon', '1') !== '0';
+const useWav = () => mode === 'console' || wavInMonitor;
+function paintKeep() {
+  $('keepState').textContent = running
+    ? `🛡️ 백그라운드 유지  WebRTC ${KA_ICON[keep.rtc]} · WAV ${useWav() ? KA_ICON[keep.wav] : '끔'} · PiP ${KA_ICON[pip.state]}`
+    : '🛡️ 시작하면 백그라운드 유지 장치(WebRTC·WAV)가 함께 켜집니다';
+  const b = $<HTMLButtonElement>('pipBtn');
+  b.disabled = pip.state === 'unsupported' || pip.state === 'starting';
+  b.classList.toggle('active', pip.active);
+  b.textContent = pip.state === 'unsupported' ? '📌 PiP 팝업 (이 브라우저 미지원)'
+    : pip.active ? '📌 PiP 팝업 켜짐 · 누르면 닫기' : '📌 앱 전환 시 멈춤 방지 (PiP 팝업)';
+  const w = $('wavBtn');
+  w.textContent = `🔈 모니터링 모드에서 WAV 유지 재생 : ${wavInMonitor ? 'ON' : 'OFF'}`;
+  w.classList.toggle('active', wavInMonitor);
+}
+keep.onChange = paintKeep;
+pip.onChange = paintKeep;
+$('pipBtn').onclick = () => {
+  void pip.toggle(() => pip.draw(localLevels, hudLines(), genreText(genreLabel(), genreAt), $('status').textContent || ''));
+};
+$('wavBtn').onclick = async () => {
+  wavInMonitor = !wavInMonitor; ls.set('lm.wavMon', wavInMonitor ? '1' : '0');
+  if (running && mode === 'monitor' && engine.inputStream) await keep.start(engine.inputStream, useWav());
+  paintKeep();
+};
+paintKeep();
+
 // ───────── 렌더링 (폰 + 글래스 5줄 동기화) ─────────
 function genreLabel(): string {
   if (!genre) return '';
@@ -334,27 +366,8 @@ function render() {
   paintHud(lines);
   glasses.update(lines);
 }
-/** HUD 아래 쿨다운 태그: [건반 EQ] 85s × — 터치하면 개별 해제 */
-function renderCooldown() {
-  const box = $('cdTags');
-  const now = Date.now();
-  const list = advice.cooldownList(now);
-  const sig = list.map(c => c.key).join('|');
-  if (box.dataset.sig !== sig) {
-    box.dataset.sig = sig;
-    box.innerHTML = '';
-    for (const c of list) {
-      const b = document.createElement('button');
-      b.type = 'button'; b.dataset.key = c.key; b.title = '터치하면 쿨다운 해제';
-      b.onclick = () => { advice.removeCooldown(c.key); renderCooldown(); setStatus(`쿨다운 해제: ${c.label}`); };
-      box.appendChild(b);
-    }
-  }
-  box.querySelectorAll<HTMLButtonElement>('button').forEach((b, i) => {
-    const c = list[i];
-    if (c) b.textContent = `${c.label} ${Math.max(0, Math.ceil((c.until - now) / 1000))}s ×`;
-  });
-}
+/** 쿨다운은 화면에 표시하지 않음 (내부 목록만 유지 · AI 에 전달) */
+function renderCooldown() { /* 표시 없음 */ }
 
 // ───────── 오디오 시작/정지 ─────────
 const modeName = () => (mode === 'console' ? '🎛️ 콘솔 2-Track' : '▶️ 유튜브/재생음 모니터링');
@@ -364,11 +377,10 @@ async function startAudio() {
   await engine.start(mode, deviceSel.value || DEFAULT_INPUT_ID);
   if (mode === 'console') refreshDevices().catch(() => {});   // 권한 승인 직후: 실제 장치 이름으로 목록 갱신
 
-  // 백그라운드 유지: 콘솔 = <audio loop> + 미디어 세션 / 모니터링 = <audio> 금지 (유튜브 오디오 포커스 보호)
-  if (mode === 'console') {
-    const ok = await keepAudio.start();
-    if (!ok) showNotice('백그라운드 유지용 오디오를 시작하지 못했습니다. 화면을 한 번 터치하면 다시 시도합니다.');
-  } else keepAudio.stop();
+  // 🛡️ 3중 백그라운드 유지: A. WebRTC 루프백 + B. WAV 루프·미디어 세션 (+ C. PiP 는 버튼으로)
+  const stream = engine.inputStream;
+  if (stream) await keep.start(stream, useWav());
+  if (keep.rtc === 'failed' && keep.wav !== 'on') showNotice('백그라운드 유지 장치를 시작하지 못했습니다. 앱을 전환하기 전에 [📌 PiP 팝업]을 켜 주세요.');
 
   const info = engine.openInfo, st = info?.settings, ch = engine.channels;
   const parts: string[] = [];
@@ -379,7 +391,6 @@ async function startAudio() {
   if (ch === 1) parts.push('⚠ 모노로 열렸습니다 (R = L 복제)');
   if (info?.step === 3) parts.push('⚠ 기본 모드로 열림: OS 음성 보정(에코 제거/노이즈 억제/AGC)이 켜져 있을 수 있습니다');
   else if (st && (st.echoCancellation || st.noiseSuppression || st.autoGainControl)) parts.push('⚠ 브라우저가 음성 보정을 끄지 못했습니다 (EC/NS/AGC 일부 ON)');
-  parts.push(mode === 'console' ? '🔋 백그라운드 유지: 무음 루프 재생 중 (알림에 표시)' : '🔋 백그라운드 유지: 오디오 엔진 내부 노드 (유튜브를 멈추지 않음)');
   if (engine.state !== 'running') parts.push('⚠ 오디오 엔진이 대기 상태입니다. 화면을 한 번 터치해 주세요');
   $('inputInfo').textContent = parts.join('\n');
   paintToggles();
@@ -388,7 +399,7 @@ async function startAudio() {
 document.addEventListener('pointerdown', () => {
   if (!running) return;
   engine.resumeCtx();
-  if (mode === 'console' && !keepAudio.playing) void keepAudio.start();
+  keep.heal();
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible' || !running) return;
@@ -412,7 +423,7 @@ startBtn.onclick = async () => {
     showError(describeError(e));
     setStatus('시작 실패 — 버튼 아래 원인을 확인하세요');
     try { await engine.stop(); } catch { /* ignore */ }
-    keepAudio.stop();
+    keep.stop();
     startBtn.disabled = false; startBtn.textContent = '시작';
     starting = false;
     return;
@@ -434,7 +445,8 @@ async function stop() {
   clearTicker(ticker); ticker = 0;
   tellNative(false);
   await engine.stop();
-  keepAudio.stop();
+  keep.stop();
+  void pip.close();
   localLevels = null;
   startBtn.textContent = '시작'; startBtn.classList.remove('on');
   setStatus('정지');
@@ -489,6 +501,7 @@ function masterTick() {
   if (hit) { fbText = `⚠️ 피드백: ${hit.hz}Hz`; fbUntil = now + FB_HOLD_MS; }
   else if (fbText && now > fbUntil) fbText = '';
   render();
+  if (pip.active) pip.draw(localLevels, hudLines(), engine.idle ? IDLE_TEXT : genreText(genreLabel(), genreAt), $('status').textContent || '');
   if (tickN % 2 === 0 && localLevels) sender.sendLevels(localLevels[0], localLevels[1]);   // 0.2초: 레벨
   if (now - lastSecondAt >= 1000) { lastSecondAt = now; secondTick(); }
   if (engine.idle) lastAnalyzeAt = now;           // 무음 대기: AI 호출 일시 중지
@@ -501,7 +514,8 @@ function secondTick() {
   paintGenre();
   updateLiveBands();
   paintToggles();
-  if (mode === 'console' && keepAudio.active && !keepAudio.playing) void keepAudio.start();   // 시스템이 멈춘 무음 루프 재개
+  keep.heal();                                // 시스템이 멈춘 유지 재생 재개
+  paintKeep();
   sender.update({ genre: badgeForSend(), genreAt: engine.idle ? 0 : genreAt, levels: localLevels });
   sender.publish();                           // 1초마다 전체 상태 retain 발행
   $('bandInfo').textContent = `${engine.autoTrim ? 'Auto-Trim 기준' : 'Raw'} · 엔진 ${engine.state}${recoverCount ? ` · 자동 복구 ${recoverCount}회` : ''}`;

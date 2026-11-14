@@ -42,6 +42,8 @@
         <button id="startBtn" class="primary" type="button">시작</button>
         <button id="resetBtn" type="button">쿨다운 초기화</button>
       </div>
+      <button id="pipBtn" class="toggle pip" type="button">📌 앱 전환 시 멈춤 방지 (PiP 팝업)</button>
+      <div id="keepState" class="hint"></div>
       <div id="inputInfo" class="hint"></div>
     </section>
 
@@ -79,7 +81,6 @@
         <div class="hud-line" id="hud3"></div>
         <div class="hud-line" id="hud4"></div>
       </div>
-      <div id="cdTags" class="cdtags" aria-label="쿨다운 중인 조언 (터치하면 해제)"></div>
     </section>
 
     <!-- 6) 6밴드 실시간 분석 -->
@@ -140,13 +141,15 @@
           </select>
         </label>
       </div>
-      <div class="hint">쿨다운 중인 조언은 HUD 아래 태그로 표시되며, 태그를 누르면 개별 해제됩니다.</div>
+      <div class="hint">쿨다운 중인 조언은 화면에 따로 표시하지 않고 같은 조언만 걸러 냅니다. 메인 화면의 [쿨다운 초기화]로 전체 해제할 수 있습니다.</div>
 
       <h3>입력 신호</h3>
       <button id="thruBtn" class="toggle" type="button"></button>
       <div id="thruHint" class="hint"></div>
       <button id="trimBtn" class="toggle" type="button"></button>
       <div id="trimHint" class="hint"></div>
+      <button id="wavBtn" class="toggle" type="button"></button>
+      <div class="hint">백그라운드 유지용 초미세 신호(-65 dBFS) 재생입니다. 콘솔 모드는 항상 켜집니다. 모니터링 모드에서 유튜브가 일시정지되면 OFF로 바꾸고 [📌 PiP 팝업]을 사용하세요.</div>
       <label>노이즈 게이트 (실시간 유튜브/재생음 모드) <small id="gateInfo"></small>
         <input id="gateSlider" type="range" min="-55" max="-20" step="1" />
       </label>

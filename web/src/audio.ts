@@ -16,54 +16,6 @@ export const TRIM = {
   minDb: -20, maxDb: 40,
 } as const;
 
-/** 백그라운드 유지용 '들리지 않는' 루프 WAV: 15Hz · -50 dBFS · 1초(15주기 → 이음새 없음)
- *  완전 무음(0)은 크롬이 '소리 없는 탭'으로 보고 백그라운드에서 멈출 수 있어 귀·스피커로는 안 들리는 초저역을 쓴다 */
-function makeKeepWav(rate = 8000): Blob {
-  const n = rate, amp = Math.round(0.00316 * 32767);
-  const buf = new ArrayBuffer(44 + n * 2);
-  const v = new DataView(buf);
-  const str = (o: number, t: string) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
-  str(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
-  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
-  str(36, 'data'); v.setUint32(40, n * 2, true);
-  for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, Math.round(amp * Math.sin(2 * Math.PI * 15 * i / rate)), true);
-  return new Blob([buf], { type: 'audio/wav' });
-}
-
-/** 콘솔 모드 전용 백그라운드 유지: <audio loop> 재생 + 미디어 세션(안드로이드 알림) → 화면이 꺼져도 크롬이 탭을 절전시키지 않음.
- *  유튜브 모니터링 모드에서는 오디오 포커스를 뺏어 유튜브가 멈추므로 절대 재생하지 않는다. */
-export class KeepAliveAudio {
-  private el: HTMLAudioElement | null = null;
-  private url = '';
-  active = false;
-  async start(): Promise<boolean> {
-    if (!this.el) {
-      this.url = URL.createObjectURL(makeKeepWav());
-      const a = document.createElement('audio');
-      a.src = this.url; a.loop = true; a.volume = 1;
-      a.setAttribute('playsinline', '');
-      this.el = a;
-    }
-    try {
-      await this.el.play();
-      this.active = true;
-      const ms: any = (navigator as any).mediaSession;
-      if (ms && typeof (window as any).MediaMetadata === 'function') {
-        ms.metadata = new (window as any).MediaMetadata({ title: 'Live Mix Assistant 분석 중', artist: '콘솔 2-Track 입력' });
-        try { ms.setActionHandler('pause', () => { /* 분석 유지: 알림의 일시정지는 무시 */ void this.el?.play(); }); } catch { /* ignore */ }
-      }
-      return true;
-    } catch (e) { console.warn('백그라운드 유지 오디오 재생 실패', e); this.active = false; return false; }
-  }
-  stop() {
-    this.active = false;
-    if (this.el) { this.el.pause(); this.el.currentTime = 0; }
-    try { const ms: any = (navigator as any).mediaSession; if (ms) ms.metadata = null; } catch { /* ignore */ }
-  }
-  get playing() { return !!this.el && !this.el.paused; }
-}
-
 const NO_MIC_MSG = '이 페이지에서는 마이크를 사용할 수 없습니다 (HTTPS 주소가 아니거나 브라우저/웹뷰가 차단함)';
 export const micAvailable = () => !!navigator.mediaDevices?.getUserMedia;
 /** 시스템/화면 오디오 캡처 지원 여부 (모바일 브라우저는 미지원) */
@@ -355,6 +307,8 @@ export class AudioEngine {
     return true;
   }
   get state() { return this.ctx?.state ?? 'closed'; }
+  /** 열려 있는 입력 스트림 (WebRTC 루프백 유지용) */
+  get inputStream(): MediaStream | undefined { return this.stream; }
 
   /** 🎧 입력 신호 출력 모니터링: 원본 입력을 audioContext.destination 으로 직접 연결/해제 (하울링 주의) */
   setThru(on: boolean) {
