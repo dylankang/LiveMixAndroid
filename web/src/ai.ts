@@ -9,7 +9,7 @@ export function buildSystemPrompt(tolDb: number): string {
 일반적인 다이내믹 변화나 편곡상 악기가 치고 나오는 자연스러운 강조는 문제로 지적하지 마라. 밸런스가 무난하거나 완성된 음원 수준이면 억지로 조언을 짜내지 말고 \`NONE\`을 출력해라. 애매하면 \`NONE\`.
 
 입력은 2트랙(스테레오 믹스) 분석 JSON이다:
-- inputMode: console-2track-raw(콘솔 2트랙 직결, 절대 레벨 의미 있음) | playback-monitor-autotrim(재생음 모니터링, 레벨은 -18dBFS 기준으로 자동 정규화됨 → 절대 레벨이 아니라 상대 비율로 판단). captureNote 가 있으면 반드시 고려(예: 폰 마이크 수음은 저역이 깎여 들어옴).
+- inputMode: console-2track-raw(FOH 콘솔 → USB 인터페이스 2트랙 직결, 절대 레벨 의미 있음). levelReference 가 auto-trim 이면 레벨은 -18dBFS 기준으로 정규화된 것이므로 상대 비율로 판단. captureNote 가 있으면 고려.
 - bands: 6개 대역(Sub 20-60, Low 60-250, Low-Mid 250-500, Mid 500-2k, High-Mid 2k-6k, High 6k-16k Hz)의 avgDb/peakDb/crestDb, deltaDb(일반 음악 타겟 커브 보정 후 평균 대비 편차 · +과다 −부족 · Solo면 null), active, character(transient/sustained/mixed)
 - features (장르·문제 판단 핵심 지표):
   · relativeSpectralBalanceDb: 6개 대역 전체 평균 대비 상대 에너지(dB). 수음 경로로 저역이 깎여도 중·고역 비율로 판단할 것
@@ -54,7 +54,7 @@ deltaDb 는 "일반 음악" 타겟 기준이므로, 판별한 장르 특성(힙�
 - 그 밖의 설명, 번호, 마크다운은 출력하지 마라.`;
 }
 
-const TIMEOUT_MS = 30_000;
+const TIMEOUT_MS = 8_000;     // 백그라운드/느린 망에서 분석 루프(inFlight)가 영구 잠기지 않도록 짧게
 
 export class ApiError extends Error {
   status: number;
@@ -77,11 +77,13 @@ async function post(url: string, headers: Record<string, string>, body: unknown)
   let timedOut = false;
   const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, TIMEOUT_MS);
   try {
+    const payload = JSON.stringify(body);
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...headers },
-      body: JSON.stringify(body),
+      body: payload,
       signal: ctl.signal,
+      keepalive: payload.length < 60000,     // 백그라운드 전환 중에도 요청 유지 (keepalive 본문 한도 64KB 이내일 때만)
     });
     const text = await res.text();
     if (!res.ok) throw new ApiError(res.status, `HTTP ${res.status}: ${text.slice(0, 200)}`);

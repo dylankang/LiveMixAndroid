@@ -83,6 +83,16 @@ class Bus {
 
   private hiddenAt = 0;
   private connecting = false;
+  private downSince = 0;
+
+  /** 오디오 틱(1초)에서 호출하는 워치독: 끊겼거나 접속 시도가 7초 넘게 멈춰 있으면 즉시 새로 연결 */
+  watchdog() {
+    if (typeof mqtt === 'undefined') return;
+    if (this.client?.connected) { this.downSince = 0; return; }
+    const now = Date.now();
+    if (!this.downSince) this.downSince = now;
+    if (!this.client || now - this.downSince > 7000) { this.downSince = now; this.reconnectNow(); }
+  }
 
   /** 지금 연결을 버리고 즉시 새로 연결 */
   reconnectNow() {
@@ -106,7 +116,7 @@ class Bus {
     this.setState('connecting');
     let c: any;
     try {
-      c = mqtt.connect(MQTT_URL, { clientId: `g2mix-${rand()}`, clean: true, keepalive: 10, connectTimeout: 6000, reconnectPeriod: 0 });
+      c = mqtt.connect(MQTT_URL, { clientId: `g2mix-${rand()}`, clean: true, keepalive: 15, connectTimeout: 6000, reconnectPeriod: 0 });
     } catch { this.connecting = false; later(() => this.connectMqtt(), 2000); return; }
     this.client = c;
     c.on('connect', () => {
@@ -147,6 +157,9 @@ class Bus {
     this.handlers.forEach(h => { try { h(m, via); } catch (e) { console.warn('link handler error', e); } });
   }
 }
+
+/** 오디오 틱 워치독용: MQTT 가 끊겨 있으면 바로 재연결 (재연결되면 마지막 분석 상태를 자동 재발행) */
+export const linkWatchdog = () => bus().watchdog();
 
 let busSingleton: Bus | null = null;
 const bus = () => (busSingleton ??= new Bus());

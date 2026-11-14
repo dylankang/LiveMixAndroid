@@ -1,12 +1,7 @@
 import { BANDS, FB, fbParamsFor } from './config';
 
-/** 입력 장치 드롭다운의 특수 값: 시스템/화면 오디오 캡처(내부 재생음) */
-export const SYSTEM_AUDIO_ID = '__system_audio__';
 /** 드롭다운 기본값: deviceId 지정 없이 OS 기본 입력(안드로이드는 꽂힌 USB 인터페이스)을 연다 */
 export const DEFAULT_INPUT_ID = 'default';
-
-/** 입력 모드: 콘솔 2-Track(USB 인터페이스 · 1순위 기본값) / 실시간 유튜브·재생음 모니터링(2순위) */
-export type InputMode = 'console' | 'monitor';
 
 /** Auto-Trim(볼륨 무관 레벨 고정) 기준 */
 export const TRIM = {
@@ -18,9 +13,20 @@ export const TRIM = {
 
 const NO_MIC_MSG = '이 페이지에서는 마이크를 사용할 수 없습니다 (HTTPS 주소가 아니거나 브라우저/웹뷰가 차단함)';
 export const micAvailable = () => !!navigator.mediaDevices?.getUserMedia;
-/** 시스템/화면 오디오 캡처 지원 여부 (모바일 브라우저는 미지원) */
-export const systemCaptureSupported = () =>
-  !!(navigator.mediaDevices as any)?.getDisplayMedia && !/Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+/** 노이즈 게이트: 기본 임계값(dBFS)과 무음 대기 진입 시간 */
+export const GATE = { defaultDb: -45, minDb: -55, maxDb: -20, enterMs: 2500, exitTicks: 2 } as const;
+
+/** 마스터 클럭 AudioWorklet (오디오 렌더 스레드에서 100ms 마다 메인 스레드에 박동을 보냄) */
+const CLOCK_SRC = `
+class LmClock extends AudioWorkletProcessor {
+  constructor() { super(); this.acc = 0; this.every = Math.round(sampleRate / 10); }
+  process() {
+    this.acc += 128;
+    if (this.acc >= this.every) { this.acc -= this.every; this.port.postMessage({ type: 'tick' }); }
+    return true;
+  }
+}
+registerProcessor('lm-clock', LmClock);`;
 
 /** 마이크 권한 팝업을 띄워 승인받는다 (승인 후에야 enumerateDevices 가 실제 장치 이름/ID를 돌려줌) */
 export async function requestMicPermission(): Promise<void> {
@@ -55,7 +61,7 @@ export async function findUsbInput(): Promise<MediaDeviceInfo | null> {
  */
 export async function openInput(deviceId?: string): Promise<{ stream: MediaStream; step: 1 | 2 | 3 }> {
   if (!micAvailable()) throw new Error(NO_MIC_MSG);
-  const realId = !!deviceId && deviceId !== DEFAULT_INPUT_ID && deviceId !== SYSTEM_AUDIO_ID;
+  const realId = !!deviceId && deviceId !== DEFAULT_INPUT_ID;
   const raw = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
   const first: MediaTrackConstraints = { channelCount: { ideal: 2 }, ...raw };
   if (realId) first.deviceId = { exact: deviceId };
@@ -120,83 +126,57 @@ export class AudioEngine {
   private src?: AudioNode;               // 원본 입력 (Thru 는 여기서 → 귀로 듣는 소리는 보정 없음)
   private trim?: GainNode;               // Auto-Trim 게인 (분석 경로 전용)
   private anRaw: AnalyserNode[] = [];    // 보정 전 원본 L/R 레벨 (Auto-Trim 추적용)
-  private sp?: ScriptProcessorNode;      // 오디오 스레드 하트비트 (Worker 가 멈춰도 분석 구동)
-  private thruOn = false;
-  private keepOsc?: OscillatorNode;
-  private keepGain?: GainNode;
+  private sp?: ScriptProcessorNode;      // AudioWorklet 을 쓸 수 없을 때만 쓰는 오디오 스레드 하트비트
+  private clockNode?: AudioWorkletNode;  // 마스터 클럭 (오디오 스레드 100ms 박동)
+  private pilotDest?: MediaStreamAudioDestinationNode;   // 파일럿 톤 출력 스트림 (WebRTC 루프백용 · 입력 신호는 섞지 않음)
+  private pilotSrc: AudioScheduledSourceNode[] = [];
+  /** 마스터 클럭 종류 */
+  clockKind: 'worklet' | 'scriptprocessor' | 'none' = 'none';
   private trimOn = false;
   private trimIntDb = -120;              // 단기 통합 레벨 (활성 구간만 · dB 영역 평균)
   private trimInit = false;
   private trimLastAt = 0;
   private startedAt = 0;
   trimDb = 0;                            // 현재 적용 중인 오프셋 게인 (dB)
-  mode: InputMode = 'console';
   usbPicked = false;
-  /** 오디오 스레드 콜백 (ScriptProcessor) — 분석기에서 Worker 틱 대체용으로 연결 */
+  /** 오디오 스레드 박동 (AudioWorklet 100ms) — 분석기의 마스터 틱 */
   onAudioBeat: () => void = () => {};
   private fullAcc = { sumSq: 0, n: 0, peak: 0 };
   /** 100ms 마다 쌓는 대역별 단기 레벨(dB) 시리즈: [low, mid, highMid] */
   private series: number[][] = [[], [], []];
-  /** 노이즈 게이트 (실시간 재생음 모드): Raw RMS 가 임계값 아래로 1.5초 이상이면 무음 대기 */
-  private gateOn = false;
-  gateDb = -38;
+  /** 노이즈 게이트: 원본 RMS 가 임계값 아래로 GATE.enterMs 이상이면 무음 대기 */
+  private gateOn = true;
+  gateDb: number = GATE.defaultDb;
   idle = false;
   private belowSince = 0;
   private aboveCount = 0;
   onIdleChange: (idle: boolean) => void = () => {};
-  onEnded: () => void = () => {};     // 시스템 오디오 공유가 사용자에 의해 종료될 때
+  onEnded: () => void = () => {};     // 입력 장치가 분리되는 등 트랙이 끝났을 때
   channels = 0;
   running = false;
   openInfo: OpenInfo | null = null;
   ctxState = '';
 
   /**
-   * console : getUserMedia 무보정 스테레오(EC/NS/AGC OFF) · 3단계 Fallback · Auto-Trim 기본 OFF(Raw dBFS)
-   * monitor : 데스크탑 = getDisplayMedia 시스템 오디오 / 모바일 = 기기 마이크 수음 스트림 · Auto-Trim 기본 ON
+   * USB 오디오 인터페이스(콘솔 2트랙) 단일 입력: getUserMedia 무보정 스테레오(EC/NS/AGC OFF) · 3단계 Fallback
+   * 장치를 따로 고르지 않았으면 연결된 USB 인터페이스를 내장 마이크보다 먼저 연다.
    */
-  async start(mode: InputMode, deviceId?: string) {
+  async start(deviceId?: string) {
     await this.stop();
-    let step: 1 | 2 | 3 = 1;
-    this.mode = mode;
-    let label = '';
-    if (mode === 'monitor' && systemCaptureSupported()) {
-      // 🖥️ 데스크탑: 탭/시스템 오디오 캡처 (유튜브 재생음 그대로)
-      const md: any = navigator.mediaDevices;
-      const ds: MediaStream = await md.getDisplayMedia({
-        video: true,
-        audio: { channelCount: 2, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-        systemAudio: 'include',
-      });
-      if (!ds.getAudioTracks().length) {
-        ds.getTracks().forEach(t => t.stop());
-        throw new Error('공유한 소스에 오디오가 없습니다 (공유 창에서 "오디오 공유"를 체크하세요)');
-      }
-      // 비디오 트랙은 분석에 쓰지 않음: stop() 하면 일부 브라우저가 공유 전체를 끝내므로 비활성화 + 최소 사양
-      ds.getVideoTracks().forEach(t => {
-        t.enabled = false;
-        t.applyConstraints({ frameRate: 1, width: 2, height: 2 }).catch(() => {});
-        ds.removeTrack(t);
-      });
-      this.stream = ds;
-      label = '🖥️ 시스템/탭 오디오 캡처';
-    } else {
-      // 콘솔: 선택한 장치 / 기본값이거나 모바일 모니터링이면 연결된 USB 인터페이스(루프백 포함)를 내장 마이크보다 먼저 연다
-      let id = mode === 'console' ? deviceId : undefined;
-      let usb = false;
-      if (!id || id === DEFAULT_INPUT_ID) {
-        const u = await findUsbInput().catch(() => null);
-        if (u) { id = u.deviceId; usb = true; }
-      }
-      const o = await openInput(id);
-      this.stream = o.stream; step = o.step;
-      if (usb && step === 1) label = '';
-      this.usbPicked = usb && step === 1;
+    let id = deviceId, usb = false;
+    if (!id || id === DEFAULT_INPUT_ID) {
+      const u = await findUsbInput().catch(() => null);
+      if (u) { id = u.deviceId; usb = true; }
     }
+    const o = await openInput(id);
+    this.stream = o.stream;
+    const step = o.step;
+    this.usbPicked = usb && step === 1;
     const track = this.stream!.getAudioTracks()[0];
     track.addEventListener('ended', () => { if (this.running) this.onEnded(); });
     const settings = track.getSettings();
     this.channels = settings.channelCount ?? 0;
-    this.openInfo = { step, label: label || track.label || '', settings, usb: this.usbPicked };
+    this.openInfo = { step, label: track.label || '', settings, usb: this.usbPicked };
 
     const ctx = new AudioContext({ latencyHint: 'interactive' });
     // resume() 이 자동재생 정책 때문에 끝나지 않는 경우에도 시작이 멈추지 않도록 1.5초만 기다림
@@ -205,7 +185,6 @@ export class AudioEngine {
     this.ctxState = ctx.state;
     ctx.onstatechange = () => { if (ctx.state === 'suspended') ctx.resume().catch(() => {}); };   // 백그라운드 전환 시 자동 복구
     const src = ctx.createMediaStreamSource(this.stream!);
-    if (this.thruOn) src.connect(ctx.destination);   // 🎧 Thru ON 상태 유지 (원본 그대로 · 보정 전)
     this.src = src;
     // Auto-Trim: 원본 → trim(게인) → 모든 분석 노드.  원본 레벨은 anRaw 로 따로 측정
     const trim = ctx.createGain();
@@ -214,10 +193,17 @@ export class AudioEngine {
     this.trim = trim;
     this.trimDb = 0; this.trimIntDb = -120; this.trimInit = false; this.trimLastAt = 0; this.startedAt = performance.now();
     const an = trim;   // 이하 분석 노드는 모두 trim 출력에 연결
-    // 무음 싱크: 분석기를 destination에 연결해 Safari 등에서도 처리가 멈추지 않게 함 (소리는 나가지 않음)
+    // 출력 그래프: 입력 신호는 절대 스피커/출력으로 보내지 않는다 (하울링 방지).
+    //  분석 노드들 → 무음 싱크(Gain 0) → mix → MediaStreamDestination ← 파일럿 톤
+    //  mix 의 스트림은 WebRTC 루프백 <audio>(volume 1.0)로만 재생된다.
+    const dest = ctx.createMediaStreamDestination();
+    const mix = ctx.createGain();
+    mix.gain.value = 1;
+    mix.connect(dest);
+    this.pilotDest = dest;
     const sink = ctx.createGain();
     sink.gain.value = 0;
-    sink.connect(ctx.destination);
+    sink.connect(mix);
 
     // 원본 L/R 을 따로 측정 (Analyser 는 스테레오를 모노로 평균내 레벨이 낮게 나오므로 Splitter 로 분리)
     const rawSplit = ctx.createChannelSplitter(2);
@@ -268,8 +254,9 @@ export class AudioEngine {
     this.bandAcc = BANDS.map(() => ({ sumSq: 0, n: 0, peak: 0 }));
     this.fullAcc = { sumSq: 0, n: 0, peak: 0 }; this.series = [[], [], []];
     this.idle = false; this.belowSince = 0; this.aboveCount = 0;
-    // AudioContext 내부 무음 노드(15Hz -50dBFS) + ScriptProcessor 하트비트: <audio> 태그 없이 백그라운드 오디오 처리 유지
-    try { this.startKeepNodes(src); } catch (e) { console.warn('백그라운드 유지 노드 실패 (분석은 계속)', e); }
+    // 파일럿 톤(-43dBFS 19kHz + 저역 80Hz + 디더 노이즈)과 AudioWorklet 마스터 클럭
+    try { this.startPilot(mix); } catch (e) { console.warn('파일럿 톤 생성 실패 (분석은 계속)', e); }
+    await this.startClock(src, sink);
     this.specAcc.fill(0); this.specN = 0;
     this.fbTrack = { bin: -1, n: 0, maxDb: -200 };
     this.running = true;
@@ -278,12 +265,14 @@ export class AudioEngine {
   async stop() {
     this.running = false;
     if (this.sp) { this.sp.onaudioprocess = null; try { this.sp.disconnect(); } catch { /* ignore */ } }
+    if (this.clockNode) { this.clockNode.port.onmessage = null; try { this.clockNode.disconnect(); } catch { /* ignore */ } }
     this.stream?.getTracks().forEach(t => t.stop());
     await this.ctx?.close().catch(() => {});
     this.ctx = undefined; this.stream = undefined; this.src = undefined; this.bandAn = [];
     this.trim = undefined; this.anRaw = []; this.sp = undefined;
     this.anL = undefined; this.anR = undefined; this.anFb = undefined;
-    this.keepOsc = undefined; this.keepGain = undefined;
+    this.clockNode = undefined; this.clockKind = 'none';
+    this.pilotDest = undefined; this.pilotSrc = [];
   }
 
   /** 피드백 민감도 슬라이더 (0=둔감 … 1=예민). 반환: 적용된 판정 기준 */
@@ -307,17 +296,10 @@ export class AudioEngine {
     return true;
   }
   get state() { return this.ctx?.state ?? 'closed'; }
-  /** 열려 있는 입력 스트림 (WebRTC 루프백 유지용) */
-  get inputStream(): MediaStream | undefined { return this.stream; }
+  /** 파일럿 톤 스트림 (WebRTC 루프백 <audio> 재생용). 입력 신호는 들어 있지 않다 */
+  get pilotStream(): MediaStream | undefined { return this.pilotDest?.stream; }
 
-  /** 🎧 입력 신호 출력 모니터링: 원본 입력을 audioContext.destination 으로 직접 연결/해제 (하울링 주의) */
-  setThru(on: boolean) {
-    this.thruOn = on;
-    if (!this.ctx || !this.src) return;
-    try { if (on) this.src.connect(this.ctx.destination); else this.src.disconnect(this.ctx.destination); } catch { /* ignore */ }
-  }
-
-  /** 노이즈 게이트 설정 (실시간 재생음 모드에서만 켬). 끄면 즉시 무음 대기 해제 */
+  /** 노이즈 게이트 설정. 끄면 즉시 무음 대기 해제 */
   setGate(on: boolean, db: number) {
     this.gateOn = on; this.gateDb = db;
     this.belowSince = 0; this.aboveCount = 0;
@@ -335,7 +317,7 @@ export class AudioEngine {
     // Auto-Trim 동결: 게인을 즉시 0.0dB 로 (방 소음을 키우지 않음), 다음 음악에서 처음부터 다시 학습
     this.trimDb = 0; this.trimInit = false; this.trimIntDb = -120;
     if (this.trim && this.ctx) { this.trim.gain.cancelScheduledValues(this.ctx.currentTime); this.trim.gain.setValueAtTime(1, this.ctx.currentTime); }
-    this.resetAccum();                 // 게이트 닫히기 전 1.5초 동안 쌓인 소음도 버림
+    this.resetAccum();                 // 게이트 닫히기 전 대기 시간 동안 쌓인 소음도 버림
     this.onIdleChange(true);
   }
   private exitIdle() {
@@ -375,10 +357,10 @@ export class AudioEngine {
       if (rawDb < this.gateDb) {
         this.aboveCount = 0;
         if (!this.belowSince) this.belowSince = now;
-        if (!this.idle && now - this.belowSince >= 1500) this.enterIdle();
+        if (!this.idle && now - this.belowSince >= GATE.enterMs) this.enterIdle();
       } else {
         this.belowSince = 0;
-        if (this.idle && ++this.aboveCount >= 2) this.exitIdle();   // 0.2초 연속 신호 → 자동 분석 재개
+        if (this.idle && ++this.aboveCount >= GATE.exitTicks) this.exitIdle();   // 0.2초 연속 신호 → 자동 분석 재개
       }
       if (this.idle) return rawDb;                                  // 무음 대기: 보정 게인 동결(0dB)
     }
@@ -395,23 +377,52 @@ export class AudioEngine {
     return rawDb;
   }
 
-  /** AudioContext 내부 무음 노드 + ScriptProcessor 하트비트 (유튜브 오디오 포커스를 뺏지 않음) */
-  private startKeepNodes(src: AudioNode) {
+  /**
+   * 마스터 클럭: 입력 스트림 → AudioWorkletNode(오디오 렌더 스레드) → 무음 싱크 → mix → MediaStreamDestination.
+   * 워클릿이 100ms 마다 메인 스레드로 박동을 보낸다. (AudioWorklet 을 쓸 수 없는 환경에서만 ScriptProcessor 로 대체)
+   */
+  private async startClock(src: AudioNode, sink: AudioNode) {
     const ctx = this.ctx!;
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    // 크롬은 출력이 약 -72 dBFS 미만이면 '무음 탭'으로 보고 백그라운드에서 멈출 수 있어 들리지 않는 15Hz 를 -50 dBFS 로 낸다
-    g.gain.value = 0.00316;
-    o.frequency.value = 15;
-    o.connect(g); g.connect(ctx.destination);
-    o.start();
-    this.keepOsc = o; this.keepGain = g;
-    // ScriptProcessor: 오디오 스레드가 4096 샘플마다 호출 → 메인 스레드 타이머가 늦어져도 분석 루프를 깨움
-    const sp = ctx.createScriptProcessor(4096, 1, 1);
-    const mute = ctx.createGain(); mute.gain.value = 0;
-    src.connect(sp); sp.connect(mute); mute.connect(ctx.destination);
-    sp.onaudioprocess = () => { try { this.onAudioBeat(); } catch { /* ignore */ } };
-    this.sp = sp;
+    try {
+      if (!ctx.audioWorklet || typeof AudioWorkletNode === 'undefined') throw new Error('AudioWorklet 미지원');
+      const url = URL.createObjectURL(new Blob([CLOCK_SRC], { type: 'text/javascript' }));
+      try { await ctx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
+      const node = new AudioWorkletNode(ctx, 'lm-clock', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
+      node.port.onmessage = ev => { if (ev.data?.type !== 'tick') return; try { this.onAudioBeat(); } catch { /* ignore */ } };
+      src.connect(node); node.connect(sink);
+      this.clockNode = node; this.clockKind = 'worklet';
+    } catch (e) {
+      console.warn('AudioWorklet 마스터 클럭 실패 → ScriptProcessor 대체', e);
+      try {
+        const sp = ctx.createScriptProcessor(4096, 1, 1);
+        src.connect(sp); sp.connect(sink);
+        sp.onaudioprocess = () => { try { this.onAudioBeat(); } catch { /* ignore */ } };
+        this.sp = sp; this.clockKind = 'scriptprocessor';
+      } catch (e2) { console.warn('오디오 스레드 박동 없음 (Worker 틱만 사용)', e2); this.clockKind = 'none'; }
+    }
+  }
+
+  /**
+   * 파일럿 톤: 크롬 AudioPowerMonitor 가 '무음'으로 판정하지 않도록 실제 에너지가 있는 신호를 만든다.
+   *  · 19kHz -43dBFS (비가청) · 80Hz -46dBFS (Opus 는 고역을 잘라 낼 수 있어 저역 파일럿을 함께 실음) · -60dBFS 디더 노이즈
+   */
+  private startPilot(mix: AudioNode) {
+    const ctx = this.ctx!;
+    const tone = (hz: number, db: number) => {
+      const o = ctx.createOscillator(); o.type = 'sine'; o.frequency.value = hz;
+      const g = ctx.createGain(); g.gain.value = Math.pow(10, db / 20);
+      o.connect(g); g.connect(mix); o.start();
+      this.pilotSrc.push(o);
+    };
+    tone(Math.min(19000, ctx.sampleRate / 2 - 1000), -43);
+    tone(80, -46);
+    const len = Math.round(ctx.sampleRate * 2);
+    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = buf.getChannelData(0), amp = Math.pow(10, -60 / 20);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * amp;
+    const ns = ctx.createBufferSource(); ns.buffer = buf; ns.loop = true;
+    ns.connect(mix); ns.start();
+    this.pilotSrc.push(ns);
   }
 
   /** L/R 입력 레벨 (rAF/타이머에서 호출) */

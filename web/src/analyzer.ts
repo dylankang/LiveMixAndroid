@@ -1,10 +1,10 @@
-import { AudioEngine, type BandStat, type InputMode, listInputs, requestMicPermission, systemCaptureSupported, DEFAULT_INPUT_ID, TRIM } from './audio';
+import { AudioEngine, type BandStat, listInputs, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE } from './audio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
 import { callAI, parseReply, buildSystemPrompt, isQuotaError, type Genre } from './ai';
 import { evaluateBalance, TOL_RANGE } from './balance';
 import { fbParamsFor } from './config';
 import { Glasses } from './glasses';
-import { HudSender, HudReceiver, linesToShow, type BandRow, type LevelPkt, type MixState, type ReceiverInfo } from './link';
+import { HudSender, HudReceiver, linkWatchdog, linesToShow, type BandRow, type LevelPkt, type MixState, type ReceiverInfo } from './link';
 import { renderBandTable, paintMeters, paintHud, genreText, clock } from './views';
 import { setTicker, clearTicker } from './ticker';
 import { KeepAlive, PipMonitor, type KaState } from './keepalive';
@@ -162,59 +162,23 @@ let intervalSec = clamp(Math.round(parseFloat(ls.get('lm.interval', String(INTER
   paint();
 }
 
-// ───────── ⚙️ 설정: 노이즈 게이트 (실시간 재생음 모드) ─────────
-let gateDb = clamp(parseFloat(ls.get('lm.gate', '-38')), -55, -20);
+// ───────── ⚙️ 설정: 노이즈 게이트 (무음 대기) ─────────
+let gateDb = clamp(parseFloat(ls.get('lm.gate2', String(GATE.defaultDb))), GATE.minDb, GATE.maxDb);
 {
   const g = $<HTMLInputElement>('gateSlider');
   g.value = String(gateDb);
   const paint = () => { $('gateInfo').textContent = `${gateDb} dBFS`; };
-  g.oninput = () => { gateDb = +g.value; ls.set('lm.gate', String(gateDb)); applyGate(); paint(); };
+  g.oninput = () => { gateDb = +g.value; ls.set('lm.gate2', String(gateDb)); applyGate(); paint(); };
   paint();
 }
-function applyGate() { engine.setGate(mode === 'monitor', gateDb); }
+function applyGate() { engine.setGate(true, gateDb); }
 
-// ───────── 2) 오디오 입력 모드: 🎛️ 콘솔 2-Track (1순위·기본) / ▶️ 실시간 유튜브·재생음 (2순위) ─────────
-let mode: InputMode = ls.get('lm.inmode', 'console') === 'monitor' ? 'monitor' : 'console';
-/** Auto-Trim 은 모드별로 따로 기억: 콘솔 기본 OFF(Raw dBFS) · 모니터링 기본 ON */
-const trimFor = (m: InputMode) => ls.get(`lm.trim.${m}`, m === 'monitor' ? '1' : '0') === '1';
-let thruOn = false;   // 하울링 위험 → 항상 OFF 로 시작
+// ───────── 2) 오디오 입력: 🎛️ 콘솔 2-Track (USB 인터페이스) 단일 경로 ─────────
+/** Auto-Trim 기본 OFF (Raw dBFS). 설정에서 켜면 기억 */
+const trimSaved = () => ls.get('lm.trim.console', '0') === '1';
 
 const deviceSel = $<HTMLSelectElement>('device');
 const findBtn = $<HTMLButtonElement>('findBtn');
-
-function monitorHintText(): string {
-  return systemCaptureSupported()
-    ? '🖥️ 시작을 누르면 공유 창이 열립니다. 유튜브 탭(또는 전체 화면)을 고르고 "오디오 공유"를 켜 주세요. 재생 중인 소리를 디지털로 직접 분석합니다.'
-    : '📱 USB 인터페이스(ZOOM AMS-24 등)가 연결돼 있으면 그 입력(루프백)을 먼저 열고, 없으면 폰 마이크로 들리는 소리를 수음합니다. Auto-Trim이 볼륨 차이를 보정하고, 노이즈 게이트가 무음일 때 방 소음 분석을 막습니다.';
-}
-
-function paintMode() {
-  document.querySelectorAll<HTMLButtonElement>('#modeSeg button').forEach(b => {
-    const on = b.dataset.mode === mode;
-    b.classList.toggle('active', on);
-    b.setAttribute('aria-selected', String(on));
-  });
-  $('consolePane').hidden = mode !== 'console';
-  const h = $('monitorHint');
-  h.hidden = mode !== 'monitor';
-  h.textContent = monitorHintText();
-  paintToggles();
-}
-
-document.querySelectorAll<HTMLButtonElement>('#modeSeg button').forEach(b => {
-  b.onclick = async () => {
-    const m = b.dataset.mode as InputMode;
-    if (m === mode || starting) return;
-    mode = m; ls.set('lm.inmode', m);
-    engine.setAutoTrim(trimFor(m));
-    applyGate();
-    paintMode();
-    if (!running) return;
-    // 분석 중 모드 전환: 이 클릭(사용자 동작) 안에서 바로 새 입력을 연다 (공유 창/권한 팝업 허용)
-    try { await startAudio(); clearError(); }
-    catch (e) { showError(describeError(e)); await stop(); }
-  };
-});
 
 /** 오류를 사람이 읽을 수 있는 원인으로 변환 */
 function describeError(e: unknown): string {
@@ -222,9 +186,7 @@ function describeError(e: unknown): string {
   const msg = e instanceof Error ? e.message : String(e);
   const detail = name && name !== 'Error' ? ` (${name}: ${msg})` : '';
   if (name === 'NotAllowedError' || name === 'SecurityError' || name === 'PermissionDeniedError')
-    return mode === 'monitor' && systemCaptureSupported()
-      ? `화면/오디오 공유가 취소되었거나 거부되었습니다. 다시 시작하고 공유 창에서 유튜브 탭과 "오디오 공유"를 선택하세요.${detail}`
-      : `마이크 권한이 거부되었습니다. 주소창 왼쪽 아이콘 → 권한 → 마이크를 '허용'으로 바꾸고, 안드로이드 설정에서 크롬 앱의 마이크 권한도 확인한 뒤 다시 시도하세요.${detail}`;
+    return `마이크 권한이 거부되었습니다. 주소창 왼쪽 아이콘 → 권한 → 마이크를 '허용'으로 바꾸고, 안드로이드 설정에서 크롬 앱의 마이크 권한도 확인한 뒤 다시 시도하세요.${detail}`;
   if (name === 'NotFoundError' || name === 'DevicesNotFoundError')
     return `오디오 입력 장치를 찾지 못했습니다. USB 인터페이스 연결(전원·케이블·OTG)을 확인하고 [🔄 장치 찾기]를 눌러 주세요.${detail}`;
   if (name === 'NotReadableError' || name === 'TrackStartError')
@@ -266,7 +228,7 @@ findBtn.onclick = async () => {
 };
 deviceSel.onchange = async () => {
   ls.set('lm.device', deviceSel.value);
-  if (!running || mode !== 'console') return;
+  if (!running) return;
   try { await startAudio(); clearError(); }
   catch (e) { showError(describeError(e)); await stop(); }
 };
@@ -274,63 +236,45 @@ try { navigator.mediaDevices?.addEventListener?.('devicechange', () => { refresh
 fillDevices([]);
 refreshDevices().catch(() => {});
 
-// ───────── ⚙️ 설정: Thru 모니터링 / Auto-Trim 수동 토글 ─────────
+// ───────── ⚙️ 설정: Auto-Trim 수동 토글 ─────────
 function paintToggles() {
-  const thruBtn = $('thruBtn'), trimBtn = $('trimBtn');
-  thruBtn.textContent = `🎧 입력 신호 출력 모니터링 (Thru ${thruOn ? 'ON' : 'OFF'})`;
-  thruBtn.classList.toggle('active', thruOn);
-  $('thruHint').textContent = thruOn
-    ? '⚠ 하울링 주의: 입력이 스피커로 나가 마이크로 되돌아오면 피드백이 생깁니다. 이어폰/헤드폰을 사용하세요.'
-    : '입력 신호를 이 기기 스피커/이어폰으로 그대로 들려줍니다 (보정 전 원본).';
+  const trimBtn = $('trimBtn');
   const on = engine.autoTrim;
-  trimBtn.textContent = `🎚️ 볼륨 무관 레벨 고정 (Auto-Trim ${on ? 'ON' : 'OFF'}) · ${mode === 'console' ? '콘솔 모드' : '모니터링 모드'}`;
+  trimBtn.textContent = `🎚️ 볼륨 무관 레벨 고정 (Auto-Trim ${on ? 'ON' : 'OFF'})`;
   trimBtn.classList.toggle('active', on);
-  $('trimHint').textContent = `무음(${TRIM.gateDb}dBFS 미만)을 뺀 최근 약 ${TRIM.tauSec}초 평균 레벨을 ${TRIM.targetDb}dBFS 기준으로 자동 보정해, 기기 볼륨과 상관없이 같은 기준에서 분석합니다. `
-    + (mode === 'console' ? '콘솔 모드는 실제 물리 레벨(Raw dBFS)을 봐야 하므로 기본 OFF입니다.' : '모니터링 모드는 기본 ON입니다.')
-    + ' 모드별로 따로 기억됩니다.';
+  $('trimHint').textContent = `무음(${TRIM.gateDb}dBFS 미만)을 뺀 최근 약 ${TRIM.tauSec}초 평균 레벨을 ${TRIM.targetDb}dBFS 기준으로 자동 보정합니다. `
+    + '콘솔 입력은 실제 물리 레벨(Raw dBFS)을 봐야 하므로 기본 OFF입니다.';
   $('meterInfo').textContent = on ? `-60 ~ 0 dBFS · Auto-Trim ${engine.trimDb >= 0 ? '+' : ''}${engine.trimDb.toFixed(1)}dB 보정됨` : '-60 ~ 0 dBFS · Raw';
 }
-$('thruBtn').onclick = () => { thruOn = !thruOn; engine.setThru(thruOn); paintToggles(); };
 $('trimBtn').onclick = () => {
   const on = !engine.autoTrim;
-  ls.set(`lm.trim.${mode}`, on ? '1' : '0');
+  ls.set('lm.trim.console', on ? '1' : '0');
   engine.setAutoTrim(on);
   paintToggles();
 };
-engine.setAutoTrim(trimFor(mode));
-engine.setThru(false);
+engine.setAutoTrim(trimSaved());
 applyGate();
-paintMode();
+paintToggles();
 
 $('resetBtn').onclick = () => { advice.resetCooldown(); renderCooldown(); setStatus('쿨다운 초기화됨'); };
 
-// ───────── 🛡️ 백그라운드 유지 상태 · 📌 PiP 버튼 · WAV 유지 설정 ─────────
+// ───────── 🛡️ 백그라운드 유지 상태 · 📌 PiP 버튼 ─────────
 const KA_ICON: Record<KaState, string> = { off: '–', starting: '…', on: '✔', failed: '✖', unsupported: '미지원' };
-/** 모니터링 모드에서 WAV 유지 사용 여부 (유튜브가 멈추면 끔). 콘솔 모드는 항상 사용 */
-let wavInMonitor = ls.get('lm.wavMon', '1') !== '0';
-const useWav = () => mode === 'console' || wavInMonitor;
+const CLOCK_ICON = { worklet: 'AudioWorklet ✔', scriptprocessor: 'ScriptProcessor(대체)', none: 'Worker만' } as const;
 function paintKeep() {
   $('keepState').textContent = running
-    ? `🛡️ 백그라운드 유지  WebRTC ${KA_ICON[keep.rtc]} · WAV ${useWav() ? KA_ICON[keep.wav] : '끔'} · PiP ${KA_ICON[pip.state]}`
-    : '🛡️ 시작하면 백그라운드 유지 장치(WebRTC·WAV)가 함께 켜집니다';
+    ? `🛡️ 백그라운드 유지  파일럿 WebRTC ${KA_ICON[keep.rtc]} · 파일럿 WAV ${KA_ICON[keep.wav]} · 클럭 ${CLOCK_ICON[engine.clockKind]} · PiP ${KA_ICON[pip.state]}`
+    : '🛡️ 시작하면 백그라운드 유지 장치(파일럿 톤·미디어 알림·AudioWorklet 클럭)가 함께 켜집니다';
   const b = $<HTMLButtonElement>('pipBtn');
   b.disabled = pip.state === 'unsupported' || pip.state === 'starting';
   b.classList.toggle('active', pip.active);
   b.textContent = pip.state === 'unsupported' ? '📌 PiP 팝업 (이 브라우저 미지원)'
-    : pip.active ? '📌 PiP 팝업 켜짐 · 누르면 닫기' : '📌 앱 전환 시 멈춤 방지 (PiP 팝업)';
-  const w = $('wavBtn');
-  w.textContent = `🔈 모니터링 모드에서 WAV 유지 재생 : ${wavInMonitor ? 'ON' : 'OFF'}`;
-  w.classList.toggle('active', wavInMonitor);
+    : pip.active ? '📌 PiP 켜짐 · 누르면 닫기' : '📌 백그라운드 유지용 PiP 켜기';
 }
 keep.onChange = paintKeep;
 pip.onChange = paintKeep;
 $('pipBtn').onclick = () => {
   void pip.toggle(() => pip.draw(localLevels, hudLines(), genreText(genreLabel(), genreAt), $('status').textContent || ''));
-};
-$('wavBtn').onclick = async () => {
-  wavInMonitor = !wavInMonitor; ls.set('lm.wavMon', wavInMonitor ? '1' : '0');
-  if (running && mode === 'monitor' && engine.inputStream) await keep.start(engine.inputStream, useWav());
-  paintKeep();
 };
 paintKeep();
 
@@ -361,33 +305,38 @@ function render() {
   const sig = lines.join('\n');
   if (sig === lastRendered) return;
   lastRendered = sig;
+  nowPlaying(lines);
   sender.update({ lines }, true);
   if (mirroring) return;
   paintHud(lines);
   glasses.update(lines);
 }
+/** 잠금화면/알림창 미디어 컨트롤러에 마지막 조언 1줄 표시 (피드백 경고가 있으면 그것을 우선) */
+function nowPlaying(lines: string[]) {
+  const last = [...lines].reverse().find(l => l.trim()) ?? '';
+  keep.setNowPlaying(last || 'Live Mix Assistant 분석 중', engine.idle ? '⏸️ 신호 대기 중' : genreLabel() || 'G2 HUD');
+}
 /** 쿨다운은 화면에 표시하지 않음 (내부 목록만 유지 · AI 에 전달) */
 function renderCooldown() { /* 표시 없음 */ }
 
 // ───────── 오디오 시작/정지 ─────────
-const modeName = () => (mode === 'console' ? '🎛️ 콘솔 2-Track' : '▶️ 유튜브/재생음 모니터링');
+const modeName = () => '🎛️ 콘솔 2-Track (USB)';
 
 async function startAudio() {
-  engine.setAutoTrim(trimFor(mode));
-  await engine.start(mode, deviceSel.value || DEFAULT_INPUT_ID);
-  if (mode === 'console') refreshDevices().catch(() => {});   // 권한 승인 직후: 실제 장치 이름으로 목록 갱신
+  engine.setAutoTrim(trimSaved());
+  applyGate();
+  await engine.start(deviceSel.value || DEFAULT_INPUT_ID);
+  refreshDevices().catch(() => {});   // 권한 승인 직후: 실제 장치 이름으로 목록 갱신
 
-  // 🛡️ 3중 백그라운드 유지: A. WebRTC 루프백 + B. WAV 루프·미디어 세션 (+ C. PiP 는 버튼으로)
-  const stream = engine.inputStream;
-  if (stream) await keep.start(stream, useWav());
-  if (keep.rtc === 'failed' && keep.wav !== 'on') showNotice('백그라운드 유지 장치를 시작하지 못했습니다. 앱을 전환하기 전에 [📌 PiP 팝업]을 켜 주세요.');
+  // 🛡️ 백그라운드 유지: 파일럿 톤(WebRTC 루프백 + WAV) · 미디어 알림 · (PiP 는 버튼으로)
+  await keep.start(engine.pilotStream, () => engine.resumeCtx());
+  if (keep.rtc !== 'on' && keep.wav !== 'on') showNotice('백그라운드 유지 장치를 시작하지 못했습니다. 앱을 전환하기 전에 [📌 PiP 팝업]을 켜 주세요.');
 
   const info = engine.openInfo, st = info?.settings, ch = engine.channels;
   const parts: string[] = [];
-  if (mode === 'monitor' && systemCaptureSupported()) parts.push('🖥️ 시스템/탭 오디오 캡처 중 (공유를 끝내면 분석이 정지됩니다)');
-  else parts.push(`${modeName()} · ${info?.label || '기본 장치'} · ${ch || '?'}ch · ${info?.step ?? 1}차 방식으로 열림`);
+  parts.push(`${modeName()} · ${info?.label || '기본 장치'} · ${ch || '?'}ch · ${info?.step ?? 1}차 방식으로 열림`);
   if (info?.usb) parts.push('🔌 USB 오디오 인터페이스를 내장 마이크보다 우선 연결했습니다');
-  if (mode === 'monitor') parts.push(`🚪 노이즈 게이트 ${gateDb} dBFS · 1.5초 이상 무음이면 대기`);
+  parts.push(`🚪 노이즈 게이트 ${gateDb} dBFS · ${GATE.enterMs / 1000}초 이상 무음이면 대기`);
   if (ch === 1) parts.push('⚠ 모노로 열렸습니다 (R = L 복제)');
   if (info?.step === 3) parts.push('⚠ 기본 모드로 열림: OS 음성 보정(에코 제거/노이즈 억제/AGC)이 켜져 있을 수 있습니다');
   else if (st && (st.echoCancellation || st.noiseSuppression || st.autoGainControl)) parts.push('⚠ 브라우저가 음성 보정을 끄지 못했습니다 (EC/NS/AGC 일부 ON)');
@@ -404,11 +353,25 @@ document.addEventListener('pointerdown', () => {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible' || !running) return;
   engine.resumeCtx();
+  void ensureWake();
   sender.publish();
 });
 document.addEventListener('freeze', () => { if (running) sender.publishFrozen(); });
 window.addEventListener('pagehide', () => { if (running) sender.publishFrozen(); });
 document.addEventListener('resume', () => { if (running) { engine.resumeCtx(); sender.publish(); } });
+
+// ───────── 💡 Screen WakeLock: 풀리면 (가시 상태에서) 자동 재획득 ─────────
+let wake: any = null;
+let wakePending = false;
+async function ensureWake() {
+  if (!running || wakePending || document.visibilityState !== 'visible') return;
+  if (wake && !wake.released) return;
+  const wl: any = (navigator as any).wakeLock;
+  if (!wl?.request) return;
+  wakePending = true;
+  try { wake = await wl.request('screen'); } catch { wake = null; } finally { wakePending = false; }
+}
+function releaseWake() { try { wake?.release?.(); } catch { /* ignore */ } wake = null; }
 
 startBtn.onclick = async () => {
   if (starting) return;
@@ -433,6 +396,9 @@ startBtn.onclick = async () => {
   lastCollectAt = Date.now(); lastAnalyzeAt = Date.now(); lastSecondAt = 0;
   startBtn.disabled = false; startBtn.textContent = '정지'; startBtn.classList.add('on');
   startTicker();
+  void ensureWake();
+  // 분석 시작 직후 사용자 동작이 아직 유효하면 PiP 도 자동으로 켠다 (아니면 상단 [📌 PiP 켜기] 버튼)
+  if ((navigator as any).userActivation?.isActive && pip.state === 'off') $('pipBtn').click();
   tellNative(true);
   try { sender.setRunning(true); } catch (e) { console.warn('수신기 전송 시작 실패 (분석은 계속)', e); }
   setStatus(`실행 중 · ${modeName()}${glasses.connected ? ' · G2 연결됨' : ''}`);
@@ -444,6 +410,7 @@ async function stop() {
   try { sender.setRunning(false); } catch { /* ignore */ }
   clearTicker(ticker); ticker = 0;
   tellNative(false);
+  releaseWake();
   await engine.stop();
   keep.stop();
   void pip.close();
@@ -456,7 +423,7 @@ engine.onIdleChange = idle => {
   if (idle) {
     localLevels = [{ rmsDb: -120, peakDb: -120, clip: false }, { rmsDb: -120, peakDb: -120, clip: false }];
     showBands(null);
-    setStatus('⏸️ 신호 대기 중 · 게이트 아래 무음 (Auto-Trim 0dB 동결)');
+    setStatus('⏸️ 신호 대기 중 · 게이트 아래 무음' + (engine.autoTrim ? ' (Auto-Trim 0dB 동결)' : ''));
   } else {
     lastCollectAt = now; lastAnalyzeAt = now;        // 음악이 다시 나오면 새 구간부터 분석
     setStatus(`실행 중 · ${modeName()} · 신호 감지 → 분석 재개`);
@@ -467,8 +434,9 @@ engine.onIdleChange = idle => {
 engine.onEnded = () => { if (running) { setStatus('입력이 종료되었습니다 (오디오 공유 종료/장치 분리)'); void stop(); } };
 
 // ───────── 4) 백그라운드에서도 멈추지 않는 단일 100ms 틱 ─────────
-// 인라인 Blob Web Worker(ticker.ts)가 100ms 마다 postMessage → 여기서 FFT 수집·피드백·6밴드 누적·1초 MQTT·AI 타이머를 모두 구동.
-// rAF/일반 setInterval 은 쓰지 않는다. Worker 가 늦어지면 오디오 스레드(ScriptProcessor) 하트비트가 대신 깨운다.
+// 1순위: AudioWorklet(오디오 렌더 스레드)이 100ms 마다 메인 스레드로 박동 → 여기서 FFT 수집·피드백·6밴드 누적·1초 MQTT·AI 타이머를 구동.
+// 2순위: 인라인 Blob Web Worker(ticker.ts) 100ms 타이머. 두 박동 중 먼저 온 쪽이 틱을 돌리고 70ms 안에 겹쳐 온 것은 건너뛴다.
+// rAF/일반 setInterval 은 쓰지 않는다.
 let ticker = 0;
 let tickN = 0;
 let lastTickAt = 0;
@@ -479,16 +447,23 @@ let recoverCount = 0;
 function startTicker() {
   clearTicker(ticker);
   tickN = 0; lastTickAt = performance.now();
-  ticker = setTicker(masterTick, 100);
+  ticker = setTicker(workerBackupTick, 100);
 }
-engine.onAudioBeat = () => {
-  if (running && performance.now() - lastTickAt > 350) masterTick();   // Worker 틱이 끊기면 오디오 스레드가 대신 구동
-};
+/** 2차 백업 워치독: AudioWorklet 박동이 정상이면 건너뛰고, 300ms 넘게 끊겼거나 워클릿이 없을 때만 틱을 돌린다 */
+function workerBackupTick() {
+  if (engine.clockKind === 'worklet' && performance.now() - lastTickAt < 300) return;
+  masterTick();
+}
+engine.onAudioBeat = () => { if (running) masterTick(); };
 
 function masterTick() {
   if (!running) return;
-  lastTickAt = performance.now();
+  const t0 = performance.now();
+  if (t0 - lastTickAt < 70) return;           // 워클릿/Worker 박동이 겹치면 한 번만 실행
+  lastTickAt = t0;
   tickN++;
+  keep.heal();                                // 시스템이 멈춘 파일럿 재생·미디어 세션을 매 틱 재확인
+  void ensureWake();                          // 화면 WakeLock 이 풀려 있고 화면이 보이면 재요청
   // 워치독: suspended 면 즉시 resume
   if (engine.watchdog()) recoverCount++;
   engine.updateTrim();                        // Auto-Trim (OFF 면 측정만)
@@ -513,8 +488,9 @@ function secondTick() {
   renderCooldown();
   paintGenre();
   updateLiveBands();
+  linkWatchdog();                             // MQTT 가 끊겼으면 즉시 재연결 (재연결 시 마지막 상태 자동 재발행)
   paintToggles();
-  keep.heal();                                // 시스템이 멈춘 유지 재생 재개
+  nowPlaying(hudLines());                     // 알림창 문구(장르/대기 상태 포함) 갱신 — 바뀔 때만 적용
   paintKeep();
   sender.update({ genre: badgeForSend(), genreAt: engine.idle ? 0 : genreAt, levels: localLevels });
   sender.publish();                           // 1초마다 전체 상태 retain 발행
@@ -588,7 +564,7 @@ async function analyze() {
   const payload = {
     windowSec,
     toleranceDb: tol,
-    inputMode: mode === 'console' ? 'console-2track-raw' : 'playback-monitor-autotrim',
+    inputMode: 'console-2track-raw',
     levelReference: engine.autoTrim ? `auto-trim normalized to ${TRIM.targetDb} dBFS (absolute level not meaningful)` : 'raw dBFS from console',
     captureNote: captureNote(),
     signal: ev.signal,
@@ -630,11 +606,7 @@ async function analyze() {
 
 /** AI 에 알려 줄 수음 경로 특성 */
 function captureNote(): string {
-  const o = engine.openInfo;
-  if (mode === 'console') return o?.usb ? 'USB 오디오 인터페이스 2트랙 직결 (Raw)' : '콘솔 2트랙 입력 (Raw)';
-  if (systemCaptureSupported()) return '데스크탑 시스템/탭 오디오 디지털 캡처 (레벨 정규화됨)';
-  return o?.usb ? 'USB 인터페이스 루프백 입력 (레벨 정규화됨)'
-    : '스마트폰 내장 마이크로 스피커 재생음을 수음 — 저역(특히 Sub/Low)이 실제보다 크게 깎이고 방 울림이 섞임. 상대 비율·리듬 어택 위주로 판단';
+  return engine.openInfo?.usb ? 'USB 오디오 인터페이스 2트랙 직결 (Raw)' : '콘솔 2트랙 입력 (Raw)';
 }
 
 function bandRows(b: Record<string, BandStat>, deltas: Record<string, number> | null): BandRow[] {
