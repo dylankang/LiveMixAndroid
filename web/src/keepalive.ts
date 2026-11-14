@@ -1,11 +1,10 @@
-// 🛡️ 백그라운드 유지 엔진 — 크롬을 내리거나 Even 앱으로 전환해도 분석이 멈추지 않게 한다.
-// 안드로이드 크롬의 AudioPowerMonitor 는 '무음(디지털 0/극소)' 재생을 가짜 재생으로 보고 백그라운드에서 오디오 서비스를 끊는다.
-// 따라서 Keep-Alive <audio> 는 반드시 volume 1.0 · muted false 로, 실제 에너지가 있는 파일럿 톤(-43dBFS 19kHz + 저역 + 디더)을 재생한다.
-//  A. WebRTC 루프백: AudioContext 가 만든 '파일럿 톤' 스트림(입력 신호 아님)을 pc1 → pc2 → <audio> 로 재생
-//  B. 파일럿 WAV <audio loop> (+ audioSession 'playback' · MediaSession 알림 컨트롤러에 마지막 조언 표시)
-//  C. Picture-in-Picture 미니 모니터: 캔버스(미터 + HUD 5줄)를 PiP 창으로 띄워 크롬을 화면 표시 상태로 유지
-// 입력(USB) 스트림은 스피커로 직접 보내지 않고, -100dBFS(gain 0.00001)로만 파일럿 스트림에 섞어 WebRTC 루프백에 태운다
-// (크롬이 입력 트랙을 '실시간 전송 중'으로 보게 해 백그라운드 캡처 음소거를 막음 · 출력은 들리지 않는 수준).
+// 🛡️ 백그라운드 유지 엔진 — 화면이 꺼지거나 Even 앱으로 전환해도 USB 입력 캡처와 분석이 멈추지 않게 한다.
+//  A. WebRTC 직결: getUserMedia 원본 트랙 자체를 pc1.addTrack → pc2 → <audio volume 0.0001> (하울링 없음)
+//     크롬은 원본 트랙이 실시간 전송 중이면 백그라운드에서 캡처를 음소거하지 않는다.
+//  B. 파일럿 WAV <audio loop volume 1.0> (+ audioSession 'playback' · MediaSession 알림 컨트롤러)
+//     안드로이드 크롬 AudioPowerMonitor 가 '실제 재생 중'으로 보도록 -44dBFS 수준의 비가청 파일럿을 재생한다.
+//  C. Picture-in-Picture 미니 모니터
+//  D. 더미 MediaRecorder: 원본 스트림을 1초 단위로 녹음하되 데이터는 즉시 버린다 (마이크 포그라운드 서비스 유지)
 import type { LevelPkt } from './link';
 
 export type KaState = 'off' | 'starting' | 'on' | 'failed' | 'unsupported';
@@ -44,6 +43,9 @@ const audibleEl = (el: HTMLAudioElement): HTMLAudioElement => {
 export class KeepAlive {
   rtc: KaState = 'off';
   wav: KaState = 'off';
+  rec: KaState = 'off';
+  private recorder: MediaRecorder | null = null;
+  private recStream: MediaStream | null = null;
   private pc1: RTCPeerConnection | null = null;
   private pc2: RTCPeerConnection | null = null;
   private rtcEl: HTMLAudioElement | null = null;
@@ -56,17 +58,18 @@ export class KeepAlive {
   private shown = '';
   onChange: () => void = () => {};
 
-  /** [시작] 클릭(사용자 동작) 안에서 호출. pilot = AudioContext 가 만든 파일럿 톤 스트림 (입력 신호 아님) */
-  async start(pilot: MediaStream | undefined, onResume: () => void) {
+  /** [시작] 클릭(사용자 동작) 안에서 호출. raw = getUserMedia 원본 입력 스트림 */
+  async start(raw: MediaStream | undefined, onResume: () => void) {
     this.active = true; this.onResume = onResume;
     this.setSession();
-    await Promise.all([this.startRtc(pilot), this.startWav()]);
+    this.startRec(raw);
+    await Promise.all([this.startRtc(raw), this.startWav()]);
     this.shown = ''; this.applyMeta();
   }
 
   stop() {
     this.active = false;
-    this.stopRtc(); this.stopWav();
+    this.stopRec(); this.stopRtc(); this.stopWav();
     try { const ms: any = (navigator as any).mediaSession; if (ms) { ms.metadata = null; ms.playbackState = 'none'; } } catch { /* ignore */ }
     this.shown = '';
   }
@@ -83,6 +86,7 @@ export class KeepAlive {
     if (this.wav === 'on' && this.wavEl?.paused) this.wavEl.play().catch(() => {});
     if (this.rtc === 'on' && this.rtcEl?.paused) this.rtcEl.play().catch(() => {});
     if (this.rtc === 'on' && this.pc1 && /failed|closed/.test(this.pc1.connectionState)) { this.rtc = 'failed'; this.onChange(); }
+    if (this.recStream && this.recorder?.state !== 'recording') this.restartRec();
     try {
       const ms: any = (navigator as any).mediaSession;
       if (ms && ms.playbackState !== 'playing') ms.playbackState = 'playing';
@@ -132,11 +136,11 @@ export class KeepAlive {
     el.addEventListener('pause', () => { if (this.active) { el.play().catch(() => {}); this.onResume(); } });
   }
 
-  // ───────── A. WebRTC 루프백 (파일럿 톤 스트림) ─────────
-  private async startRtc(pilot: MediaStream | undefined) {
+  // ───────── A. WebRTC 직결 (원본 입력 트랙) ─────────
+  private async startRtc(raw: MediaStream | undefined) {
     this.stopRtc();
     if (typeof RTCPeerConnection === 'undefined') { this.rtc = 'unsupported'; this.onChange(); return; }
-    if (!pilot || !pilot.getAudioTracks().length) { this.rtc = 'failed'; this.onChange(); return; }
+    if (!raw || !raw.getAudioTracks().length) { this.rtc = 'failed'; this.onChange(); return; }
     this.rtc = 'starting'; this.onChange();
     try {
       const pc1 = new RTCPeerConnection(), pc2 = new RTCPeerConnection();
@@ -145,10 +149,12 @@ export class KeepAlive {
       pc2.onicecandidate = e => { if (e.candidate) pc1.addIceCandidate(e.candidate).catch(() => {}); };
       const el = audibleEl(document.createElement('audio'));
       el.autoplay = true;
+      el.volume = 0.0001;   // 원본 입력이므로 사실상 무음(-80dB)으로 재생 · muted 는 쓰지 않음 (재생 중 상태 유지)
       this.guard(el);
       this.rtcEl = el;
       pc2.ontrack = e => { el.srcObject = e.streams[0] ?? new MediaStream([e.track]); el.play().catch(() => {}); };
-      for (const t of pilot.getAudioTracks()) pc1.addTrack(t, pilot);
+      const rawTrack = raw.getAudioTracks()[0];
+      pc1.addTrack(rawTrack, raw);         // WebAudio 를 거치지 않은 원본 트랙 그대로
       const connected = new Promise<void>((res, rej) => {
         const to = setTimeout(() => rej(new Error('연결 시간 초과')), 8000);
         pc1.onconnectionstatechange = () => {
@@ -170,6 +176,41 @@ export class KeepAlive {
     }
     this.onChange();
   }
+  // ───────── D. 더미 MediaRecorder (데이터는 즉시 폐기) ─────────
+  private startRec(raw: MediaStream | undefined) {
+    this.stopRec();
+    if (typeof MediaRecorder === 'undefined') { this.rec = 'unsupported'; this.onChange(); return; }
+    if (!raw || !raw.getAudioTracks().length) { this.rec = 'failed'; this.onChange(); return; }
+    this.recStream = raw;
+    this.restartRec();
+  }
+  private restartRec() {
+    const raw = this.recStream;
+    if (!raw || !this.active) return;
+    if (this.recorder && this.recorder.state === 'recording') return;
+    try {
+      const r = new MediaRecorder(raw);
+      r.ondataavailable = () => { /* Blob 은 저장하지 않고 버림 */ };
+      const again = () => { if (this.active && this.recorder === r) setTimeout(() => this.restartRec(), 500); };
+      r.onstop = () => { if (this.recorder === r) { this.rec = this.active ? 'starting' : 'off'; this.onChange(); } again(); };
+      r.onerror = () => { try { r.stop(); } catch { /* ignore */ } again(); };
+      this.recorder = r;
+      r.start(1000);
+      this.rec = 'on';
+    } catch (e) {
+      console.warn('MediaRecorder 시작 실패', e);
+      this.rec = 'failed';
+      this.recorder = null;
+    }
+    this.onChange();
+  }
+  private stopRec() {
+    const r = this.recorder;
+    this.recorder = null; this.recStream = null;
+    if (r && r.state !== 'inactive') { try { r.stop(); } catch { /* ignore */ } }
+    if (this.rec !== 'unsupported') this.rec = 'off';
+  }
+
   private stopRtc() {
     try { this.pc1?.close(); this.pc2?.close(); } catch { /* ignore */ }
     this.pc1 = this.pc2 = null;

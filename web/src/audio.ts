@@ -1,4 +1,5 @@
 import { BANDS, FB, fbParamsFor } from './config';
+import { PcmDsp, readAudioData, type PcmWindow } from './dsp';
 
 /** 드롭다운 기본값: deviceId 지정 없이 OS 기본 입력(안드로이드는 꽂힌 USB 인터페이스)을 연다 */
 export const DEFAULT_INPUT_ID = 'default';
@@ -16,13 +17,21 @@ export const micAvailable = () => !!navigator.mediaDevices?.getUserMedia;
 /** 노이즈 게이트: 기본 임계값(dBFS)과 무음 대기 진입 시간 */
 export const GATE = { defaultDb: -55, minDb: -70, maxDb: -20, enterMs: 2500, exitTicks: 2 } as const;
 
-/** 마스터 클럭 AudioWorklet (오디오 렌더 스레드에서 100ms 마다 메인 스레드에 박동을 보냄) */
+/**
+ * 마스터 클럭 AudioWorklet (오디오 렌더 스레드):
+ *  · 100ms 마다 { type:'tick', rms, peak } 를 메인 스레드로 보냄
+ *  · 입력을 출력으로 그대로 통과 (뒤에서 -120dB 게인으로 destination 에 직결 → 그래프가 '소비 중'으로 유지)
+ *  · MediaStreamTrackProcessor 를 쓸 수 없을 때는 100ms 분량 원본 PCM(L/R)도 함께 보냄 (pcm 모드)
+ */
 const CLOCK_SRC = `
 class LmClock extends AudioWorkletProcessor {
-  constructor() { super(); this.acc = 0; this.every = Math.round(sampleRate / 10); this.sq = [0, 0]; this.pk = [0, 0]; this.n = 0; }
-  process(inputs) {
-    // 입력(L/R)의 RMS·Peak 를 오디오 스레드에서 직접 측정 (백그라운드에서 메인 스레드 AnalyserNode 가 멈춰도 유효)
-    const inp = inputs[0];
+  constructor() {
+    super(); this.acc = 0; this.every = Math.round(sampleRate / 10); this.sq = [0, 0]; this.pk = [0, 0]; this.n = 0;
+    this.pcm = false; this.bl = new Float32Array(this.every + 512); this.br = new Float32Array(this.every + 512); this.bn = 0;
+    this.port.onmessage = e => { if (e.data && e.data.type === 'pcm') { this.pcm = !!e.data.on; this.bn = 0; } };
+  }
+  process(inputs, outputs) {
+    const inp = inputs[0], out = outputs[0];
     if (inp && inp.length) {
       const L = inp[0], R = inp[1] || inp[0];
       for (let i = 0; i < L.length; i++) {
@@ -33,14 +42,21 @@ class LmClock extends AudioWorkletProcessor {
         if (pb > this.pk[1]) this.pk[1] = pb;
       }
       this.n += L.length;
+      if (this.pcm && this.bn + L.length <= this.bl.length) { this.bl.set(L, this.bn); this.br.set(R, this.bn); this.bn += L.length; }
+      if (out) for (let c = 0; c < out.length; c++) out[c].set(c === 0 ? L : R);
     }
     this.acc += 128;
     if (this.acc >= this.every) {
       this.acc -= this.every;
       const db = x => (x > 1e-7 ? 20 * Math.log10(x) : -120), n = this.n || 1;
-      this.port.postMessage({ type: 'tick',
+      const msg = { type: 'tick',
         rms: [db(Math.sqrt(this.sq[0] / n)), db(Math.sqrt(this.sq[1] / n))],
-        peak: [db(this.pk[0]), db(this.pk[1])] });
+        peak: [db(this.pk[0]), db(this.pk[1])] };
+      if (this.pcm && this.bn) {
+        const l = this.bl.slice(0, this.bn), r = this.br.slice(0, this.bn);
+        msg.pcm = [l, r]; this.bn = 0;
+        this.port.postMessage(msg, [l.buffer, r.buffer]);
+      } else this.port.postMessage(msg);
       this.sq[0] = this.sq[1] = 0; this.pk[0] = this.pk[1] = 0; this.n = 0;
     }
     return true;
@@ -148,8 +164,22 @@ export class AudioEngine {
   private anRaw: AnalyserNode[] = [];    // 보정 전 원본 L/R 레벨 (Auto-Trim 추적용)
   private sp?: ScriptProcessorNode;      // AudioWorklet 을 쓸 수 없을 때만 쓰는 오디오 스레드 하트비트
   private clockNode?: AudioWorkletNode;  // 마스터 클럭 (오디오 스레드 100ms 박동)
-  private pilotDest?: MediaStreamAudioDestinationNode;   // 파일럿 톤 출력 스트림 (WebRTC 루프백용 · 입력 신호는 섞지 않음)
   private pilotSrc: AudioScheduledSourceNode[] = [];
+  /** 🧮 PCM 직결 분석기 (MediaStreamTrackProcessor 또는 AudioWorklet 원본 샘플) */
+  private dsp = new PcmDsp();
+  private mstpReader: any = null;
+  /** PCM 공급 경로 */
+  pcmKind: 'mstp' | 'worklet' | 'none' = 'none';
+  /** 이번 틱의 측정 소스: AnalyserNode / PCM 직결 */
+  source: 'analyser' | 'pcm' = 'analyser';
+  private pcmWin: PcmWindow | null = null;
+  private anRawDb = -120;
+  private srcCount = { analyser: 0, pcm: 0, cached: 0 };
+  /** 무음 버퍼(-80dBFS 이하) 대체용: 직전 유효 틱(최대 3초 = 30틱) 이동평균 캐시 */
+  private cache: { band: { ms: number; pk: number }[]; full: { ms: number; pk: number } }[] = [];
+  private specCache: Float64Array | null = null;
+  private tickQuiet = false;
+  private tickCached = false;
   /** AudioWorklet 이 직접 측정한 입력 레벨 (dBFS) · 100ms 마다 갱신 */
   private wk: { rms: [number, number]; peak: [number, number]; at: number } | null = null;
   /** 마스터 클럭 종류 */
@@ -169,7 +199,7 @@ export class AudioEngine {
   /** 100ms 마다 쌓는 대역별 단기 레벨(dB) 시리즈: [low, mid, highMid] */
   private series: number[][] = [[], [], []];
   /** 노이즈 게이트: 원본 RMS 가 임계값 아래로 GATE.enterMs 이상이면 무음 대기 */
-  private gateOn = true;
+  private gateOn = false;   // 기본 OFF: 레벨이 낮아도 신호 대기로 넘어가지 않고 계속 분석
   gateDb: number = GATE.defaultDb;
   idle = false;
   private belowSince = 0;
@@ -217,21 +247,18 @@ export class AudioEngine {
     this.trim = trim;
     this.trimDb = 0; this.trimIntDb = -120; this.trimInit = false; this.trimLastAt = 0; this.startedAt = performance.now();
     const an = trim;   // 이하 분석 노드는 모두 trim 출력에 연결
-    // 출력 그래프: 입력 신호는 절대 스피커/출력으로 보내지 않는다 (하울링 방지).
-    //  분석 노드들 → 무음 싱크(Gain 0) → mix → MediaStreamDestination ← 파일럿 톤
-    //  mix 의 스트림은 WebRTC 루프백 <audio>(volume 1.0)로만 재생된다.
-    const dest = ctx.createMediaStreamDestination();
-    const mix = ctx.createGain();
-    mix.gain.value = 1;
-    mix.connect(dest);
-    this.pilotDest = dest;
+    // 출력 그래프: audioCtx.destination 에 직결해 크롬 SilentSinkSuspender 가 컨텍스트를 멈추지 못하게 한다.
+    //  · 분석 노드들 → 무음 싱크(Gain 0) → out(Gain 0.000001 ≈ -120dB) → destination
+    //  · 입력 → AnalyserNode → AudioWorklet(통과) → out(-120dB) → destination
+    //  · 19kHz 오실레이터 → Gain 0.01(약 -40dBFS) → destination
+    const out = ctx.createGain();
+    out.gain.value = 0.000001;
+    out.connect(ctx.destination);
     const sink = ctx.createGain();
     sink.gain.value = 0;
-    sink.connect(mix);
-    // 입력 → -100dBFS(gain 0.00001) → mix: 크롬이 입력 트랙을 'WebRTC 로 실시간 전송 중'으로 보게 해 백그라운드 캡처 음소거를 막는다 (출력은 들리지 않는 수준)
-    const inGain = ctx.createGain();
-    inGain.gain.value = 0.00001;
-    src.connect(inGain); inGain.connect(mix);
+    sink.connect(out);
+    this.cache = []; this.specCache = null; this.srcCount = { analyser: 0, pcm: 0, cached: 0 };
+    this.dsp = new PcmDsp(); this.pcmWin = null; this.source = 'analyser';
 
     // 원본 L/R 을 따로 측정 (Analyser 는 스테레오를 모노로 평균내 레벨이 낮게 나오므로 Splitter 로 분리)
     const rawSplit = ctx.createChannelSplitter(2);
@@ -282,9 +309,15 @@ export class AudioEngine {
     this.bandAcc = BANDS.map(() => ({ sumSq: 0, n: 0, peak: 0 }));
     this.fullAcc = { sumSq: 0, n: 0, peak: 0 }; this.series = [[], [], []];
     this.idle = false; this.belowSince = 0; this.aboveCount = 0;
-    // 파일럿 톤(-43dBFS 19kHz + 저역 80Hz + 디더 노이즈)과 AudioWorklet 마스터 클럭
-    try { this.startPilot(mix); } catch (e) { console.warn('파일럿 톤 생성 실패 (분석은 계속)', e); }
-    await this.startClock(src, sink);
+    // 19kHz 파일럿(destination 직결) · AudioWorklet 마스터 클럭 · PCM 직결 분석 경로
+    try { this.startPilot(); } catch (e) { console.warn('파일럿 톤 생성 실패 (분석은 계속)', e); }
+    const pre = ctx.createAnalyser();
+    pre.fftSize = 256;
+    src.connect(pre);
+    await this.startClock(pre, out, sink);
+    if (this.startMstp(track)) this.pcmKind = 'mstp';
+    else if (this.clockNode) { this.clockNode.port.postMessage({ type: 'pcm', on: true }); this.pcmKind = 'worklet'; }
+    else this.pcmKind = 'none';
     this.specAcc.fill(0); this.specN = 0;
     this.fbTrack = { bin: -1, n: 0, maxDb: -200 };
     this.running = true;
@@ -294,13 +327,16 @@ export class AudioEngine {
     this.running = false;
     if (this.sp) { this.sp.onaudioprocess = null; try { this.sp.disconnect(); } catch { /* ignore */ } }
     if (this.clockNode) { this.clockNode.port.onmessage = null; try { this.clockNode.disconnect(); } catch { /* ignore */ } }
+    const rd = this.mstpReader; this.mstpReader = null;
+    if (rd) { try { rd.cancel(); } catch { /* ignore */ } }
+    this.pcmKind = 'none'; this.pcmWin = null;
     this.stream?.getTracks().forEach(t => t.stop());
     await this.ctx?.close().catch(() => {});
     this.ctx = undefined; this.stream = undefined; this.src = undefined; this.bandAn = [];
     this.trim = undefined; this.anRaw = []; this.sp = undefined;
     this.anL = undefined; this.anR = undefined; this.anFb = undefined;
     this.clockNode = undefined; this.clockKind = 'none';
-    this.pilotDest = undefined; this.pilotSrc = [];
+    this.pilotSrc = [];
   }
 
   /** 피드백 민감도 슬라이더 (0=둔감 … 1=예민). 반환: 적용된 판정 기준 */
@@ -324,8 +360,67 @@ export class AudioEngine {
     return true;
   }
   get state() { return this.ctx?.state ?? 'closed'; }
-  /** 파일럿 톤 스트림 (WebRTC 루프백 <audio> 재생용). 입력 신호는 들어 있지 않다 */
-  get pilotStream(): MediaStream | undefined { return this.pilotDest?.stream; }
+  /** 원본 입력 스트림 (getUserMedia 그대로 · MediaRecorder/WebRTC 직결용) */
+  get rawStream(): MediaStream | undefined { return this.stream; }
+
+  /**
+   * 🧮 MediaStreamTrackProcessor(WebCodecs) 리더 루프: AudioContext 가 얼어도 캡처 스레드에서 원본 PCM 을 직접 받는다.
+   * 지원하지 않으면 false (→ AudioWorklet 이 PCM 을 대신 보냄)
+   */
+  private startMstp(track: MediaStreamTrack): boolean {
+    const MSTP = (window as any).MediaStreamTrackProcessor;
+    if (typeof MSTP !== 'function') return false;
+    let reader: any;
+    try { reader = new MSTP({ track }).readable.getReader(); } catch (e) { console.warn('MediaStreamTrackProcessor 실패', e); return false; }
+    this.mstpReader = reader;
+    let L = new Float32Array(4096), R = new Float32Array(4096);
+    void (async () => {
+      while (this.mstpReader === reader) {
+        let r: any;
+        try { r = await reader.read(); } catch { break; }
+        if (r.done || !r.value) break;
+        const ad = r.value;
+        try {
+          if (ad.numberOfFrames > L.length) { L = new Float32Array(ad.numberOfFrames); R = new Float32Array(ad.numberOfFrames); }
+          const n = readAudioData(ad, L, R);
+          this.dsp.feed(L, R, n, ad.sampleRate, 'mstp');
+        } catch (e) { console.warn('AudioData 읽기 실패', e); }
+        finally { try { ad.close(); } catch { /* ignore */ } }
+      }
+    })();
+    return true;
+  }
+
+  /**
+   * 매 틱 시작 시 호출: 이번 틱에 쓸 측정 소스를 고른다.
+   * 화면 꺼짐/백그라운드(document.hidden)이거나 AnalyserNode RMS 가 -70dBFS 이하이면 PCM 직결 분석값을 쓴다.
+   */
+  selectSource(hidden: boolean) {
+    let pw = 0;
+    for (const a of this.anRaw) {
+      a.getFloatTimeDomainData(this.rawBuf);
+      let sq = 0;
+      for (let k = 0; k < this.rawBuf.length; k++) sq += this.rawBuf[k] * this.rawBuf[k];
+      pw += sq / this.rawBuf.length / (this.anRaw.length || 1);
+    }
+    this.anRawDb = toDb(Math.sqrt(pw));
+    this.pcmWin = this.dsp.take();
+    const now = performance.now();
+    // MSTP 가 1.5초 넘게 샘플을 못 주면 AudioWorklet PCM 으로 전환
+    if (this.pcmKind === 'mstp' && this.running && now - this.dsp.lastFeedAt > 1500 && this.clockNode) {
+      this.mstpReader = null;
+      this.clockNode.port.postMessage({ type: 'pcm', on: true });
+      this.pcmKind = 'worklet';
+    }
+    const fresh = !!this.pcmWin && now - this.dsp.lastFeedAt < 600;
+    this.source = fresh && (hidden || this.anRawDb <= -70) ? 'pcm' : 'analyser';
+    this.srcCount[this.source]++;
+  }
+  /** 지난 AI 구간 동안 소스별 틱 수 (확인용). 호출하면 초기화 */
+  takeSourceStats() { const s = this.srcCount; this.srcCount = { analyser: 0, pcm: 0, cached: 0 }; return s; }
+  /** PCM 공급 경로 이름 */
+  get pcmVia() { return this.pcmKind === 'mstp' ? 'MediaStreamTrackProcessor' : this.pcmKind === 'worklet' ? 'AudioWorklet' : '없음'; }
+  private trimGain() { return this.trimOn ? Math.pow(10, this.trimDb / 20) : 1; }
 
   /** 노이즈 게이트 설정. 끄면 즉시 무음 대기 해제 */
   setGate(on: boolean, db: number) {
@@ -372,14 +467,8 @@ export class AudioEngine {
    */
   updateTrim(): number {
     if (!this.anRaw.length || !this.ctx || !this.trim) return -120;
-    let pw = 0;
-    for (const a of this.anRaw) {                    // L/R 평균 파워 (미터의 채널별 RMS 와 같은 기준)
-      a.getFloatTimeDomainData(this.rawBuf);
-      let sq = 0;
-      for (let k = 0; k < this.rawBuf.length; k++) sq += this.rawBuf[k] * this.rawBuf[k];
-      pw += sq / this.rawBuf.length / this.anRaw.length;
-    }
-    let rawDb = toDb(Math.sqrt(pw));
+    // 원본 L/R 평균 파워: 이번 틱 소스(AnalyserNode / PCM 직결)의 값
+    let rawDb = this.source === 'pcm' && this.pcmWin ? this.pcmWin.rawDb : this.anRawDb;
     const now = performance.now();
     // 백그라운드에서 AnalyserNode 가 갱신되지 않아도 AudioWorklet 이 잰 값이 있으면 더 큰(유효한) 값을 기준으로 삼는다
     if (this.wk && now - this.wk.at < 600) {
@@ -412,23 +501,24 @@ export class AudioEngine {
   }
 
   /**
-   * 마스터 클럭: 입력 스트림 → AudioWorkletNode(오디오 렌더 스레드) → 무음 싱크 → mix → MediaStreamDestination.
-   * 워클릿이 100ms 마다 메인 스레드로 박동을 보낸다. (AudioWorklet 을 쓸 수 없는 환경에서만 ScriptProcessor 로 대체)
+   * 마스터 클럭: 입력 → AnalyserNode → AudioWorkletNode(통과) → Gain 0.000001 → destination.
+   * 워클릿이 100ms 마다 메인 스레드로 박동(+레벨, 필요하면 원본 PCM)을 보낸다. (AudioWorklet 을 쓸 수 없을 때만 ScriptProcessor 로 대체)
    */
-  private async startClock(src: AudioNode, sink: AudioNode) {
+  private async startClock(src: AudioNode, out: AudioNode, sink: AudioNode) {
     const ctx = this.ctx!;
     try {
       if (!ctx.audioWorklet || typeof AudioWorkletNode === 'undefined') throw new Error('AudioWorklet 미지원');
       const url = URL.createObjectURL(new Blob([CLOCK_SRC], { type: 'text/javascript' }));
       try { await ctx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
-      const node = new AudioWorkletNode(ctx, 'lm-clock', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
+      const node = new AudioWorkletNode(ctx, 'lm-clock', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] });
       node.port.onmessage = ev => {
         const d = ev.data;
         if (d?.type !== 'tick') return;
         if (Array.isArray(d.rms) && Array.isArray(d.peak)) this.wk = { rms: [d.rms[0], d.rms[1]], peak: [d.peak[0], d.peak[1]], at: performance.now() };
+        if (d.pcm && this.pcmKind === 'worklet') this.dsp.feed(d.pcm[0], d.pcm[1], d.pcm[0].length, ctx.sampleRate, 'worklet');
         try { this.onAudioBeat(); } catch { /* ignore */ }
       };
-      src.connect(node); node.connect(sink);
+      src.connect(node); node.connect(out);
       this.clockNode = node; this.clockKind = 'worklet';
     } catch (e) {
       console.warn('AudioWorklet 마스터 클럭 실패 → ScriptProcessor 대체', e);
@@ -441,27 +531,13 @@ export class AudioEngine {
     }
   }
 
-  /**
-   * 파일럿 톤: 크롬 AudioPowerMonitor 가 '무음'으로 판정하지 않도록 실제 에너지가 있는 신호를 만든다.
-   *  · 19kHz -43dBFS (비가청) · 80Hz -46dBFS (Opus 는 고역을 잘라 낼 수 있어 저역 파일럿을 함께 실음) · -60dBFS 디더 노이즈
-   */
-  private startPilot(mix: AudioNode) {
+  /** 19kHz 파일럿 → Gain 0.01(약 -40dBFS) → destination 직결: 하드웨어 출력 콜백이 멈추지 않게 한다 */
+  private startPilot() {
     const ctx = this.ctx!;
-    const tone = (hz: number, db: number) => {
-      const o = ctx.createOscillator(); o.type = 'sine'; o.frequency.value = hz;
-      const g = ctx.createGain(); g.gain.value = Math.pow(10, db / 20);
-      o.connect(g); g.connect(mix); o.start();
-      this.pilotSrc.push(o);
-    };
-    tone(Math.min(19000, ctx.sampleRate / 2 - 1000), -43);
-    tone(80, -46);
-    const len = Math.round(ctx.sampleRate * 2);
-    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
-    const d = buf.getChannelData(0), amp = Math.pow(10, -60 / 20);
-    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * amp;
-    const ns = ctx.createBufferSource(); ns.buffer = buf; ns.loop = true;
-    ns.connect(mix); ns.start();
-    this.pilotSrc.push(ns);
+    const o = ctx.createOscillator(); o.type = 'sine'; o.frequency.value = Math.min(19000, ctx.sampleRate / 2 - 1000);
+    const g = ctx.createGain(); g.gain.value = 0.01;
+    o.connect(g); g.connect(ctx.destination); o.start();
+    this.pilotSrc.push(o);
   }
 
   /** L/R 입력 레벨 (rAF/타이머에서 호출) */
@@ -469,14 +545,18 @@ export class AudioEngine {
     if (!this.anL || !this.anR) return null;
     if (this.idle) return [{ rmsDb: -120, peakDb: -120, clip: false }, { rmsDb: -120, peakDb: -120, clip: false }];   // 무음 대기: 미터 -∞
     const now = performance.now();
+    const w = this.source === 'pcm' ? this.pcmWin : null, g = this.trimGain();
     const out = [this.anL, this.anR].map((an, i) => {
-      an.getFloatTimeDomainData(this.buf);
-      let sum = 0, peak = 0;
-      for (let k = 0; k < this.buf.length; k++) {
-        const v = Math.abs(this.buf[k]);
-        sum += v * v; if (v > peak) peak = v;
+      let sum = 0, peak = 0, len = this.buf.length;
+      if (w) { sum = w.sq[i] * g * g; peak = w.pk[i] * g; len = w.n; }       // PCM 직결 측정값
+      else {
+        an.getFloatTimeDomainData(this.buf);
+        for (let k = 0; k < this.buf.length; k++) {
+          const v = Math.abs(this.buf[k]);
+          sum += v * v; if (v > peak) peak = v;
+        }
       }
-      let rmsDb = toDb(Math.sqrt(sum / this.buf.length));
+      let rmsDb = toDb(Math.sqrt(sum / len));
       let peakDb = toDb(peak);
       // AnalyserNode 가 죽어 있는데(-100 미만) AudioWorklet 은 신호를 보면 워클릿 값으로 대체
       if (rmsDb < -100 && this.wk && now - this.wk.at < 600 && this.wk.rms[i] > -100) { rmsDb = this.wk.rms[i]; peakDb = this.wk.peak[i]; }
@@ -489,41 +569,67 @@ export class AudioEngine {
     return [out[0], out[1]];
   }
 
-  /** 100ms 틱마다 호출: 6밴드·전대역 누적 */
+  /**
+   * 100ms 틱마다 호출: 6밴드·전대역 누적.
+   * 소스는 selectSource() 가 고른 AnalyserNode 또는 PCM 직결 분석값.
+   * 게이트 OFF 에서 이번 틱이 -80dBFS 이하(완전 무음 버퍼)면 직전 3초 이동평균 캐시로 대체해 분석이 끊기지 않게 한다.
+   */
   pollBands() {
     if (this.idle) return;                       // 무음 대기 중에는 누적하지 않음
-    this.bandAn.forEach((an, i) => {
-      an.getFloatTimeDomainData(this.buf);
-      const acc = this.bandAcc[i];
-      let sq = 0;
-      for (let k = 0; k < this.buf.length; k++) {
-        const v = this.buf[k];
-        sq += v * v;
-        const a = Math.abs(v);
-        if (a > acc.peak) acc.peak = a;
+    type T = { band: { ms: number; pk: number }[]; full: { ms: number; pk: number } };
+    let t: T, n: number;
+    const w = this.source === 'pcm' ? this.pcmWin : null;
+    if (w) {
+      const g2 = this.trimGain() ** 2, g = Math.sqrt(g2);
+      n = w.n;
+      t = {
+        band: w.band.map(b => ({ ms: b.sq / w.n * g2, pk: b.pk * g })),
+        full: { ms: (w.sq[0] + w.sq[1]) / (2 * w.n) * g2, pk: Math.max(w.pk[0], w.pk[1]) * g },
+      };
+    } else {
+      n = this.buf.length;
+      const meas = (an: AnalyserNode | undefined) => {
+        if (!an) return { ms: 0, pk: 0 };
+        an.getFloatTimeDomainData(this.buf);
+        let sq = 0, pk = 0;
+        for (let k = 0; k < this.buf.length; k++) { const v = this.buf[k]; sq += v * v; const a = v < 0 ? -v : v; if (a > pk) pk = a; }
+        return { ms: sq / this.buf.length, pk };
+      };
+      const l = meas(this.anL), r = meas(this.anR);
+      t = { band: this.bandAn.map(meas), full: { ms: (l.ms + r.ms) / 2, pk: Math.max(l.pk, r.pk) } };
+    }
+    // 무음 버퍼 보정
+    this.tickQuiet = toDb(Math.sqrt(t.full.ms)) <= -80;
+    this.tickCached = false;
+    if (this.tickQuiet) {
+      if (!this.gateOn && this.cache.length) {
+        const c = this.cache, k = c.length;
+        t = {
+          band: BANDS.map((_, i) => ({ ms: c.reduce((s, x) => s + x.band[i].ms, 0) / k, pk: c.reduce((s, x) => s + x.band[i].pk, 0) / k })),
+          full: { ms: c.reduce((s, x) => s + x.full.ms, 0) / k, pk: c.reduce((s, x) => s + x.full.pk, 0) / k },
+        };
+        this.tickCached = true;
+        this.srcCount.cached++;
       }
-      acc.sumSq += sq;
-      acc.n += this.buf.length;
+    } else {
+      this.cache.push(t);
+      if (this.cache.length > 30) this.cache.shift();
+    }
+    t.band.forEach((b, i) => {
+      const acc = this.bandAcc[i];
+      acc.sumSq += b.ms * n; acc.n += n;
+      if (b.pk > acc.peak) acc.peak = b.pk;
       const si = i === 1 ? 0 : i === 3 ? 1 : i === 4 ? 2 : -1;   // Low / Mid / High-Mid 단시간 레벨 → 트랜지언트·잔향 분석
       if (si >= 0) {
         const ser = this.series[si];
-        ser.push(toDb(Math.sqrt(sq / this.buf.length)));
+        ser.push(toDb(Math.sqrt(b.ms)));
         if (ser.length > 1200) ser.splice(0, 200);
       }
     });
     // 전 대역 Crest Factor (L+R 합산, Peak 대비 RMS)
-    for (const an of [this.anL, this.anR]) {
-      if (!an) continue;
-      an.getFloatTimeDomainData(this.buf);
-      const f = this.fullAcc;
-      for (let k = 0; k < this.buf.length; k++) {
-        const v = this.buf[k];
-        f.sumSq += v * v;
-        const a = Math.abs(v);
-        if (a > f.peak) f.peak = a;
-      }
-      f.n += this.buf.length;
-    }
+    const f = this.fullAcc;
+    f.sumSq += t.full.ms * 2 * n; f.n += 2 * n;
+    if (t.full.pk > f.peak) f.peak = t.full.pk;
   }
 
   /** 전 대역 Crest Factor + 저역 트랜지언트 변화량을 집계하고 초기화 */
@@ -648,9 +754,24 @@ export class AudioEngine {
    */
   scanFeedback(): FbHit | null {
     if (!this.ctx || !this.anFb || this.idle) return null;
-    const d = this.fbBuf;
-    this.anFb.getFloatFrequencyData(d);
-    for (let k = 0; k < d.length; k++) this.specAcc[k] += Math.pow(10, d[k] / 10); // 평균 스펙트럼 누적
+    // 무음 버퍼를 캐시로 대체한 틱: 스펙트럼도 직전 이동평균으로 (피드백 판정은 건너뜀)
+    if (this.tickCached && this.specCache) {
+      for (let k = 0; k < this.specAcc.length; k++) this.specAcc[k] += this.specCache[k];
+      this.specN++;
+      return null;
+    }
+    let d: Float32Array = this.fbBuf;
+    if (this.source === 'pcm') {
+      d = this.dsp.spectrumDb();                 // PCM 직결 FFT (AnalyserNode 와 같은 dB 척도)
+      if (this.trimOn && this.trimDb) for (let k = 0; k < d.length; k++) d[k] += this.trimDb;
+    } else this.anFb.getFloatFrequencyData(this.fbBuf);
+    if (!this.specCache) this.specCache = new Float64Array(d.length);
+    const first = !this.cache.length || this.cache.length === 1;
+    for (let k = 0; k < d.length; k++) {
+      const p = Math.pow(10, d[k] / 10);
+      this.specAcc[k] += p;                        // 평균 스펙트럼 누적
+      if (!this.tickQuiet) this.specCache[k] = first ? p : this.specCache[k] * 0.9667 + p * 0.0333;   // 약 3초 이동평균
+    }
     this.specN++;
 
     const binHz = this.ctx.sampleRate / FB.fftSize;

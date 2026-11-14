@@ -164,7 +164,7 @@ let intervalSec = clamp(Math.round(parseFloat(ls.get('lm.interval', String(INTER
 
 // ───────── ⚙️ 설정: 노이즈 게이트 (무음 대기) ─────────
 let gateDb = clamp(parseFloat(ls.get('lm.gate3', String(GATE.defaultDb))), GATE.minDb, GATE.maxDb);
-let gateOn = ls.get('lm.gateOn', '1') !== '0';
+let gateOn = ls.get('lm.gateOn2', '0') === '1';   // 기본 OFF: 낮은 레벨에서도 계속 분석·AI 호출
 {
   const g = $<HTMLInputElement>('gateSlider');
   g.min = String(GATE.minDb); g.max = String(GATE.maxDb);
@@ -177,7 +177,7 @@ let gateOn = ls.get('lm.gateOn', '1') !== '0';
     g.disabled = !gateOn;
   };
   g.oninput = () => { gateDb = +g.value; ls.set('lm.gate3', String(gateDb)); applyGate(); paint(); };
-  $('gateBtn').onclick = () => { gateOn = !gateOn; ls.set('lm.gateOn', gateOn ? '1' : '0'); applyGate(); paint(); };
+  $('gateBtn').onclick = () => { gateOn = !gateOn; ls.set('lm.gateOn2', gateOn ? '1' : '0'); applyGate(); paint(); };
   paint();
 }
 function applyGate() { engine.setGate(gateOn, gateDb); }
@@ -272,7 +272,7 @@ const KA_ICON: Record<KaState, string> = { off: '–', starting: '…', on: '✔
 const CLOCK_ICON = { worklet: 'AudioWorklet ✔', scriptprocessor: 'ScriptProcessor(대체)', none: 'Worker만' } as const;
 function paintKeep() {
   $('keepState').textContent = running
-    ? `🛡️ 백그라운드 유지  파일럿 WebRTC ${KA_ICON[keep.rtc]} · 파일럿 WAV ${KA_ICON[keep.wav]} · 클럭 ${CLOCK_ICON[engine.clockKind]} · PiP ${KA_ICON[pip.state]}`
+    ? `🛡️ 백그라운드 유지  원본 WebRTC ${KA_ICON[keep.rtc]} · 레코더 ${KA_ICON[keep.rec]} · 파일럿 WAV ${KA_ICON[keep.wav]} · 클럭 ${CLOCK_ICON[engine.clockKind]} · PiP ${KA_ICON[pip.state]}\n🧮 PCM 직결 분석: ${engine.pcmVia} · 지금 측정 소스: ${engine.source === 'pcm' ? 'PCM 직결' : 'AnalyserNode'}`
     : '🛡️ 시작하면 백그라운드 유지 장치(파일럿 톤·미디어 알림·AudioWorklet 클럭)가 함께 켜집니다';
   const b = $<HTMLButtonElement>('pipBtn');
   b.disabled = pip.state === 'unsupported' || pip.state === 'starting';
@@ -331,10 +331,15 @@ function render() {
   paintHud(lines);
   glasses.update(lines);
 }
-/** 잠금화면/알림창 미디어 컨트롤러에 마지막 조언 1줄 표시 (피드백 경고가 있으면 그것을 우선) */
-function nowPlaying(lines: string[]) {
-  const last = [...lines].reverse().find(l => l.trim()) ?? '';
-  keep.setNowPlaying(last || 'Live Mix Assistant 분석 중', engine.idle ? '⏸️ 신호 대기 중' : genreLabel() || 'G2 HUD');
+/**
+ * 잠금화면/알림창(Now Bar) 제목: [실시간 입력 dB] + 최신 AI 조언 1줄 (피드백 경고가 있으면 그것을 우선)
+ * 예) [-18dB] [여성보컬] EQ:3kHz -2dB  — 화면을 켜지 않고도 입력이 들어오는지와 최신 조언을 확인
+ */
+function nowPlaying(_lines?: string[]) {
+  const db = engine.lastRawDb;
+  const lv = running ? `[${db <= -100 ? '-∞' : Math.round(db)}dB] ` : '';
+  const latest = fbText || advice.items[advice.items.length - 1]?.text || (running ? '분석 중 · AI 조언 대기' : 'Live Mix Assistant');
+  keep.setNowPlaying(lv + latest, genreLabel() || 'G2 HUD');
 }
 /** ⏳ 현재 쿨다운 목록 (분석기 본체 화면 전용 · HUD 수신기에는 보내지 않음) */
 const esc = (t: string) => t.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
@@ -374,7 +379,7 @@ async function startAudio() {
   refreshDevices().catch(() => {});   // 권한 승인 직후: 실제 장치 이름으로 목록 갱신
 
   // 🛡️ 백그라운드 유지: 파일럿 톤(WebRTC 루프백 + WAV) · 미디어 알림 · (PiP 는 버튼으로)
-  await keep.start(engine.pilotStream, () => engine.resumeCtx());
+  await keep.start(engine.rawStream, () => engine.resumeCtx());
   if (keep.rtc !== 'on' && keep.wav !== 'on') showNotice('백그라운드 유지 장치를 시작하지 못했습니다. 앱을 전환하기 전에 [📌 PiP 팝업]을 켜 주세요.');
 
   const info = engine.openInfo, st = info?.settings, ch = engine.channels;
@@ -512,6 +517,7 @@ function masterTick() {
   void ensureWake();                          // 화면 WakeLock 이 풀려 있고 화면이 보이면 재요청
   // 워치독: suspended 면 즉시 resume
   if (engine.watchdog()) recoverCount++;
+  engine.selectSource(document.hidden);       // 화면 꺼짐/백그라운드 또는 Analyser ≤-70dBFS → PCM 직결 분석값 사용
   engine.updateTrim();                        // Auto-Trim (OFF 면 측정만)
   engine.pollBands();                         // 6밴드 + 전대역 누적
   const lv = engine.readLevels();
@@ -541,7 +547,7 @@ function secondTick() {
   paintKeep();
   sender.update({ genre: badgeForSend(), genreAt: engine.idle ? 0 : genreAt, levels: localLevels });
   sender.publish();                           // 1초마다 전체 상태 retain 발행
-  $('bandInfo').textContent = `${engine.autoTrim ? 'Auto-Trim 기준' : 'Raw'} · 엔진 ${engine.state}${recoverCount ? ` · 자동 복구 ${recoverCount}회` : ''}`;
+  $('bandInfo').textContent = `${engine.autoTrim ? 'Auto-Trim 기준' : 'Raw'} · ${engine.source === 'pcm' ? 'PCM 직결' : 'Analyser'} · 엔진 ${engine.state}${recoverCount ? ` · 자동 복구 ${recoverCount}회` : ''}`;
 }
 
 function updateLiveBands() {
@@ -574,6 +580,7 @@ async function analyze() {
   const bands = engine.collectBands();
   const spec = engine.collectSpectrum();
   const dyn = engine.collectDynamics();
+  const srcStat = engine.takeSourceStats();
   const peaks = spec.peaks;
   const nowMs = Date.now();
   const windowSec = Math.max(1, Math.round((nowMs - lastCollectAt) / 1000));
@@ -599,7 +606,7 @@ async function analyze() {
   const over = solo
     ? [ev.crestOk ? '협대역 피크' : 'Crest 범위 밖']
     : Object.entries(ev.deltas).filter(([, d]) => Math.abs(d) > tol).map(([n, d]) => `${n} ${d > 0 ? '+' : ''}${d}`);
-  const gateInfo = `${modeInfo}\n필터 초과: ` + (over.length ? over.join(', ') : 'Crest 범위 밖');
+  const gateInfo = `${modeInfo}\n측정 소스: Analyser ${srcStat.analyser}틱 · PCM 직결 ${srcStat.pcm}틱 · 무음 캐시 ${srcStat.cached}틱\n필터 초과: ` + (over.length ? over.join(', ') : 'Crest 범위 밖');
 
   inFlight = true;
   const bandData = Object.fromEntries(Object.entries(bands).map(([n, b]) => [n, {
