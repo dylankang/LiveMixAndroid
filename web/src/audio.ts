@@ -1,12 +1,68 @@
 import { BANDS, FB, fbParamsFor } from './config';
-import { setTicker, clearTicker } from './ticker';
 
 /** 입력 장치 드롭다운의 특수 값: 시스템/화면 오디오 캡처(내부 재생음) */
 export const SYSTEM_AUDIO_ID = '__system_audio__';
 /** 드롭다운 기본값: deviceId 지정 없이 OS 기본 입력(안드로이드는 꽂힌 USB 인터페이스)을 연다 */
 export const DEFAULT_INPUT_ID = 'default';
-/** 드롭다운 값: 내장 디지털 레퍼런스 플레이어 (파일/URL 의 디지털 원본을 그대로 분석) */
-export const REFERENCE_ID = '__reference_player__';
+
+/** 입력 모드: 콘솔 2-Track(USB 인터페이스 · 1순위 기본값) / 실시간 유튜브·재생음 모니터링(2순위) */
+export type InputMode = 'console' | 'monitor';
+
+/** Auto-Trim(볼륨 무관 레벨 고정) 기준 */
+export const TRIM = {
+  targetDb: -18,      // 분석기 내부 기준 레벨
+  gateDb: -55,        // 이보다 작은 구간(무음)은 추적에서 제외
+  tauSec: 2.5,        // 단기 통합 RMS 시간상수 (볼륨을 바꾸면 약 5초 안에 다시 고정)
+  minDb: -20, maxDb: 40,
+} as const;
+
+/** 백그라운드 유지용 '들리지 않는' 루프 WAV: 15Hz · -50 dBFS · 1초(15주기 → 이음새 없음)
+ *  완전 무음(0)은 크롬이 '소리 없는 탭'으로 보고 백그라운드에서 멈출 수 있어 귀·스피커로는 안 들리는 초저역을 쓴다 */
+function makeKeepWav(rate = 8000): Blob {
+  const n = rate, amp = Math.round(0.00316 * 32767);
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  const str = (o: number, t: string) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+  str(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, 'data'); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, Math.round(amp * Math.sin(2 * Math.PI * 15 * i / rate)), true);
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+/** 콘솔 모드 전용 백그라운드 유지: <audio loop> 재생 + 미디어 세션(안드로이드 알림) → 화면이 꺼져도 크롬이 탭을 절전시키지 않음.
+ *  유튜브 모니터링 모드에서는 오디오 포커스를 뺏어 유튜브가 멈추므로 절대 재생하지 않는다. */
+export class KeepAliveAudio {
+  private el: HTMLAudioElement | null = null;
+  private url = '';
+  active = false;
+  async start(): Promise<boolean> {
+    if (!this.el) {
+      this.url = URL.createObjectURL(makeKeepWav());
+      const a = document.createElement('audio');
+      a.src = this.url; a.loop = true; a.volume = 1;
+      a.setAttribute('playsinline', '');
+      this.el = a;
+    }
+    try {
+      await this.el.play();
+      this.active = true;
+      const ms: any = (navigator as any).mediaSession;
+      if (ms && typeof (window as any).MediaMetadata === 'function') {
+        ms.metadata = new (window as any).MediaMetadata({ title: 'Live Mix Assistant 분석 중', artist: '콘솔 2-Track 입력' });
+        try { ms.setActionHandler('pause', () => { /* 분석 유지: 알림의 일시정지는 무시 */ void this.el?.play(); }); } catch { /* ignore */ }
+      }
+      return true;
+    } catch (e) { console.warn('백그라운드 유지 오디오 재생 실패', e); this.active = false; return false; }
+  }
+  stop() {
+    this.active = false;
+    if (this.el) { this.el.pause(); this.el.currentTime = 0; }
+    try { const ms: any = (navigator as any).mediaSession; if (ms) ms.metadata = null; } catch { /* ignore */ }
+  }
+  get playing() { return !!this.el && !this.el.paused; }
+}
 
 const NO_MIC_MSG = '이 페이지에서는 마이크를 사용할 수 없습니다 (HTTPS 주소가 아니거나 브라우저/웹뷰가 차단함)';
 export const micAvailable = () => !!navigator.mediaDevices?.getUserMedia;
@@ -76,8 +132,8 @@ export class AudioEngine {
   private anFb?: AnalyserNode;
   private bandAn: AnalyserNode[] = [];
   private bandAcc = BANDS.map(() => ({ sumSq: 0, n: 0, peak: 0 }));
-  private bandTimer = 0;
-  private buf = new Float32Array(2048);
+  private buf = new Float32Array(4096);
+  private rawBuf = new Float32Array(2048);
   private fbBuf = new Float32Array(FB.fftSize / 2);
   private clipUntil = [0, 0];
   private peakHold = [-120, -120];
@@ -86,15 +142,22 @@ export class AudioEngine {
   private specAcc = new Float64Array(FB.fftSize / 2);
   private specN = 0;
   private fbCfg = fbParamsFor(0.5);
-  private src?: AudioNode;
-  private media?: HTMLMediaElement;      // 레퍼런스 플레이어의 미디어 요소
-  private monitorGain?: GainNode;        // 귀로 듣는 경로 (Post-Fader)
-  private monitorVol = 0.8;
-  mediaMode = false;
+  private src?: AudioNode;               // 원본 입력 (Thru 는 여기서 → 귀로 듣는 소리는 보정 없음)
+  private trim?: GainNode;               // Auto-Trim 게인 (분석 경로 전용)
+  private anRaw: AnalyserNode[] = [];    // 보정 전 원본 L/R 레벨 (Auto-Trim 추적용)
+  private sp?: ScriptProcessorNode;      // 오디오 스레드 하트비트 (Worker 가 멈춰도 분석 구동)
   private thruOn = false;
-  private keepAlive = true;
   private keepOsc?: OscillatorNode;
   private keepGain?: GainNode;
+  private trimOn = false;
+  private trimIntDb = -120;              // 단기 통합 레벨 (활성 구간만 · dB 영역 평균)
+  private trimInit = false;
+  private trimLastAt = 0;
+  private startedAt = 0;
+  trimDb = 0;                            // 현재 적용 중인 오프셋 게인 (dB)
+  mode: InputMode = 'console';
+  /** 오디오 스레드 콜백 (ScriptProcessor) — 분석기에서 Worker 틱 대체용으로 연결 */
+  onAudioBeat: () => void = () => {};
   private fullAcc = { sumSq: 0, n: 0, peak: 0 };
   private lowSeries: number[] = [];
   onEnded: () => void = () => {};     // 시스템 오디오 공유가 사용자에 의해 종료될 때
@@ -103,55 +166,45 @@ export class AudioEngine {
   openInfo: OpenInfo | null = null;
   ctxState = '';
 
-  /** 레퍼런스 플레이어 요소 지정 (start(REFERENCE_ID) 전에 호출) */
-  setMedia(el: HTMLMediaElement) { this.media = el; }
-  /** 청취 볼륨 (Post-Fader): 귀로 듣는 경로만 바뀌고 분석 경로는 항상 1.0 */
-  setMonitorVolume(v: number) {
-    this.monitorVol = Math.min(1, Math.max(0, v));
-    if (this.monitorGain) this.monitorGain.gain.value = this.monitorVol;
-  }
-
-  async start(deviceId?: string) {
+  /**
+   * console : getUserMedia 무보정 스테레오(EC/NS/AGC OFF) · 3단계 Fallback · Auto-Trim 기본 OFF(Raw dBFS)
+   * monitor : 데스크탑 = getDisplayMedia 시스템 오디오 / 모바일 = 기기 마이크 수음 스트림 · Auto-Trim 기본 ON
+   */
+  async start(mode: InputMode, deviceId?: string) {
     await this.stop();
     let step: 1 | 2 | 3 = 1;
-    const media = deviceId === REFERENCE_ID;
-    this.mediaMode = media;
-    if (media) {
-      if (!this.media) throw new Error('레퍼런스 플레이어에 불러온 소스가 없습니다');
-      this.stream = undefined;
-    } else if (deviceId === SYSTEM_AUDIO_ID) {
-      // 📱 시스템/화면 오디오 캡처 (내부 재생음): 유튜브 등 폰에서 재생 중인 소리를 분석
+    this.mode = mode;
+    let label = '';
+    if (mode === 'monitor' && systemCaptureSupported()) {
+      // 🖥️ 데스크탑: 탭/시스템 오디오 캡처 (유튜브 재생음 그대로)
       const md: any = navigator.mediaDevices;
-      if (!md?.getDisplayMedia) throw new Error('이 브라우저는 시스템/화면 오디오 캡처를 지원하지 않습니다 (모바일 크롬은 미지원일 수 있음). 마이크/USB 입력을 선택하세요');
       const ds: MediaStream = await md.getDisplayMedia({
         video: true,
         audio: { channelCount: 2, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        systemAudio: 'include',
       });
       if (!ds.getAudioTracks().length) {
         ds.getTracks().forEach(t => t.stop());
         throw new Error('공유한 소스에 오디오가 없습니다 (공유 창에서 "오디오 공유"를 체크하세요)');
       }
-      // 비디오 트랙은 분석에 쓰지 않으므로 숨김 처리: stop() 하면 일부 브라우저가 공유 전체를 끝내므로 비활성화 + 최소 사양으로 낮춤
+      // 비디오 트랙은 분석에 쓰지 않음: stop() 하면 일부 브라우저가 공유 전체를 끝내므로 비활성화 + 최소 사양
       ds.getVideoTracks().forEach(t => {
         t.enabled = false;
         t.applyConstraints({ frameRate: 1, width: 2, height: 2 }).catch(() => {});
         ds.removeTrack(t);
       });
       this.stream = ds;
+      label = '🖥️ 시스템/탭 오디오 캡처';
     } else {
-      const o = await openInput(deviceId);   // 3단계 Fallback
+      // 콘솔: 선택한 USB 인터페이스 / 모바일 모니터링: 기본 입력(폰 마이크 수음)
+      const o = await openInput(mode === 'console' ? deviceId : undefined);
       this.stream = o.stream; step = o.step;
     }
-    if (this.stream) {
-      const track = this.stream.getAudioTracks()[0];
-      track.addEventListener('ended', () => { if (this.running) this.onEnded(); });
-      const settings = track.getSettings();
-      this.channels = settings.channelCount ?? 0;
-      this.openInfo = { step, label: track.label || '', settings };
-    } else {
-      this.channels = 2;
-      this.openInfo = { step: 1, label: '🎵 내장 디지털 레퍼런스 플레이어', settings: {} };
-    }
+    const track = this.stream!.getAudioTracks()[0];
+    track.addEventListener('ended', () => { if (this.running) this.onEnded(); });
+    const settings = track.getSettings();
+    this.channels = settings.channelCount ?? 0;
+    this.openInfo = { step, label: label || track.label || '', settings };
 
     const ctx = new AudioContext({ latencyHint: 'interactive' });
     // resume() 이 자동재생 정책 때문에 끝나지 않는 경우에도 시작이 멈추지 않도록 1.5초만 기다림
@@ -159,31 +212,30 @@ export class AudioEngine {
     this.ctx = ctx;
     this.ctxState = ctx.state;
     ctx.onstatechange = () => { if (ctx.state === 'suspended') ctx.resume().catch(() => {}); };   // 백그라운드 전환 시 자동 복구
-    let src: AudioNode;
-    if (media) {
-      // 레퍼런스 플레이어: 소스를 두 갈래로 분기
-      //  [분석 경로 · Pre-Fader] source → (스테레오 정규화, 게인 1.0 고정) → Splitter/Analyser … 폰 볼륨·무음·청취 볼륨과 무관
-      //  [청취 경로 · Post-Fader] source → monitorGain → destination
-      const ms = ctx.createMediaElementSource(this.media!);
-      const pre = ctx.createGain();
-      pre.gain.value = 1;
-      pre.channelCount = 2; pre.channelCountMode = 'explicit'; pre.channelInterpretation = 'speakers';   // 모노 파일도 L=R 로
-      ms.connect(pre);
-      const mon = ctx.createGain();
-      mon.gain.value = this.monitorVol;
-      ms.connect(mon); mon.connect(ctx.destination);
-      this.monitorGain = mon;
-      src = pre;
-    } else {
-      src = ctx.createMediaStreamSource(this.stream!);
-      if (this.thruOn) src.connect(ctx.destination);   // 🎧 Thru ON 상태 유지
-    }
+    const src = ctx.createMediaStreamSource(this.stream!);
+    if (this.thruOn) src.connect(ctx.destination);   // 🎧 Thru ON 상태 유지 (원본 그대로 · 보정 전)
     this.src = src;
-
+    // Auto-Trim: 원본 → trim(게인) → 모든 분석 노드.  원본 레벨은 anRaw 로 따로 측정
+    const trim = ctx.createGain();
+    trim.gain.value = 1;
+    src.connect(trim);
+    this.trim = trim;
+    this.trimDb = 0; this.trimIntDb = -120; this.trimInit = false; this.trimLastAt = 0; this.startedAt = performance.now();
+    const an = trim;   // 이하 분석 노드는 모두 trim 출력에 연결
     // 무음 싱크: 분석기를 destination에 연결해 Safari 등에서도 처리가 멈추지 않게 함 (소리는 나가지 않음)
     const sink = ctx.createGain();
     sink.gain.value = 0;
     sink.connect(ctx.destination);
+
+    // 원본 L/R 을 따로 측정 (Analyser 는 스테레오를 모노로 평균내 레벨이 낮게 나오므로 Splitter 로 분리)
+    const rawSplit = ctx.createChannelSplitter(2);
+    src.connect(rawSplit);
+    this.anRaw = [0, this.channels === 1 ? 0 : 1].map(ch => {
+      const a = ctx.createAnalyser();
+      a.fftSize = 2048; a.smoothingTimeConstant = 0;
+      rawSplit.connect(a, ch); a.connect(sink);
+      return a;
+    });
 
     const mk = (size: number) => {
       const a = ctx.createAnalyser();
@@ -197,14 +249,15 @@ export class AudioEngine {
 
     // L/R 분리
     const splitter = ctx.createChannelSplitter(2);
-    this.anL = mk(2048);
-    this.anR = mk(2048);
-    src.connect(splitter);
+    // 100ms 틱에 맞춰 4096 샘플(약 85ms) 창으로 측정 → 틱 사이 공백 최소화
+    this.anL = mk(4096);
+    this.anR = mk(4096);
+    an.connect(splitter);
     splitter.connect(this.anL, 0);
     splitter.connect(this.anR, this.channels === 1 ? 0 : 1); // 모노 장치면 R도 같은 신호
     // 피드백 FFT (L+R 믹스다운)
     this.anFb = mk(FB.fftSize);
-    src.connect(this.anFb);
+    an.connect(this.anFb);
 
     // 6밴드 시간영역 측정 (4차 밴드패스)
     this.bandAn = BANDS.map(b => {
@@ -214,16 +267,16 @@ export class AudioEngine {
         n.type = type; n.frequency.value = f; n.Q.value = Math.SQRT1_2;
         nodes.push(n);
       }
-      src.connect(nodes[0]);
+      an.connect(nodes[0]);
       nodes.reduce((a, c) => (a.connect(c), c));
-      const an = mk(2048);
-      nodes[3].connect(an);
-      return an;
+      const bandAn = mk(4096);
+      nodes[3].connect(bandAn);
+      return bandAn;
     });
     this.bandAcc = BANDS.map(() => ({ sumSq: 0, n: 0, peak: 0 }));
     this.fullAcc = { sumSq: 0, n: 0, peak: 0 }; this.lowSeries = [];
-    this.bandTimer = setTicker(() => this.pollBands(), 40);   // Worker 타이머: 화면이 꺼져도 유지
-    try { this.applyKeepAlive(); } catch (e) { console.warn('백그라운드 유지 오실레이터 실패 (분석은 계속)', e); }
+    // AudioContext 내부 무음 노드(15Hz -50dBFS) + ScriptProcessor 하트비트: <audio> 태그 없이 백그라운드 오디오 처리 유지
+    try { this.startKeepNodes(src); } catch (e) { console.warn('백그라운드 유지 노드 실패 (분석은 계속)', e); }
     this.specAcc.fill(0); this.specN = 0;
     this.fbTrack = { bin: -1, n: 0, maxDb: -200 };
     this.running = true;
@@ -231,11 +284,11 @@ export class AudioEngine {
 
   async stop() {
     this.running = false;
-    clearTicker(this.bandTimer); this.bandTimer = 0;
+    if (this.sp) { this.sp.onaudioprocess = null; try { this.sp.disconnect(); } catch { /* ignore */ } }
     this.stream?.getTracks().forEach(t => t.stop());
     await this.ctx?.close().catch(() => {});
     this.ctx = undefined; this.stream = undefined; this.src = undefined; this.bandAn = [];
-    this.monitorGain = undefined; this.mediaMode = false;
+    this.trim = undefined; this.anRaw = []; this.sp = undefined;
     this.anL = undefined; this.anR = undefined; this.anFb = undefined;
     this.keepOsc = undefined; this.keepGain = undefined;
   }
@@ -253,36 +306,79 @@ export class AudioEngine {
     if (c && c.state !== 'running') c.resume().then(() => { this.ctxState = c.state; }).catch(() => {});
   }
 
-  /** 🎧 입력 신호 출력 모니터링: 입력 소스를 audioContext.destination 으로 직접 연결/해제 (하울링 주의) */
+  /** 워치독: Worker 틱마다 호출. suspended(백그라운드 전환 등)면 즉시 resume. 복구를 시도했으면 true */
+  watchdog(): boolean {
+    const c = this.ctx;
+    if (!c || c.state === 'running' || c.state === 'closed') return false;
+    c.resume().then(() => { this.ctxState = c.state; }).catch(() => {});
+    return true;
+  }
+  get state() { return this.ctx?.state ?? 'closed'; }
+
+  /** 🎧 입력 신호 출력 모니터링: 원본 입력을 audioContext.destination 으로 직접 연결/해제 (하울링 주의) */
   setThru(on: boolean) {
     this.thruOn = on;
-    if (!this.ctx || !this.src || this.mediaMode) return;   // 플레이어 모드는 청취 경로가 따로 있음
+    if (!this.ctx || !this.src) return;
     try { if (on) this.src.connect(this.ctx.destination); else this.src.disconnect(this.ctx.destination); } catch { /* ignore */ }
   }
 
-  /** 🔋 백그라운드 유지: AudioContext 안의 들리지 않는 15Hz / -50 dBFS 오실레이터. <audio> 태그를 쓰지 않으므로 유튜브 오디오 포커스를 뺏지 않음 */
-  setKeepAlive(on: boolean) {
-    this.keepAlive = on;
-    try { this.applyKeepAlive(); } catch (e) { console.warn('백그라운드 유지 오실레이터 실패 (분석은 계속)', e); this.keepOsc = undefined; this.keepGain = undefined; }
-  }
-  private applyKeepAlive() {
-    const ctx = this.ctx;
-    if (!ctx) return;
-    if (this.keepAlive && !this.keepOsc) {
-      const o = ctx.createOscillator();
-      const g = ctx.createGain();
-      // 크롬은 출력이 약 -72 dBFS 미만이면 '무음 탭'으로 보고 백그라운드에서 멈출 수 있다.
-      // 그래서 귀·스피커로는 들리지 않는 15Hz 초저역을 -50 dBFS 로 낸다 (이전 -100 dBFS 는 무음으로 취급됨).
-      g.gain.value = 0.00316;
-      o.frequency.value = 15;
-      o.connect(g); g.connect(ctx.destination);
-      o.start();
-      this.keepOsc = o; this.keepGain = g;
-    } else if (!this.keepAlive && this.keepOsc) {
-      try { this.keepOsc.stop(); } catch { /* ignore */ }
-      this.keepOsc.disconnect(); this.keepGain?.disconnect();
-      this.keepOsc = undefined; this.keepGain = undefined;
+  /** 🎚️ Auto-Trim ON/OFF. OFF 면 게인 1.0 (콘솔의 실제 Raw dBFS 그대로) */
+  setAutoTrim(on: boolean) {
+    this.trimOn = on;
+    this.trimInit = false; this.trimIntDb = -120;
+    if (!on) {
+      this.trimDb = 0;
+      if (this.trim && this.ctx) { this.trim.gain.cancelScheduledValues(this.ctx.currentTime); this.trim.gain.setValueAtTime(1, this.ctx.currentTime); }
     }
+  }
+  get autoTrim() { return this.trimOn; }
+
+  /**
+   * Auto-Level Normalization (100ms 틱마다):
+   *  원본 RMS 가 -55 dBFS 이상인 활성 구간만 단기(약 3초) 통합 → 기준 -18 dBFS 와의 차이를 오프셋 게인으로 적용.
+   *  무음 구간에서는 게인을 그대로 유지(무음 때 게인이 치솟지 않음). 반환: 원본 순간 RMS(dBFS)
+   */
+  updateTrim(): number {
+    if (!this.anRaw.length || !this.ctx || !this.trim) return -120;
+    let pw = 0;
+    for (const a of this.anRaw) {                    // L/R 평균 파워 (미터의 채널별 RMS 와 같은 기준)
+      a.getFloatTimeDomainData(this.rawBuf);
+      let sq = 0;
+      for (let k = 0; k < this.rawBuf.length; k++) sq += this.rawBuf[k] * this.rawBuf[k];
+      pw += sq / this.rawBuf.length / this.anRaw.length;
+    }
+    const rawDb = toDb(Math.sqrt(pw));
+    if (!this.trimOn) return rawDb;
+    const now = performance.now();
+    const dt = this.trimLastAt ? Math.min(1, (now - this.trimLastAt) / 1000) : 0.1;
+    this.trimLastAt = now;
+    if (rawDb < TRIM.gateDb || now - this.startedAt < 600) return rawDb;   // 무음·입력 시작 직후(램프) 제외 → 게인 유지
+    // dB 영역 지수 평균: 볼륨을 올릴 때와 내릴 때 같은 속도로 따라감 (파워 평균은 큰 소리 이력이 오래 남음)
+    if (!this.trimInit) { this.trimIntDb = rawDb; this.trimInit = true; }
+    else this.trimIntDb += (1 - Math.exp(-dt / TRIM.tauSec)) * (rawDb - this.trimIntDb);
+    const want = Math.min(TRIM.maxDb, Math.max(TRIM.minDb, TRIM.targetDb - this.trimIntDb));
+    this.trimDb = Math.round(want * 10) / 10;
+    this.trim.gain.setTargetAtTime(Math.pow(10, want / 20), this.ctx.currentTime, 0.15);   // 부드럽게 (클릭 없음)
+    return rawDb;
+  }
+
+  /** AudioContext 내부 무음 노드 + ScriptProcessor 하트비트 (유튜브 오디오 포커스를 뺏지 않음) */
+  private startKeepNodes(src: AudioNode) {
+    const ctx = this.ctx!;
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    // 크롬은 출력이 약 -72 dBFS 미만이면 '무음 탭'으로 보고 백그라운드에서 멈출 수 있어 들리지 않는 15Hz 를 -50 dBFS 로 낸다
+    g.gain.value = 0.00316;
+    o.frequency.value = 15;
+    o.connect(g); g.connect(ctx.destination);
+    o.start();
+    this.keepOsc = o; this.keepGain = g;
+    // ScriptProcessor: 오디오 스레드가 4096 샘플마다 호출 → 메인 스레드 타이머가 늦어져도 분석 루프를 깨움
+    const sp = ctx.createScriptProcessor(4096, 1, 1);
+    const mute = ctx.createGain(); mute.gain.value = 0;
+    src.connect(sp); sp.connect(mute); mute.connect(ctx.destination);
+    sp.onaudioprocess = () => { try { this.onAudioBeat(); } catch { /* ignore */ } };
+    this.sp = sp;
   }
 
   /** L/R 입력 레벨 (rAF/타이머에서 호출) */
@@ -298,7 +394,7 @@ export class AudioEngine {
       }
       const rmsDb = toDb(Math.sqrt(sum / this.buf.length));
       const peakDb = toDb(peak);
-      if (peak >= 0.99) this.clipUntil[i] = now + 2000;
+      if (peak >= 0.99 && !this.trimOn) this.clipUntil[i] = now + 2000;   // Auto-Trim 중에는 보정 후 값이라 CLIP 판정 안 함
       if (peakDb >= this.peakHold[i] || now - this.peakHoldAt[i] > 1200) {
         this.peakHold[i] = peakDb; this.peakHoldAt[i] = now;
       }
@@ -307,7 +403,8 @@ export class AudioEngine {
     return [out[0], out[1]];
   }
 
-  private pollBands() {
+  /** 100ms 틱마다 호출: 6밴드·전대역 누적 */
+  pollBands() {
     this.bandAn.forEach((an, i) => {
       an.getFloatTimeDomainData(this.buf);
       const acc = this.bandAcc[i];
@@ -322,7 +419,7 @@ export class AudioEngine {
       acc.n += this.buf.length;
       if (i === 1) {   // Low(60~250Hz) 단시간 레벨 시리즈 → 저역 트랜지언트(리듬 타격감) 분석
         this.lowSeries.push(toDb(Math.sqrt(sq / this.buf.length)));
-        if (this.lowSeries.length > 3000) this.lowSeries.splice(0, 500);
+        if (this.lowSeries.length > 1200) this.lowSeries.splice(0, 200);
       }
     });
     // 전 대역 Crest Factor (L+R 합산, Peak 대비 RMS)
@@ -353,10 +450,10 @@ export class AudioEngine {
       std = Math.sqrt(v.reduce((p, c) => p + (c - mean) * (c - mean), 0) / v.length);
     }
     let onsets = 0, last = -100;
-    for (let i = 3; i < s.length; i++) {
-      if (s[i] > -55 && s[i] - s[i - 3] >= 6 && i - last >= 8) { onsets++; last = i; }   // 6dB↑ 급상승, 0.3초 불응기
+    for (let i = 1; i < s.length; i++) {
+      if (s[i] > -55 && s[i] - s[i - 1] >= 6 && i - last >= 3) { onsets++; last = i; }   // 0.1초 사이 6dB↑ 급상승, 0.3초 불응기
     }
-    const sec = s.length * 0.04;
+    const sec = s.length * 0.1;
     this.fullAcc = { sumSq: 0, n: 0, peak: 0 };
     this.lowSeries = [];
     return {

@@ -14,61 +14,64 @@
 </head>
 <body>
   <main id="app">
-    <header>
-      <h1>Live Mix Assistant <small>G2</small></h1>
+    <!-- 1) 헤더: 타이틀 · 수신기 연결 상태 · 수신기 URL 복사 · 설정 -->
+    <header class="top">
+      <div class="top-row">
+        <h1>Live Mix Assistant <small>G2</small></h1>
+        <button id="settingsBtn" class="icon" type="button" aria-label="설정">⚙️</button>
+      </div>
+      <div class="top-row">
+        <span id="linkState" class="pill off">🔴 수신기 대기</span>
+        <button id="copyUrl" class="small" type="button">Even Hub용 수신기 URL 복사</button>
+      </div>
       <div id="status" class="status">대기 중</div>
     </header>
 
+    <!-- 2) 오디오 입력 모드 · 시작/정지 · 쿨다운 초기화 -->
     <section class="card">
-      <div class="row">
-        <label>AI 서비스
-          <select id="provider"></select>
-        </label>
-        <label>모델
-          <select id="model"></select>
-        </label>
+      <div class="seg" id="modeSeg" role="tablist">
+        <button type="button" data-mode="console" role="tab">🎛️ 콘솔 2-Track 입력<small>USB 인터페이스 · 기본</small></button>
+        <button type="button" data-mode="monitor" role="tab">▶️ 실시간 유튜브/재생음<small>모니터링 · Auto-Trim</small></button>
       </div>
-      <input id="customModel" type="text" placeholder="모델 ID 직접 입력" hidden />
-      <label>API Key
-        <input id="apiKey" type="password" autocomplete="off" placeholder="선택한 AI의 API Key" />
-      </label>
-      <div class="hint">키는 이 기기의 브라우저(localStorage)에만 저장되며 제조사 API로 직접 전송됩니다.</div>
-    </section>
-
-    <section class="card">
-      <label>오디오 입력 장치
-        <div class="devrow">
-          <select id="device"></select>
-          <button id="findBtn" type="button">🔄 장치 찾기</button>
-        </div>
-      </label>
+      <div id="consolePane" class="devrow">
+        <select id="device" aria-label="오디오 입력 장치"></select>
+        <button id="findBtn" type="button">🔄 장치 찾기</button>
+      </div>
+      <div id="monitorHint" class="hint" hidden></div>
       <div class="row">
-        <button id="startBtn" class="primary">시작</button>
-        <button id="resetBtn">쿨다운 초기화</button>
+        <button id="startBtn" class="primary" type="button">시작</button>
+        <button id="resetBtn" type="button">쿨다운 초기화</button>
       </div>
       <div id="inputInfo" class="hint"></div>
     </section>
 
+    <!-- 3) 장르/모드 배지 -->
+    <div id="genreBadge" class="badge genre">🎵 장르 판별 대기 중</div>
+
+    <!-- 4) 스테레오 레벨 미터 -->
     <section class="card">
-      <h2>스테레오 레벨 미터 <small>-60 ~ 0 dBFS</small></h2>
-      <div class="meter" data-ch="L">
-        <span class="ch">L</span>
-        <div class="bar"><div class="rms"></div><div class="peak"></div>
-          <i style="left:0%">-60</i><i style="left:50%">-30</i><i style="left:75%">-15</i><i style="left:90%">-6</i>
+      <h2>스테레오 레벨 미터 <small id="meterInfo">-60 ~ 0 dBFS · Raw</small></h2>
+      <div id="meters">
+        <div class="meter" data-ch="L">
+          <span class="ch">L</span>
+          <div class="bar"><div class="rms"></div><div class="peak"></div>
+            <i style="left:0%">-60</i><i style="left:50%">-30</i><i style="left:75%">-15</i><i style="left:90%">-6</i>
+          </div>
+          <span class="clip">CLIP</span>
+          <span class="val">-∞</span>
         </div>
-        <span class="clip">CLIP</span>
-        <span class="val">-∞</span>
-      </div>
-      <div class="meter" data-ch="R">
-        <span class="ch">R</span>
-        <div class="bar"><div class="rms"></div><div class="peak"></div></div>
-        <span class="clip">CLIP</span>
-        <span class="val">-∞</span>
+        <div class="meter" data-ch="R">
+          <span class="ch">R</span>
+          <div class="bar"><div class="rms"></div><div class="peak"></div></div>
+          <span class="clip">CLIP</span>
+          <span class="val">-∞</span>
+        </div>
       </div>
     </section>
 
+    <!-- 5) 5줄 HUD 프리뷰 -->
     <section class="card">
-      <h2>HUD (G2 동기화 · 5줄)</h2>
+      <h2>HUD <small>G2 동기화 · 1줄 피드백 / 2~5줄 조언</small></h2>
       <div id="hud">
         <div class="hud-line fb" id="hud0"></div>
         <div class="hud-line" id="hud1"></div>
@@ -79,11 +82,54 @@
       <div id="cooldownInfo" class="hint"></div>
     </section>
 
+    <!-- 6) 6밴드 실시간 분석 -->
     <section class="card">
-      <h2>밴드 (최근 20초)</h2>
+      <h2>6밴드 실시간 분석 <small id="bandInfo"></small></h2>
       <table id="bandTable"></table>
     </section>
   </main>
+
+  <!-- ⚙️ 설정 모달 -->
+  <dialog id="settings">
+    <form method="dialog" class="modal">
+      <div class="top-row">
+        <h2 style="margin:0">⚙️ 설정</h2>
+        <button class="icon" value="close" aria-label="닫기">✕</button>
+      </div>
+
+      <h3>AI</h3>
+      <div class="row">
+        <label>AI 서비스 <select id="provider"></select></label>
+        <label>모델 <select id="model"></select></label>
+      </div>
+      <input id="customModel" type="text" placeholder="모델 ID 직접 입력" hidden />
+      <label>API Key
+        <input id="apiKey" type="password" autocomplete="off" placeholder="선택한 AI의 API Key (입력 즉시 저장)" />
+      </label>
+      <div class="hint">키는 이 브라우저(localStorage)에만 저장되며 AI 제조사 API로 직접 전송됩니다.</div>
+
+      <h3>조언 민감도 <small id="tolInfo"></small></h3>
+      <input id="tolSlider" type="range" step="1" />
+      <div class="scale"><span id="tolLo"></span><span id="tolMid"></span><span id="tolHi"></span></div>
+
+      <h3>피드백 감지 민감도 <small id="fbInfo"></small></h3>
+      <input id="fbSlider" type="range" min="0" max="100" step="5" />
+      <div class="scale"><span>둔감</span><span>보통</span><span>예민</span></div>
+
+      <h3>AI 조언 주기 <small id="intInfo"></small></h3>
+      <input id="intSlider" type="range" />
+      <div class="scale"><span id="intLo"></span><span id="intHi"></span></div>
+
+      <h3>입력 신호</h3>
+      <button id="thruBtn" class="toggle" type="button"></button>
+      <div id="thruHint" class="hint"></div>
+      <button id="trimBtn" class="toggle" type="button"></button>
+      <div id="trimHint" class="hint"></div>
+
+      <h3>최근 AI 응답</h3>
+      <div id="aiLast" class="hint">아직 없음</div>
+    </form>
+  </dialog>
   <script type="module" src="/src/main.ts"></script>
 </body>
 </html>
