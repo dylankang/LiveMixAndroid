@@ -1,0 +1,60 @@
+# Live Mix Assistant 웹 버전 → GitHub Pages 자동 배포
+#  · main 브랜치의 web/ 가 바뀌면 자동 빌드·배포 (Actions 탭에서 수동 실행도 가능)
+#  · 주소: https://<사용자>.github.io/<저장소>/          (분석기)
+#          https://<사용자>.github.io/<저장소>/?mode=hud (G2 수신기 — Even 앱에서 열기)
+name: Deploy Web (GitHub Pages)
+
+on:
+  push:
+    branches: [main]
+    paths: ['web/**', '.github/workflows/pages.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # gh-pages 브랜치에 빌드 결과를 올리기 위해 필요
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Build
+        run: npx vite build
+
+      - name: Remove Netlify-only file
+        run: rm -f dist/_headers
+
+      - name: Publish to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: web/dist
+          publish_branch: gh-pages
+          force_orphan: true
+          commit_message: 'Deploy web'
+
+      - name: Summary
+        working-directory: .
+        run: |
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"; REPO="${GITHUB_REPOSITORY#*/}"
+          {
+            echo "## 🌐 웹 버전 배포 완료"
+            echo "- 분석기: https://$OWNER.github.io/$REPO/"
+            echo "- G2 수신기 (Even 앱): https://$OWNER.github.io/$REPO/?mode=hud"
+          } >> "$GITHUB_STEP_SUMMARY"
