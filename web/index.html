@@ -37,25 +37,23 @@
       <div id="status" class="status">대기 중</div>
     </header>
 
-    <!-- 2) 오디오 입력: 장치 · 채널 라우팅 · 시작/정지 · 쿨다운 초기화 -->
+    <!-- 2) 오디오 입력/출력 · 모니터링 · 시작/정지 · 쿨다운 초기화 -->
     <section class="card">
-      <h2>오디오 입력 <small>WDM 장치 · 콘솔 2트랙 매트릭스 출력</small></h2>
-      <div id="consolePane" class="devrow">
-        <select id="device" aria-label="오디오 입력 장치"></select>
-        <button id="findBtn" type="button">🔄 장치 찾기</button>
-      </div>
-      <div class="routerow">
-        <label>L 채널 <select id="chL" aria-label="L 입력 채널"></select></label>
-        <label>R 채널 <select id="chR" aria-label="R 입력 채널"></select></label>
-        <label>빠른 선택 <select id="pairSel" aria-label="스테레오 페어 빠른 선택"></select></label>
-      </div>
-      <div id="presets" class="presets">
-        <button type="button" data-l="0" data-r="1">Ch 1-2</button>
-        <button type="button" data-l="2" data-r="3">Ch 3-4</button>
-        <button type="button" data-l="4" data-r="5">Ch 5-6</button>
-        <button type="button" data-l="6" data-r="7">Ch 7-8</button>
-      </div>
-      <div id="routeInfo" class="hint"></div>
+      <h2>오디오 장치 <small>Windows 에 인식된 활성 장치</small></h2>
+      <label class="devlabel">입력 장치
+        <div class="devrow">
+          <select id="device" aria-label="오디오 입력 장치"></select>
+          <button id="findBtn" type="button">🔄 장치 찾기</button>
+        </div>
+      </label>
+      <label class="devlabel">출력 장치
+        <select id="outputDev" aria-label="오디오 출력 장치"></select>
+      </label>
+      <button id="monBtn" class="toggle" type="button">🎧 모니터링 모드 : OFF</button>
+      <label class="devlabel">모니터링 볼륨 <small id="monVolInfo"></small>
+        <input id="monVol" type="range" min="0" max="100" step="1" />
+      </label>
+      <div id="monInfo" class="hint"></div>
       <div class="row">
         <button id="startBtn" class="primary" type="button">시작</button>
         <button id="resetBtn" type="button">쿨다운 전체 초기화</button>

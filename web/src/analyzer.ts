@@ -1,4 +1,4 @@
-import { AudioEngine, type BandStat, listInputs, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE, MAX_CHANNELS } from './audio';
+import { AudioEngine, type BandStat, listInputs, listOutputs, realDevices, outputSelectSupported, requestMicPermission, TRIM, GATE } from './audio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
 import { callAI, parseReply, buildSystemPrompt, isQuotaError, type Genre } from './ai';
 import { evaluateBalance, TOL_RANGE, ALWAYS_AI_TOL } from './balance';
@@ -201,93 +201,64 @@ let gateOn = ls.get('lm.gateOn2', '0') === '1';   // 기본 OFF: 낮은 레벨�
 }
 function applyGate() { engine.setGate(gateOn, gateDb); }
 
-// ───────── 2) 오디오 입력: WDM(브라우저 표준) 장치 + 입력 채널(L/R) 라우팅 ─────────
+// ───────── 2) 오디오 입력/출력: Windows 가 인식한 활성 장치 중에서 선택 · 🎧 모니터링 ─────────
 /** Auto-Trim 기본 OFF (Raw dBFS). 설정에서 켜면 기억 */
 const trimSaved = () => ls.get('lm.trim.console', '0') === '1';
 
 const deviceSel = $<HTMLSelectElement>('device');
+const outputSel = $<HTMLSelectElement>('outputDev');
 const findBtn = $<HTMLButtonElement>('findBtn');
-const chL = $<HTMLSelectElement>('chL');
-const chR = $<HTMLSelectElement>('chR');
-const pairSel = $<HTMLSelectElement>('pairSel');
-const MONO = 'mono';
+const monBtn = $<HTMLButtonElement>('monBtn');
+const monVol = $<HTMLInputElement>('monVol');
 
-/** 저장된 입력 선택: 장치 값 + 장치 이름(ID 가 바뀌어도 이름으로 복원) + L/R 채널(0부터, R=-1 은 모노) */
-interface SavedInput { device: string; name: string; l: number; r: number }
-function loadSaved(): SavedInput {
-  try {
-    const o = JSON.parse(ls.get('lm.input', ''));
-    if (o && typeof o.device === 'string') return { device: o.device, name: String(o.name ?? ''), l: Number(o.l) || 0, r: Number.isFinite(Number(o.r)) ? Number(o.r) : 1 };
-  } catch { /* ignore */ }
-  return { device: ls.get('lm.device', DEFAULT_INPUT_ID), name: '', l: 0, r: 1 };
-}
-let saved = loadSaved();
-function saveInput() {
-  const opt = deviceSel.selectedOptions[0];
-  saved = { device: deviceSel.value, name: opt?.dataset.name ?? '', l: Number(chL.value) || 0, r: chR.value === MONO ? -1 : Number(chR.value) || 0 };
-  ls.set('lm.input', JSON.stringify(saved));
-}
-/** 지금 선택된 장치의 최대 채널 수 (실행 중이면 장치가 실제로 연 채널 수, 아니면 64) */
-function maxChannels(): number {
-  if (running && engine.deviceChannels) return engine.deviceChannels;
-  return MAX_CHANNELS;
-}
-function fillChannels() {
-  const n = Math.max(1, maxChannels());
-  const l = Math.min(saved.l, n - 1), r = saved.r < 0 ? -1 : Math.min(saved.r, n - 1);
-  chL.innerHTML = Array.from({ length: n }, (_, i) => `<option value="${i}">Ch ${i + 1}</option>`).join('');
-  chR.innerHTML = `<option value="${MONO}">Mono (L과 동일)</option>` + Array.from({ length: n }, (_, i) => `<option value="${i}">Ch ${i + 1}</option>`).join('');
-  chL.value = String(l);
-  chR.value = r < 0 ? MONO : String(r);
-  document.querySelectorAll<HTMLButtonElement>('#presets button').forEach(b => {
-    const pl = Number(b.dataset.l), pr = Number(b.dataset.r);
-    b.disabled = pr >= n;
-    b.classList.toggle('active', pl === l && pr === r);
-  });
-  // 스테레오 페어 빠른 선택: 장치 채널 수만큼 Ch 1-2 … Ch 47-48 …
-  const pairs = Math.floor(n / 2);
-  pairSel.innerHTML = '<option value="">스테레오 페어 선택…</option>'
-    + Array.from({ length: pairs }, (_, k) => `<option value="${2 * k}">Ch ${2 * k + 1}-${2 * k + 2}</option>`).join('');
-  pairSel.value = r === l + 1 && l % 2 === 0 ? String(l) : '';
-  paintRouteInfo();
-}
-function routeLR(): { l: number; r: number } {
-  const l = Number(chL.value) || 0;
-  return { l, r: chR.value === MONO ? l : Number(chR.value) || 0 };
-}
-function paintRouteInfo() {
-  const { l, r } = routeLR();
-  const pair = l === r ? `Ch ${l + 1} (모노)` : `L = Ch ${l + 1} · R = Ch ${r + 1}`;
-  let t = `분석 입력: ${pair}`;
-  if (running) {
-    t += ` · 장치 입력 ${engine.deviceChannels}채널`;
-    if (routeClamped)
-      t += `\n※ 고른 채널(${routeClamped})이 장치의 WDM 입력 ${engine.deviceChannels}채널 밖이라 조정했습니다. 더 높은 채널이 필요하면 드라이버 설정에서 WDM 채널 수를 늘려 주세요.`;
-  }
-  $('routeInfo').textContent = t;
-}
-/** 시작할 때 고른 채널이 장치 채널 수를 넘어 조정됐으면 원래 고른 채널 표시 (아니면 '') */
-let routeClamped = '';
-const onRouteChange = () => {
-  saveInput();
-  fillChannels();
-  if (running) {
-    const { l, r } = routeLR();
-    engine.setRoute(l, r);
-    setStatus(`입력 채널 변경: ${l === r ? `Ch ${l + 1} 모노` : `Ch ${l + 1}-${r + 1}`}`);
-  }
+/** 저장된 선택: 장치 ID + 이름 (ID 가 바뀌어도 이름으로 복원) */
+interface SavedDev { device: string; name: string }
+const loadDev = (key: string): SavedDev => {
+  try { const o = JSON.parse(ls.get(key, '')); if (o && typeof o.device === 'string') return { device: o.device, name: String(o.name ?? '') }; } catch { /* ignore */ }
+  return { device: '', name: '' };
 };
-chL.onchange = onRouteChange;
-chR.onchange = onRouteChange;
-pairSel.onchange = () => {
-  if (pairSel.value === '') return;
-  const l = Number(pairSel.value);
-  chL.value = String(l); chR.value = String(l + 1);
-  onRouteChange();
+let savedIn = loadDev('lm.input');
+let savedOut = loadDev('lm.output');
+const saveSel = (sel: HTMLSelectElement, key: string): SavedDev => {
+  const v = { device: sel.value, name: sel.selectedOptions[0]?.dataset.name ?? '' };
+  if (v.device) ls.set(key, JSON.stringify(v));
+  return v;
 };
-document.querySelectorAll<HTMLButtonElement>('#presets button').forEach(b => {
-  b.onclick = () => { chL.value = b.dataset.l!; chR.value = b.dataset.r!; onRouteChange(); };
-});
+
+// 🎧 모니터링 모드: 선택한 입력을 분석하면서 선택한 출력 장치로 내보냄 (기본 OFF)
+let monitorOn = ls.get('lm.monitor', '0') === '1';
+let monitorPct = Math.min(100, Math.max(0, Number(ls.get('lm.monVol', '80')) || 0));
+function paintMonitor() {
+  monBtn.textContent = `🎧 모니터링 모드 : ${monitorOn ? 'ON (입력 → 출력)' : 'OFF'}`;
+  monBtn.classList.toggle('active', monitorOn);
+  monVol.value = String(monitorPct);
+  $('monVolInfo').textContent = `${monitorPct}%`;
+  const out = engine.outputInfo;
+  let t = monitorOn
+    ? `선택한 입력을 분석하면서 「${outputSel.selectedOptions[0]?.textContent ?? '출력 장치'}」로 내보냅니다. 입력 장치의 소리가 다시 입력으로 들어가지 않게(하울링) 출력 연결을 확인하세요.`
+    : '모니터링 OFF: 분석만 하고 소리는 내보내지 않습니다.';
+  if (running && out.via !== 'none' && !out.ok) t += `\n⚠ 출력 장치를 바꾸지 못했습니다: ${out.error ?? ''}`;
+  if (!outputSelectSupported()) t += '\n⚠ 이 브라우저는 출력 장치 지정을 지원하지 않아 Windows 기본 출력으로 나갑니다.';
+  $('monInfo').textContent = t;
+}
+monBtn.onclick = () => {
+  monitorOn = !monitorOn;
+  ls.set('lm.monitor', monitorOn ? '1' : '0');
+  engine.setMonitor(monitorOn, monitorPct / 100);
+  paintMonitor();
+  if (running) setStatus(`🎧 모니터링 ${monitorOn ? 'ON' : 'OFF'}`);
+};
+monVol.oninput = () => {
+  monitorPct = Number(monVol.value) || 0;
+  ls.set('lm.monVol', String(monitorPct));
+  engine.setMonitor(monitorOn, monitorPct / 100);
+  $('monVolInfo').textContent = `${monitorPct}%`;
+};
+outputSel.onchange = async () => {
+  savedOut = saveSel(outputSel, 'lm.output');
+  if (running) { await engine.setOutput(outputSel.value); setStatus(`출력 장치: ${outputSel.selectedOptions[0]?.textContent ?? ''}`); }
+  paintMonitor();
+};
 
 /** 오류를 사람이 읽을 수 있는 원인으로 변환 */
 function describeError(e: unknown): string {
@@ -304,30 +275,35 @@ function describeError(e: unknown): string {
   return (msg || '알 수 없는 오류') + (name && name !== 'Error' ? ` (${name})` : '');
 }
 
-const DEFAULT_LABEL = '🔌 기본 오디오 입력 (USB 인터페이스 자동)';
-let lastBrowserDevs: MediaDeviceInfo[] = [];
-function fillDevices(devs: MediaDeviceInfo[] = lastBrowserDevs) {
-  lastBrowserDevs = devs;
-  const real = devs.filter(d => d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications');
-  // 사용자가 마지막으로 고른 장치(저장값)를 우선 (ID 가 바뀌었으면 이름으로 찾음)
-  const want = saved.device;
-  const wantName = saved.name;
-  deviceSel.innerHTML = '';
-  const add = (parent: HTMLElement, value: string, label: string, name: string) => {
+/** 목록 채우기: 실제 장치만. 권한 전이라 목록이 비어 있으면 안내 항목 하나 */
+function fillSelect(sel: HTMLSelectElement, devs: MediaDeviceInfo[], want: SavedDev, emptyText: string, prefix: string) {
+  const real = realDevices(devs);
+  sel.innerHTML = '';
+  if (!real.length) {
     const o = document.createElement('option');
-    o.value = value; o.textContent = label; o.dataset.name = name;
-    parent.appendChild(o);
-  };
-  add(deviceSel, DEFAULT_INPUT_ID, DEFAULT_LABEL, '');
-  real.forEach((d, i) => add(deviceSel, d.deviceId, d.label || `입력 ${i + 1}`, d.label || ''));
-  const opts = [...deviceSel.options];
-  const hit = opts.find(o => o.value === want) ?? (wantName ? opts.find(o => o.dataset.name === wantName) : undefined);
-  deviceSel.value = hit ? hit.value : DEFAULT_INPUT_ID;
-  fillChannels();
+    o.value = ''; o.textContent = emptyText; o.dataset.name = '';
+    sel.appendChild(o);
+    sel.value = '';
+    return;
+  }
+  real.forEach((d, i) => {
+    const o = document.createElement('option');
+    o.value = d.deviceId; o.textContent = d.label || `${prefix} ${i + 1}`; o.dataset.name = d.label || '';
+    sel.appendChild(o);
+  });
+  const opts = [...sel.options];
+  const hit = opts.find(o => o.value === want.device) ?? (want.name ? opts.find(o => o.dataset.name === want.name) : undefined);
+  sel.value = (hit ?? opts[0]).value;
 }
+let haveLabels = false;
 async function refreshDevices(askPermission = false) {
   if (askPermission && !running) await requestMicPermission();
-  fillDevices(await listInputs());
+  const [ins, outs] = await Promise.all([listInputs(), listOutputs()]);
+  haveLabels = realDevices(ins).some(d => d.label);
+  fillSelect(deviceSel, ins, savedIn, '🔄 [장치 찾기]를 눌러 입력 장치 목록을 불러오세요', '입력');
+  fillSelect(outputSel, outs, savedOut, outputSelectSupported() ? '🔄 [장치 찾기]를 눌러 출력 장치 목록을 불러오세요' : '이 브라우저는 출력 장치 선택 미지원 (Windows 기본 출력)', '출력');
+  outputSel.disabled = !outputSelectSupported();
+  paintMonitor();
 }
 findBtn.onclick = async () => {
   const old = findBtn.textContent;
@@ -335,24 +311,20 @@ findBtn.onclick = async () => {
   try {
     await refreshDevices(true);
     clearError();
-    const n = lastBrowserDevs.filter(d => d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications').length;
-    setStatus(`WDM 입력 장치 ${n}개 찾음`);
+    setStatus(`입력 ${realDevices(await listInputs()).length}개 · 출력 ${realDevices(await listOutputs()).length}개 찾음`);
   } catch (e) {
     showError(describeError(e));
-    try { fillDevices(await listInputs()); } catch { /* ignore */ }
+    try { await refreshDevices(); } catch { /* ignore */ }
   } finally { findBtn.disabled = false; findBtn.textContent = old; }
 };
 deviceSel.onchange = async () => {
-  saveInput();
-  fillChannels();
-  saveInput();
-  if (!running) return;
+  savedIn = saveSel(deviceSel, 'lm.input');
+  if (!running || !deviceSel.value) return;
   try { await startAudio(); clearError(); }
   catch (e) { showError(describeError(e)); await stop(); }
 };
 try { navigator.mediaDevices?.addEventListener?.('devicechange', () => { refreshDevices().catch(() => {}); }); } catch { /* ignore */ }
-
-fillDevices([]);
+paintMonitor();
 refreshDevices().catch(() => {});
 
 // ───────── ⚙️ 설정: Auto-Trim 수동 토글 ─────────
@@ -449,31 +421,25 @@ $('cdList').addEventListener('click', e => {
 });
 
 // ───────── 오디오 시작/정지 ─────────
-const modeName = () => {
-  const { l, r } = engine.running ? engine.route : routeLR();
-  return `🎛️ 콘솔 2-Track (WDM · ${l === r ? `Ch ${l + 1} 모노` : `Ch ${l + 1}-${r + 1}`})`;
-};
+const modeName = () => `🎛️ 콘솔 2-Track${monitorOn ? ' · 🎧 모니터링' : ''}`;
 
 async function startAudio() {
   engine.setAutoTrim(trimSaved());
   applyGate();
-  const v = deviceSel.value || DEFAULT_INPUT_ID;
-  const { l, r } = routeLR();
-  await engine.start({ deviceId: v, l, r });
-  routeClamped = engine.route.l !== l || engine.route.r !== r ? (l === r ? `Ch ${l + 1}` : `Ch ${l + 1}-${r + 1}`) : '';
+  // 목록이 아직 없으면(권한 전) 권한을 받아 Windows 장치 목록을 먼저 불러온다
+  if (!deviceSel.value || !haveLabels) await refreshDevices(true);
+  if (!deviceSel.value) throw Object.assign(new Error('Windows 에 인식된 오디오 입력 장치가 없습니다'), { name: 'NotFoundError' });
+  savedIn = saveSel(deviceSel, 'lm.input');
+  if (outputSel.value) savedOut = saveSel(outputSel, 'lm.output');
+  await engine.start({ deviceId: deviceSel.value, outputId: outputSel.value, monitor: monitorOn, monitorGain: monitorPct / 100 });
   await refreshDevices().catch(() => {});   // 권한 승인 직후: 실제 장치 이름으로 목록 갱신
-  // 장치 채널 수 때문에 엔진이 채널 번호를 조정했으면 화면·저장값도 실제 라우팅에 맞춤
-  {
-    const er = engine.route, mono = er.l === er.r;
-    saved = { ...saved, l: er.l, r: mono ? -1 : er.r };
-    ls.set('lm.input', JSON.stringify(saved));
-  }
-  fillChannels();
+  paintMonitor();
 
   const info = engine.openInfo, st = info?.settings;
   const parts: string[] = [];
-  parts.push(`${modeName()} · ${info?.label || '기본 장치'} · 장치 입력 ${engine.deviceChannels || '?'}채널${` · ${st?.sampleRate ?? '?'}Hz · ${info?.step ?? 1}차 방식으로 열림`}`);
-  if (info?.usb) parts.push('🔌 USB 오디오 인터페이스를 우선 연결했습니다');
+  parts.push(`입력: ${info?.label || deviceSel.selectedOptions[0]?.textContent || '?'} · ${engine.deviceChannels >= 2 ? 'Ch 1-2 스테레오' : '모노'} · ${st?.sampleRate ?? '?'}Hz${info?.step && info.step > 1 ? ` · ${info.step}차 방식으로 열림` : ''}`);
+  parts.push(`출력: ${outputSel.selectedOptions[0]?.textContent || 'Windows 기본'} · 🎧 모니터링 ${monitorOn ? `ON (${monitorPct}%)` : 'OFF'}`
+    + (engine.outputInfo.ok || engine.outputInfo.via === 'none' ? '' : ` · ⚠ 출력 전환 실패: ${engine.outputInfo.error ?? ''}`));
   parts.push(gateOn ? `🚪 노이즈 게이트 ${gateDb} dBFS · ${GATE.enterMs / 1000}초 이상 무음이면 대기` : '🚪 노이즈 게이트 OFF (무음에도 계속 분석)');
   if (info?.step === 3) parts.push('⚠ 기본 모드로 열림: OS 음성 보정(에코 제거/노이즈 억제/AGC)이 켜져 있을 수 있습니다');
   else if (st && (st.echoCancellation || st.noiseSuppression || st.autoGainControl)) parts.push('⚠ 브라우저가 음성 보정을 끄지 못했습니다 (EC/NS/AGC 일부 ON)');
@@ -532,7 +498,6 @@ startBtn.onclick = async () => {
   startBtn.disabled = false; startBtn.textContent = '정지'; startBtn.classList.add('on');
   startTicker();
   void ensureWake();
-  fillChannels();
   tellNative(true);
   try { sender.setRunning(true); } catch (e) { console.warn('수신기 전송 시작 실패 (분석은 계속)', e); }
   setStatus(`실행 중 · ${modeName()}${glasses.connected ? ' · G2 연결됨' : ''}`);
@@ -547,7 +512,7 @@ async function stop() {
   releaseWake();
   await engine.stop();
   localLevels = null;
-  fillChannels();
+  paintMonitor();
   startBtn.textContent = '시작'; startBtn.classList.remove('on');
   setStatus('정지');
 }
@@ -741,8 +706,7 @@ async function analyze() {
 
 /** AI 에 알려 줄 수음 경로 특성 */
 function captureNote(): string {
-  const { l, r } = engine.route;
-  return `콘솔 2트랙 매트릭스 출력 직결 (WDM 입력 · ${l === r ? `Ch ${l + 1} 모노` : `Ch ${l + 1}-${r + 1}`} · Raw)`;
+  return `콘솔 2트랙 출력 직결 (오디오 입력 장치 Ch 1-2 · Raw)`;
 }
 
 function bandRows(b: Record<string, BandStat>, deltas: Record<string, number> | null): BandRow[] {

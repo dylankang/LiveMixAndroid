@@ -91,14 +91,6 @@ dialog#settings::backdrop { background:rgba(0,0,0,.7); }
 .pair-label { color:#9fb4c8; font-size:.9rem; }
 .pair-code { font-size:2.6rem; font-weight:800; letter-spacing:.35em; color:#7fd3ff; font-variant-numeric:tabular-nums; }
 .pair-btns { display:flex; gap:8px; flex-wrap:wrap; margin:6px 0; }
-/* 입력 채널 라우팅 */
-.routerow { display:flex; gap:12px; flex-wrap:wrap; margin:8px 0 4px; }
-.routerow label { display:flex; flex-direction:row; align-items:center; gap:6px; font-size:.9rem; margin:0; }
-.routerow select { min-width:9em; }
-.presets { display:flex; gap:6px; flex-wrap:wrap; margin:4px 0; }
-.presets button { width:auto; flex:0 0 auto; padding:6px 14px; font-size:.85rem; }
-.presets button.active { border-color:#39ff7a; color:#b9ffd0; }
-#routeInfo { white-space:pre-line; }
 /* 수신기: 연결 코드 · 키패드 · PC 신호 경고 */
 .rxcode { display:flex; align-items:center; gap:10px; margin:6px 0; }
 .rxcode b { font-size:1.6rem; letter-spacing:.3em; color:#7fd3ff; font-variant-numeric:tabular-nums; }
@@ -111,3 +103,10 @@ dialog#settings::backdrop { background:rgba(0,0,0,.7); }
 .keypad .kp-grid button { font-size:1.8rem; padding:14px 0; border-radius:14px; }
 .keypad .kp-msg { min-height:1.2em; color:#9fb4c8; font-size:.9rem; text-align:center; }
 #tolInfo.always { color:#39ff7a; font-weight:700; }
+/* 오디오 장치 · 모니터링 */
+.devlabel { display:block; margin:8px 0 4px; font-size:.9rem; color:#9fb4c8; }
+.devlabel select, .devlabel input[type=range] { width:100%; margin-top:4px; }
+.devlabel .devrow { margin-top:4px; }
+#monBtn { width:100%; margin:8px 0 2px; font-weight:700; }
+#monBtn.active { border-color:#39ff7a; background:#0a2a14; color:#b9ffd0; }
+#monInfo { white-space:pre-line; }

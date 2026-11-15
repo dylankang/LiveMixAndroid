@@ -86,8 +86,8 @@ export async function findUsbInput(): Promise<MediaDeviceInfo | null> {
 export async function openInput(deviceId?: string): Promise<{ stream: MediaStream; step: 1 | 2 | 3 }> {
   if (!micAvailable()) throw new Error(NO_MIC_MSG);
   const realId = !!deviceId && deviceId !== DEFAULT_INPUT_ID;
-  // 다채널 인터페이스의 모든 입력을 연다 (브라우저/드라이버가 허용하는 만큼)
-  const raw: MediaTrackConstraints = { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: MAX_CHANNELS } };
+  // 원음 스테레오(Ch 1-2): 음성 보정 OFF
+  const raw: MediaTrackConstraints = { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: 2 } };
   const first: MediaTrackConstraints = { ...raw };
   if (realId) first.deviceId = { exact: deviceId };
   const attempts: (MediaTrackConstraints | true)[] = [first, raw, true];
@@ -129,6 +129,20 @@ export async function listInputs(): Promise<MediaDeviceInfo[]> {
   const all = await navigator.mediaDevices.enumerateDevices();
   return all.filter(d => d.kind === 'audioinput');
 }
+
+/** Windows 가 인식한 실제 장치만 (가상 항목 'default' / 'communications' 와 권한 전 빈 항목 제외) */
+export const realDevices = (devs: MediaDeviceInfo[]) =>
+  devs.filter(d => d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications');
+
+export async function listOutputs(): Promise<MediaDeviceInfo[]> {
+  if (!navigator.mediaDevices?.enumerateDevices) return [];
+  const all = await navigator.mediaDevices.enumerateDevices();
+  return all.filter(d => d.kind === 'audiooutput');
+}
+
+/** 출력 장치 지정 지원 여부 (AudioContext.setSinkId 또는 <audio>.setSinkId) */
+export const outputSelectSupported = () =>
+  typeof (AudioContext.prototype as any).setSinkId === 'function' || typeof (HTMLMediaElement.prototype as any).setSinkId === 'function';
 
 export class AudioEngine {
   private ctx?: AudioContext;
@@ -196,14 +210,27 @@ export class AudioEngine {
   openInfo: OpenInfo | null = null;
   ctxState = '';
 
+  /** 🎧 모니터링: 입력(L/R 원음)을 선택한 출력 장치로 내보냄 */
+  private mon?: GainNode;
+  private monEl?: HTMLAudioElement;            // AudioContext.setSinkId 미지원 브라우저용 출력 경로
+  private monDest?: MediaStreamAudioDestinationNode;
+  monitorOn = false;
+  monitorGain = 1;
+  outputId = '';
+  /** 출력 장치 적용 결과 */
+  outputInfo: { ok: boolean; via: 'context' | 'element' | 'none'; error?: string } = { ok: false, via: 'none' };
+
   /**
-   * 입력 시작 (WDM/브라우저 표준 입력 장치):
-   *  getUserMedia(EC/NS/AGC OFF · 최대 64채널 · 3단계 Fallback) → ChannelSplitter(N) → 선택한 L/R → ChannelMerger(2)
-   *  → 분석 경로(Auto-Trim · L/R 미터 · 6밴드 · FFT · 지표)
+   * 입력 시작 (Windows 가 인식한 오디오 입력 장치):
+   *  getUserMedia(EC/NS/AGC OFF · Ch 1-2 · 3단계 Fallback) → L/R → 분석 경로(Auto-Trim · L/R 미터 · 6밴드 · FFT · 지표)
+   *  모니터링 ON 이면 같은 L/R 원음을 선택한 출력 장치로 내보낸다.
    */
-  async start(opt: { deviceId?: string; l: number; r: number }) {
+  async start(opt: { deviceId?: string; outputId?: string; monitor?: boolean; monitorGain?: number }) {
     await this.stop();
-    this.route = { l: Math.max(0, opt.l | 0), r: Math.max(0, opt.r | 0) };
+    this.route = { l: 0, r: 1 };
+    this.outputId = opt.outputId ?? '';
+    this.monitorOn = !!opt.monitor;
+    if (typeof opt.monitorGain === 'number') this.monitorGain = opt.monitorGain;
     let ctx: AudioContext;
     let input: AudioNode;
     {
@@ -225,7 +252,7 @@ export class AudioEngine {
       this.src = src;
       const n = Math.max(1, settings.channelCount ?? src.channelCount ?? 2);
       this.deviceChannels = n;
-      // 장치 채널 수보다 큰 번호를 고르면 1번(·2번) 채널로
+      // 1채널 장치면 L=R (모노)
       if (this.route.l >= n) this.route.l = 0;
       if (this.route.r >= n) this.route.r = Math.min(1, n - 1);
       const split = ctx.createChannelSplitter(n);
@@ -235,7 +262,7 @@ export class AudioEngine {
       this.applyRoute();
       input = merge;
     }
-    this.channels = 2;   // 분석 경로는 항상 L/R 2채널 (모노 선택 시 L=R)
+    this.channels = 2;   // 분석 경로는 항상 L/R 2채널 (1채널 장치면 L=R)
 
     // resume() 이 자동재생 정책 때문에 끝나지 않는 경우에도 시작이 멈추지 않도록 1.5초만 기다림
     await Promise.race([ctx.resume().catch(() => {}), new Promise(r => setTimeout(r, 1500))]);
@@ -255,6 +282,12 @@ export class AudioEngine {
     sink.gain.value = 0;
     sink.connect(ctx.destination);
     this.cache = []; this.specCache = null; this.srcCount = { analyser: 0, cached: 0 };
+    // 🎧 모니터링 경로: L/R 원음(보정 전) → 모니터 게인 → 출력 장치. OFF 면 게인 0
+    const mon = ctx.createGain();
+    mon.gain.value = this.monitorOn ? this.monitorGain : 0;
+    src.connect(mon);
+    this.mon = mon;
+    await this.applyOutput();
 
     // 원본 L/R 을 따로 측정 (Analyser 는 스테레오를 모노로 평균내 레벨이 낮게 나오므로 Splitter 로 분리)
     const rawSplit = ctx.createChannelSplitter(2);
@@ -317,6 +350,8 @@ export class AudioEngine {
     if (this.sp) { this.sp.onaudioprocess = null; try { this.sp.disconnect(); } catch { /* ignore */ } }
     if (this.clockNode) { this.clockNode.port.onmessage = null; try { this.clockNode.disconnect(); } catch { /* ignore */ } }
     this.split = undefined; this.merge = undefined;
+    if (this.monEl) { try { this.monEl.pause(); this.monEl.srcObject = null; this.monEl.remove(); } catch { /* ignore */ } }
+    this.monEl = undefined; this.monDest = undefined; this.mon = undefined;
     this.stream?.getTracks().forEach(t => t.stop());
     await this.ctx?.close().catch(() => {});
     this.ctx = undefined; this.stream = undefined; this.src = undefined; this.bandAn = [];
@@ -362,6 +397,52 @@ export class AudioEngine {
   }
   /** 지난 AI 구간 동안 무음 캐시로 대체한 틱 수 (확인용). 호출하면 초기화 */
   takeSourceStats() { const s = this.srcCount; this.srcCount = { analyser: 0, cached: 0 }; return s; }
+
+  /**
+   * 출력 장치 적용: AudioContext.setSinkId(Chrome 110+) 로 컨텍스트 출력 자체를 바꾸고,
+   * 지원하지 않으면 모니터 신호를 MediaStreamDestination → <audio>.setSinkId 로 내보낸다.
+   */
+  private async applyOutput() {
+    const ctx = this.ctx, mon = this.mon;
+    if (!ctx || !mon) return;
+    try { mon.disconnect(); } catch { /* ignore */ }
+    const id = this.outputId;
+    const withTimeout = <T>(p: Promise<T>) => Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error('출력 장치 전환 시간 초과')), 4000))]);
+    if (typeof (ctx as any).setSinkId === 'function') {
+      mon.connect(ctx.destination);
+      if (!id) { this.outputInfo = { ok: true, via: 'context' }; return; }
+      try { await withTimeout((ctx as any).setSinkId(id)); this.outputInfo = { ok: true, via: 'context' }; }
+      catch (e) { this.outputInfo = { ok: false, via: 'context', error: e instanceof Error ? e.message : String(e) }; }
+      return;
+    }
+    // 대체 경로: <audio> 요소로 출력
+    if (!this.monDest) this.monDest = ctx.createMediaStreamDestination();
+    mon.connect(this.monDest);
+    if (!this.monEl) {
+      const el = document.createElement('audio');
+      el.autoplay = true; el.style.display = 'none';
+      document.body.appendChild(el);
+      el.srcObject = this.monDest.stream;
+      this.monEl = el;
+    }
+    try {
+      if (id && typeof (this.monEl as any).setSinkId === 'function') await withTimeout((this.monEl as any).setSinkId(id));
+      await this.monEl.play().catch(() => {});
+      this.outputInfo = { ok: true, via: 'element' };
+    } catch (e) { this.outputInfo = { ok: false, via: 'element', error: e instanceof Error ? e.message : String(e) }; }
+  }
+
+  /** 출력 장치 변경 (분석 중에도 즉시 적용) */
+  async setOutput(id: string) {
+    this.outputId = id;
+    if (this.running) await this.applyOutput();
+  }
+
+  /** 모니터링 ON/OFF · 볼륨(0~1) — 분석 중에도 즉시 적용 */
+  setMonitor(on: boolean, gain = this.monitorGain) {
+    this.monitorOn = on; this.monitorGain = gain;
+    if (this.mon && this.ctx) this.mon.gain.setTargetAtTime(on ? gain : 0, this.ctx.currentTime, 0.02);
+  }
 
   /** 노이즈 게이트 설정. 끄면 즉시 무음 대기 해제 */
   setGate(on: boolean, db: number) {
