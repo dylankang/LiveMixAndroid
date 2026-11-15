@@ -1,13 +1,13 @@
-import { AudioEngine, type BandStat, listInputs, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE } from './audio';
+import { AudioEngine, type BandStat, listInputs, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE, MAX_CHANNELS } from './audio';
+import { AsioBridge, ASIO_URL } from './asio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
 import { callAI, parseReply, buildSystemPrompt, isQuotaError, type Genre } from './ai';
 import { evaluateBalance, TOL_RANGE } from './balance';
 import { fbParamsFor } from './config';
 import { Glasses } from './glasses';
-import { HudSender, HudReceiver, linkWatchdog, linesToShow, type BandRow, type LevelPkt, type MixState, type ReceiverInfo } from './link';
+import { HudSender, HudReceiver, linkWatchdog, linesToShow, genCode, isCode, setLinkCode, linkCode, type BandRow, type LevelPkt, type MixState, type ReceiverInfo } from './link';
 import { renderBandTable, paintMeters, paintHud, genreText, clock } from './views';
 import { setTicker, clearTicker } from './ticker';
-import { KeepAlive, PipMonitor, type KaState } from './keepalive';
 import { BANDS, PROVIDERS, INTERVAL_RANGE, type ProviderId } from './config';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -16,9 +16,15 @@ const ls = {
   set: (k: string, v: string) => { try { localStorage.setItem(k, v); } catch { /* 저장 불가 환경 */ } },
 };
 
+// ───────── 🔑 연결 코드: 저장된 4자리 코드를 그대로 쓰고, 없으면 새로 발급 (송신기를 만들기 전에 정함) ─────────
+{
+  let code = ls.get('lm.pairCode');
+  if (!isCode(code)) { code = genCode(); ls.set('lm.pairCode', code); }
+  setLinkCode(code);
+}
+
 const engine = new AudioEngine();
-const keep = new KeepAlive();
-const pip = new PipMonitor();
+const asio = new AsioBridge();
 const advice = new AdviceManager();
 const glasses = new Glasses();
 const sender = new HudSender();
@@ -66,13 +72,23 @@ const tellNative = (b: boolean) => { try { (window as any).LiveMixNative?.setRun
 
 const setStatus = (s: string) => { $('status').textContent = s; sender.update({ status: s }); };
 
-// ───────── 1) 헤더: 수신기 연결 상태 · URL 복사 · 설정 ─────────
-const hudUrl = () => `${location.origin}${location.pathname}?mode=hud`;
+// ───────── 1) 헤더: 연결 코드 · 새 코드 발급 · 수신기 URL 복사 · 수신기 연결 상태 · 설정 ─────────
+const hudUrl = () => `${location.origin}${location.pathname}?mode=hud&code=${linkCode()}`;
+function paintCode() { $('pairCode').textContent = linkCode(); }
 sender.onState = i => {
   const mq = i.mqtt === 'on' ? 'MQTT 연결됨' : i.mqtt === 'connecting' ? 'MQTT 연결 중…' : 'MQTT 사용 불가';
   const el = $('linkState');
   el.textContent = i.receivers > 0 ? `🟢 수신기 ${i.receivers}개 연결됨` : `🔴 수신기 대기 · ${mq}`;
   el.className = `pill ${i.receivers > 0 ? 'live' : 'off'}`;
+};
+$('newCode').onclick = () => {
+  let code = genCode();
+  while (code === linkCode()) code = genCode();
+  ls.set('lm.pairCode', code);
+  setLinkCode(code);
+  paintCode();
+  if (running) sender.publish();
+  setStatus(`새 연결 코드 ${code} 발급 · 수신기에서 [코드 변경]으로 새 코드를 입력하세요`);
 };
 $('copyUrl').onclick = async () => {
   const url = hudUrl();
@@ -88,6 +104,7 @@ $('copyUrl').onclick = async () => {
   b.textContent = ok ? '복사됨 ✓' : url;
   setTimeout(() => { b.textContent = old; }, ok ? 1800 : 6000);
 };
+paintCode();
 const dlg = $<HTMLDialogElement>('settings');
 $('settingsBtn').onclick = () => { if (typeof dlg.showModal === 'function') dlg.showModal(); else dlg.setAttribute('open', ''); };
 dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });   // 바깥(배경) 터치로 닫기
@@ -163,7 +180,7 @@ let intervalSec = clamp(Math.round(parseFloat(ls.get('lm.interval', String(INTER
 }
 
 // ───────── ⚙️ 설정: 노이즈 게이트 (무음 대기) ─────────
-let gateDb = clamp(parseFloat(ls.get('lm.gate3', String(GATE.defaultDb))), GATE.minDb, GATE.maxDb);
+let gateDb = clamp(parseFloat(ls.get('lm.gate4', String(GATE.defaultDb))), GATE.minDb, GATE.maxDb);
 let gateOn = ls.get('lm.gateOn2', '0') === '1';   // 기본 OFF: 낮은 레벨에서도 계속 분석·AI 호출
 {
   const g = $<HTMLInputElement>('gateSlider');
@@ -176,18 +193,88 @@ let gateOn = ls.get('lm.gateOn2', '0') === '1';   // 기본 OFF: 낮은 레벨�
     b.classList.toggle('active', gateOn);
     g.disabled = !gateOn;
   };
-  g.oninput = () => { gateDb = +g.value; ls.set('lm.gate3', String(gateDb)); applyGate(); paint(); };
+  g.oninput = () => { gateDb = +g.value; ls.set('lm.gate4', String(gateDb)); applyGate(); paint(); };
   $('gateBtn').onclick = () => { gateOn = !gateOn; ls.set('lm.gateOn2', gateOn ? '1' : '0'); applyGate(); paint(); };
   paint();
 }
 function applyGate() { engine.setGate(gateOn, gateDb); }
 
-// ───────── 2) 오디오 입력: 🎛️ 콘솔 2-Track (USB 인터페이스) 단일 경로 ─────────
+// ───────── 2) 오디오 입력: 장치(브라우저 / ASIO 브릿지) + 입력 채널(L/R) 라우팅 ─────────
 /** Auto-Trim 기본 OFF (Raw dBFS). 설정에서 켜면 기억 */
 const trimSaved = () => ls.get('lm.trim.console', '0') === '1';
 
 const deviceSel = $<HTMLSelectElement>('device');
 const findBtn = $<HTMLButtonElement>('findBtn');
+const chL = $<HTMLSelectElement>('chL');
+const chR = $<HTMLSelectElement>('chR');
+const MONO = 'mono';
+const ASIO_PREFIX = 'asio:';
+
+/** 저장된 입력 선택: 장치 값 + 장치 이름(ID 가 바뀌어도 이름으로 복원) + L/R 채널(0부터, R=-1 은 모노) */
+interface SavedInput { device: string; name: string; l: number; r: number }
+function loadSaved(): SavedInput {
+  try {
+    const o = JSON.parse(ls.get('lm.input', ''));
+    if (o && typeof o.device === 'string') return { device: o.device, name: String(o.name ?? ''), l: Number(o.l) || 0, r: Number.isFinite(Number(o.r)) ? Number(o.r) : 1 };
+  } catch { /* ignore */ }
+  return { device: ls.get('lm.device', DEFAULT_INPUT_ID), name: '', l: 0, r: 1 };
+}
+let saved = loadSaved();
+function saveInput() {
+  const opt = deviceSel.selectedOptions[0];
+  saved = { device: deviceSel.value, name: opt?.dataset.name ?? '', l: Number(chL.value) || 0, r: chR.value === MONO ? -1 : Number(chR.value) || 0 };
+  ls.set('lm.input', JSON.stringify(saved));
+}
+/** 지금 선택된 장치의 최대 채널 수 (ASIO = 브릿지가 알려 준 값, 브라우저 = 실행 중이면 실제로 연 값, 아니면 32) */
+function maxChannels(): number {
+  const v = deviceSel.value;
+  if (v.startsWith(ASIO_PREFIX)) return asio.devices.find(d => ASIO_PREFIX + d.id === v)?.channels ?? 2;
+  if (running && engine.kind === 'browser' && engine.deviceChannels) return engine.deviceChannels;
+  return MAX_CHANNELS;
+}
+function fillChannels() {
+  const n = Math.max(1, maxChannels());
+  const l = Math.min(saved.l, n - 1), r = saved.r < 0 ? -1 : Math.min(saved.r, n - 1);
+  chL.innerHTML = Array.from({ length: n }, (_, i) => `<option value="${i}">Ch ${i + 1}</option>`).join('');
+  chR.innerHTML = `<option value="${MONO}">Mono (L과 동일)</option>` + Array.from({ length: n }, (_, i) => `<option value="${i}">Ch ${i + 1}</option>`).join('');
+  chL.value = String(l);
+  chR.value = r < 0 ? MONO : String(r);
+  document.querySelectorAll<HTMLButtonElement>('#presets button').forEach(b => {
+    const pl = Number(b.dataset.l), pr = Number(b.dataset.r);
+    b.disabled = pr >= n;
+    b.classList.toggle('active', pl === l && pr === r);
+  });
+  paintRouteInfo();
+}
+function routeLR(): { l: number; r: number } {
+  const l = Number(chL.value) || 0;
+  return { l, r: chR.value === MONO ? l : Number(chR.value) || 0 };
+}
+function paintRouteInfo() {
+  const { l, r } = routeLR();
+  const pair = l === r ? `Ch ${l + 1} (모노)` : `L = Ch ${l + 1} · R = Ch ${r + 1}`;
+  let t = `분석 입력: ${pair}`;
+  if (running) {
+    t += ` · 장치 입력 ${engine.deviceChannels}채널`;
+    if (engine.kind === 'browser' && engine.deviceChannels <= 2)
+      t += '\n※ 브라우저가 2채널만 열었습니다. 다채널 인터페이스의 3번 이후 채널이 필요하면 ASIO 브릿지를 사용하세요.';
+  }
+  $('routeInfo').textContent = t;
+}
+const onRouteChange = () => {
+  saveInput();
+  fillChannels();
+  if (running) {
+    const { l, r } = routeLR();
+    engine.setRoute(l, r);
+    setStatus(`입력 채널 변경: ${l === r ? `Ch ${l + 1} 모노` : `Ch ${l + 1}-${r + 1}`}`);
+  }
+};
+chL.onchange = onRouteChange;
+chR.onchange = onRouteChange;
+document.querySelectorAll<HTMLButtonElement>('#presets button').forEach(b => {
+  b.onclick = () => { chL.value = b.dataset.l!; chR.value = b.dataset.r!; onRouteChange(); };
+});
 
 /** 오류를 사람이 읽을 수 있는 원인으로 변환 */
 function describeError(e: unknown): string {
@@ -195,28 +282,44 @@ function describeError(e: unknown): string {
   const msg = e instanceof Error ? e.message : String(e);
   const detail = name && name !== 'Error' ? ` (${name}: ${msg})` : '';
   if (name === 'NotAllowedError' || name === 'SecurityError' || name === 'PermissionDeniedError')
-    return `마이크 권한이 거부되었습니다. 주소창 왼쪽 아이콘 → 권한 → 마이크를 '허용'으로 바꾸고, 안드로이드 설정에서 크롬 앱의 마이크 권한도 확인한 뒤 다시 시도하세요.${detail}`;
+    return `마이크(오디오 입력) 권한이 거부되었습니다. 주소창 왼쪽 아이콘 → 사이트 설정 → 마이크를 '허용'으로 바꾸고, Windows 설정 → 개인 정보 → 마이크에서 브라우저 접근도 확인한 뒤 다시 시도하세요.${detail}`;
   if (name === 'NotFoundError' || name === 'DevicesNotFoundError')
-    return `오디오 입력 장치를 찾지 못했습니다. USB 인터페이스 연결(전원·케이블·OTG)을 확인하고 [🔄 장치 찾기]를 눌러 주세요.${detail}`;
+    return `오디오 입력 장치를 찾지 못했습니다. 인터페이스 연결·드라이버를 확인하고 [🔄 장치 찾기]를 눌러 주세요.${detail}`;
   if (name === 'NotReadableError' || name === 'TrackStartError')
-    return `입력 장치를 열 수 없습니다. 다른 앱이 마이크/인터페이스를 사용 중이거나 USB 연결이 불안정합니다.${detail}`;
+    return `입력 장치를 열 수 없습니다. 다른 프로그램(DAW 등)이 인터페이스를 독점 모드로 쓰고 있지 않은지 확인하세요.${detail}`;
   if (name === 'OverconstrainedError') return `장치가 요청한 설정을 지원하지 않습니다.${detail}`;
   return (msg || '알 수 없는 오류') + (name && name !== 'Error' ? ` (${name})` : '');
 }
 
-const DEFAULT_LABEL = '🔌 기본 오디오 입력 (연결된 USB 인터페이스 자동)';
-function fillDevices(devs: MediaDeviceInfo[]) {
+const DEFAULT_LABEL = '🔌 기본 오디오 입력 (USB 인터페이스 자동)';
+let lastBrowserDevs: MediaDeviceInfo[] = [];
+function fillDevices(devs: MediaDeviceInfo[] = lastBrowserDevs) {
+  lastBrowserDevs = devs;
   const real = devs.filter(d => d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications');
-  const keep = deviceSel.value || ls.get('lm.device', DEFAULT_INPUT_ID);
+  // 사용자가 마지막으로 고른 장치(저장값)를 우선: ASIO 목록이 늦게 도착해도 선택이 기본 장치로 덮어써지지 않게
+  const want = saved.device;
+  const wantName = saved.name;
   deviceSel.innerHTML = '';
-  const add = (value: string, label: string) => {
+  const add = (parent: HTMLElement, value: string, label: string, name: string) => {
     const o = document.createElement('option');
-    o.value = value; o.textContent = label;
-    deviceSel.appendChild(o);
+    o.value = value; o.textContent = label; o.dataset.name = name;
+    parent.appendChild(o);
   };
-  add(DEFAULT_INPUT_ID, DEFAULT_LABEL);
-  real.forEach((d, i) => add(d.deviceId, d.label || `입력 ${i + 1}`));
-  deviceSel.value = real.some(d => d.deviceId === keep) ? keep : DEFAULT_INPUT_ID;
+  if (asio.state === 'on' && asio.devices.length) {
+    const g = document.createElement('optgroup');
+    g.label = 'ASIO 브릿지 (localhost:9876)';
+    asio.devices.forEach(d => add(g, ASIO_PREFIX + d.id, `[ASIO] ${d.name} · ${d.channels}ch`, `[ASIO] ${d.name}`));
+    deviceSel.appendChild(g);
+  }
+  const g2 = document.createElement('optgroup');
+  g2.label = '브라우저 오디오 입력 (WASAPI / CoreAudio)';
+  add(g2, DEFAULT_INPUT_ID, DEFAULT_LABEL, '');
+  real.forEach((d, i) => add(g2, d.deviceId, d.label || `입력 ${i + 1}`, d.label || ''));
+  deviceSel.appendChild(g2);
+  const opts = [...deviceSel.options];
+  const hit = opts.find(o => o.value === want) ?? (wantName ? opts.find(o => o.dataset.name === wantName) : undefined);
+  deviceSel.value = hit ? hit.value : DEFAULT_INPUT_ID;
+  fillChannels();
 }
 async function refreshDevices(askPermission = false) {
   if (askPermission && !running) await requestMicPermission();
@@ -228,20 +331,36 @@ findBtn.onclick = async () => {
   try {
     await refreshDevices(true);
     clearError();
-    const n = deviceSel.options.length - 1;
-    setStatus(n > 0 ? `입력 장치 ${n}개 찾음` : '개별 장치 없음 · 기본 오디오 입력을 사용하세요');
+    const n = lastBrowserDevs.filter(d => d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications').length;
+    setStatus(`브라우저 입력 ${n}개${asio.state === 'on' ? ` · ASIO ${asio.devices.length}개` : ''} 찾음`);
   } catch (e) {
     showError(describeError(e));
     try { fillDevices(await listInputs()); } catch { /* ignore */ }
   } finally { findBtn.disabled = false; findBtn.textContent = old; }
 };
 deviceSel.onchange = async () => {
-  ls.set('lm.device', deviceSel.value);
+  saveInput();
+  fillChannels();
+  saveInput();
   if (!running) return;
   try { await startAudio(); clearError(); }
   catch (e) { showError(describeError(e)); await stop(); }
 };
 try { navigator.mediaDevices?.addEventListener?.('devicechange', () => { refreshDevices().catch(() => {}); }); } catch { /* ignore */ }
+
+// 🎛️ ASIO 브릿지 연결 상태 배지 (연결되면 장치 목록 상단에 [ASIO] 장치가 자동으로 나타남)
+function paintAsio() {
+  const b = $('asioBadge');
+  const on = asio.state === 'on';
+  b.className = `pill ${on ? 'live' : 'off'}`;
+  b.textContent = on ? `🟢 ASIO 브릿지 연결됨 · 장치 ${asio.devices.length}개` : '⚪ ASIO 브릿지 미연결';
+  b.title = on ? `${ASIO_URL} 연결됨. 장치 목록 맨 위의 [ASIO] 항목을 고르세요.`
+    : `ASIO 장치를 쓰려면 PC에서 asio-bridge/bridge.py 를 실행하세요 (${ASIO_URL}). 실행하면 자동으로 연결됩니다.`;
+  $('asioHint').hidden = on;
+}
+asio.onChange = () => { paintAsio(); fillDevices(); };
+asio.start();
+paintAsio();
 fillDevices([]);
 refreshDevices().catch(() => {});
 
@@ -266,26 +385,6 @@ applyGate();
 paintToggles();
 
 $('resetBtn').onclick = () => { advice.resetCooldown(); renderCooldown(); setStatus('쿨다운 전체 초기화됨'); };
-
-// ───────── 🛡️ 백그라운드 유지 상태 · 📌 PiP 버튼 ─────────
-const KA_ICON: Record<KaState, string> = { off: '–', starting: '…', on: '✔', failed: '✖', unsupported: '미지원' };
-const CLOCK_ICON = { worklet: 'AudioWorklet ✔', scriptprocessor: 'ScriptProcessor(대체)', none: 'Worker만' } as const;
-function paintKeep() {
-  $('keepState').textContent = running
-    ? `🛡️ 백그라운드 유지  원본 WebRTC ${KA_ICON[keep.rtc]} · 레코더 ${KA_ICON[keep.rec]} · 파일럿 WAV ${KA_ICON[keep.wav]} · 클럭 ${CLOCK_ICON[engine.clockKind]} · PiP ${KA_ICON[pip.state]}\n🧮 PCM 직결 분석: ${engine.pcmVia} · 지금 측정 소스: ${engine.source === 'pcm' ? 'PCM 직결' : 'AnalyserNode'}`
-    : '🛡️ 시작하면 백그라운드 유지 장치(파일럿 톤·미디어 알림·AudioWorklet 클럭)가 함께 켜집니다';
-  const b = $<HTMLButtonElement>('pipBtn');
-  b.disabled = pip.state === 'unsupported' || pip.state === 'starting';
-  b.classList.toggle('active', pip.active);
-  b.textContent = pip.state === 'unsupported' ? '📌 PiP 팝업 (이 브라우저 미지원)'
-    : pip.active ? '📌 PiP 켜짐 · 누르면 닫기' : '📌 백그라운드 유지용 PiP 켜기';
-}
-keep.onChange = paintKeep;
-pip.onChange = paintKeep;
-$('pipBtn').onclick = () => {
-  void pip.toggle(() => pip.draw(localLevels, hudLines(), genreText(genreLabel(), genreAt), $('status').textContent || ''));
-};
-paintKeep();
 
 // ───────── 렌더링 (폰 + 글래스 5줄 동기화) ─────────
 function genreLabel(): string {
@@ -325,21 +424,10 @@ function render() {
   const sig = lines.join('\n');
   if (sig === lastRendered) return;
   lastRendered = sig;
-  nowPlaying(lines);
   sender.update({ lines }, true);
   if (mirroring) return;
   paintHud(lines);
   glasses.update(lines);
-}
-/**
- * 잠금화면/알림창(Now Bar) 제목: [실시간 입력 dB] + 최신 AI 조언 1줄 (피드백 경고가 있으면 그것을 우선)
- * 예) [-18dB] [여성보컬] EQ:3kHz -2dB  — 화면을 켜지 않고도 입력이 들어오는지와 최신 조언을 확인
- */
-function nowPlaying(_lines?: string[]) {
-  const db = engine.lastRawDb;
-  const lv = running ? `[${db <= -100 ? '-∞' : Math.round(db)}dB] ` : '';
-  const latest = fbText || advice.items[advice.items.length - 1]?.text || (running ? '분석 중 · AI 조언 대기' : 'Live Mix Assistant');
-  keep.setNowPlaying(lv + latest, genreLabel() || 'G2 HUD');
 }
 /** ⏳ 현재 쿨다운 목록 (분석기 본체 화면 전용 · HUD 수신기에는 보내지 않음) */
 const esc = (t: string) => t.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
@@ -370,27 +458,37 @@ $('cdList').addEventListener('click', e => {
 });
 
 // ───────── 오디오 시작/정지 ─────────
-const modeName = () => '🎛️ 콘솔 2-Track (USB)';
+const modeName = () => {
+  const { l, r } = engine.running ? engine.route : routeLR();
+  return `🎛️ 콘솔 2-Track (${engine.kind === 'asio' ? 'ASIO' : '브라우저'} · ${l === r ? `Ch ${l + 1} 모노` : `Ch ${l + 1}-${r + 1}`})`;
+};
 
 async function startAudio() {
   engine.setAutoTrim(trimSaved());
   applyGate();
-  await engine.start(deviceSel.value || DEFAULT_INPUT_ID);
-  refreshDevices().catch(() => {});   // 권한 승인 직후: 실제 장치 이름으로 목록 갱신
+  const v = deviceSel.value || DEFAULT_INPUT_ID;
+  const { l, r } = routeLR();
+  if (v.startsWith(ASIO_PREFIX)) await engine.start({ kind: 'asio', bridge: asio, device: Number(v.slice(ASIO_PREFIX.length)), l, r });
+  else await engine.start({ kind: 'browser', deviceId: v, l, r });
+  if (engine.kind === 'browser') await refreshDevices().catch(() => {});   // 권한 승인 직후: 실제 장치 이름으로 목록 갱신
+  // 장치 채널 수 때문에 엔진이 채널 번호를 조정했으면 화면·저장값도 실제 라우팅에 맞춤
+  {
+    const er = engine.route, mono = er.l === er.r;
+    saved = { ...saved, l: er.l, r: mono ? -1 : er.r };
+    ls.set('lm.input', JSON.stringify(saved));
+  }
+  fillChannels();
 
-  // 🛡️ 백그라운드 유지: 파일럿 톤(WebRTC 루프백 + WAV) · 미디어 알림 · (PiP 는 버튼으로)
-  await keep.start(engine.rawStream, () => engine.resumeCtx());
-  if (keep.rtc !== 'on' && keep.wav !== 'on') showNotice('백그라운드 유지 장치를 시작하지 못했습니다. 앱을 전환하기 전에 [📌 PiP 팝업]을 켜 주세요.');
-
-  const info = engine.openInfo, st = info?.settings, ch = engine.channels;
+  const info = engine.openInfo, st = info?.settings;
   const parts: string[] = [];
-  parts.push(`${modeName()} · ${info?.label || '기본 장치'} · ${ch || '?'}ch · ${info?.step ?? 1}차 방식으로 열림`);
-  if (info?.usb) parts.push('🔌 USB 오디오 인터페이스를 내장 마이크보다 우선 연결했습니다');
+  parts.push(`${modeName()} · ${info?.label || '기본 장치'} · 장치 입력 ${engine.deviceChannels || '?'}채널${engine.kind === 'browser' ? ` · ${info?.step ?? 1}차 방식으로 열림` : ` · ${st?.sampleRate ?? '?'}Hz`}`);
+  if (info?.usb) parts.push('🔌 USB 오디오 인터페이스를 우선 연결했습니다');
   parts.push(gateOn ? `🚪 노이즈 게이트 ${gateDb} dBFS · ${GATE.enterMs / 1000}초 이상 무음이면 대기` : '🚪 노이즈 게이트 OFF (무음에도 계속 분석)');
-  if (ch === 1) parts.push('⚠ 모노로 열렸습니다 (R = L 복제)');
-  if (info?.step === 3) parts.push('⚠ 기본 모드로 열림: OS 음성 보정(에코 제거/노이즈 억제/AGC)이 켜져 있을 수 있습니다');
-  else if (st && (st.echoCancellation || st.noiseSuppression || st.autoGainControl)) parts.push('⚠ 브라우저가 음성 보정을 끄지 못했습니다 (EC/NS/AGC 일부 ON)');
-  if (engine.state !== 'running') parts.push('⚠ 오디오 엔진이 대기 상태입니다. 화면을 한 번 터치해 주세요');
+  if (engine.kind === 'browser') {
+    if (info?.step === 3) parts.push('⚠ 기본 모드로 열림: OS 음성 보정(에코 제거/노이즈 억제/AGC)이 켜져 있을 수 있습니다');
+    else if (st && (st.echoCancellation || st.noiseSuppression || st.autoGainControl)) parts.push('⚠ 브라우저가 음성 보정을 끄지 못했습니다 (EC/NS/AGC 일부 ON)');
+  }
+  if (engine.state !== 'running') parts.push('⚠ 오디오 엔진이 대기 상태입니다. 화면을 한 번 클릭해 주세요');
   $('inputInfo').textContent = parts.join('\n');
   paintToggles();
 }
@@ -398,7 +496,6 @@ async function startAudio() {
 document.addEventListener('pointerdown', () => {
   if (!running) return;
   engine.resumeCtx();
-  keep.heal();
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible' || !running) return;
@@ -436,7 +533,6 @@ startBtn.onclick = async () => {
     showError(describeError(e));
     setStatus('시작 실패 — 버튼 아래 원인을 확인하세요');
     try { await engine.stop(); } catch { /* ignore */ }
-    keep.stop();
     startBtn.disabled = false; startBtn.textContent = '시작';
     starting = false;
     return;
@@ -447,8 +543,7 @@ startBtn.onclick = async () => {
   startBtn.disabled = false; startBtn.textContent = '정지'; startBtn.classList.add('on');
   startTicker();
   void ensureWake();
-  // 분석 시작 직후 사용자 동작이 아직 유효하면 PiP 도 자동으로 켠다 (아니면 상단 [📌 PiP 켜기] 버튼)
-  if ((navigator as any).userActivation?.isActive && pip.state === 'off') $('pipBtn').click();
+  fillChannels();
   tellNative(true);
   try { sender.setRunning(true); } catch (e) { console.warn('수신기 전송 시작 실패 (분석은 계속)', e); }
   setStatus(`실행 중 · ${modeName()}${glasses.connected ? ' · G2 연결됨' : ''}`);
@@ -462,9 +557,8 @@ async function stop() {
   tellNative(false);
   releaseWake();
   await engine.stop();
-  keep.stop();
-  void pip.close();
   localLevels = null;
+  fillChannels();
   startBtn.textContent = '시작'; startBtn.classList.remove('on');
   setStatus('정지');
 }
@@ -513,11 +607,9 @@ function masterTick() {
   if (t0 - lastTickAt < 70) return;           // 워클릿/Worker 박동이 겹치면 한 번만 실행
   lastTickAt = t0;
   tickN++;
-  keep.heal();                                // 시스템이 멈춘 파일럿 재생·미디어 세션을 매 틱 재확인
   void ensureWake();                          // 화면 WakeLock 이 풀려 있고 화면이 보이면 재요청
   // 워치독: suspended 면 즉시 resume
   if (engine.watchdog()) recoverCount++;
-  engine.selectSource(document.hidden);       // 화면 꺼짐/백그라운드 또는 Analyser ≤-70dBFS → PCM 직결 분석값 사용
   engine.updateTrim();                        // Auto-Trim (OFF 면 측정만)
   engine.pollBands();                         // 6밴드 + 전대역 누적
   const lv = engine.readLevels();
@@ -528,7 +620,6 @@ function masterTick() {
   if (hit) { fbText = `⚠️ 피드백: ${hit.hz}Hz`; fbUntil = now + FB_HOLD_MS; }
   else if (fbText && now > fbUntil) fbText = '';
   render();
-  if (pip.active) pip.draw(localLevels, hudLines(), engine.idle ? IDLE_TEXT : genreText(genreLabel(), genreAt), $('status').textContent || '');
   if (tickN % 2 === 0 && localLevels) sender.sendLevels(localLevels[0], localLevels[1]);   // 0.2초: 레벨
   if (now - lastSecondAt >= 1000) { lastSecondAt = now; secondTick(); }
   if (engine.idle) lastAnalyzeAt = now;           // 무음 대기: AI 호출 일시 중지
@@ -543,11 +634,9 @@ function secondTick() {
   updateLiveBands();
   linkWatchdog();                             // MQTT 가 끊겼으면 즉시 재연결 (재연결 시 마지막 상태 자동 재발행)
   paintToggles();
-  nowPlaying(hudLines());                     // 알림창 문구(장르/대기 상태 포함) 갱신 — 바뀔 때만 적용
-  paintKeep();
   sender.update({ genre: badgeForSend(), genreAt: engine.idle ? 0 : genreAt, levels: localLevels });
   sender.publish();                           // 1초마다 전체 상태 retain 발행
-  $('bandInfo').textContent = `${engine.autoTrim ? 'Auto-Trim 기준' : 'Raw'} · ${engine.source === 'pcm' ? 'PCM 직결' : 'Analyser'} · 엔진 ${engine.state}${recoverCount ? ` · 자동 복구 ${recoverCount}회` : ''}`;
+  $('bandInfo').textContent = `${engine.autoTrim ? 'Auto-Trim 기준' : 'Raw'} · 엔진 ${engine.state}${recoverCount ? ` · 자동 복구 ${recoverCount}회` : ''}`;
 }
 
 function updateLiveBands() {
@@ -606,7 +695,7 @@ async function analyze() {
   const over = solo
     ? [ev.crestOk ? '협대역 피크' : 'Crest 범위 밖']
     : Object.entries(ev.deltas).filter(([, d]) => Math.abs(d) > tol).map(([n, d]) => `${n} ${d > 0 ? '+' : ''}${d}`);
-  const gateInfo = `${modeInfo}\n측정 소스: Analyser ${srcStat.analyser}틱 · PCM 직결 ${srcStat.pcm}틱 · 무음 캐시 ${srcStat.cached}틱\n필터 초과: ` + (over.length ? over.join(', ') : 'Crest 범위 밖');
+  const gateInfo = `${modeInfo}\n측정: ${srcStat.analyser}틱${srcStat.cached ? ` (무음 캐시 대체 ${srcStat.cached}틱)` : ''}\n필터 초과: ` + (over.length ? over.join(', ') : 'Crest 범위 밖');
 
   inFlight = true;
   const bandData = Object.fromEntries(Object.entries(bands).map(([n, b]) => [n, {
@@ -660,7 +749,8 @@ async function analyze() {
 
 /** AI 에 알려 줄 수음 경로 특성 */
 function captureNote(): string {
-  return engine.openInfo?.usb ? 'USB 오디오 인터페이스 2트랙 직결 (Raw)' : '콘솔 2트랙 입력 (Raw)';
+  const { l, r } = engine.route;
+  return `콘솔 2트랙 매트릭스 출력 직결 (${engine.kind === 'asio' ? 'ASIO' : '브라우저 입력'} · ${l === r ? `Ch ${l + 1} 모노` : `Ch ${l + 1}-${r + 1}`} · Raw)`;
 }
 
 function bandRows(b: Record<string, BandStat>, deltas: Record<string, number> | null): BandRow[] {

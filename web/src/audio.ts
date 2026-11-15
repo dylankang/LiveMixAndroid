@@ -1,7 +1,7 @@
 import { BANDS, FB, fbParamsFor } from './config';
-import { PcmDsp, readAudioData, type PcmWindow } from './dsp';
+import type { AsioBridge } from './asio';
 
-/** 드롭다운 기본값: deviceId 지정 없이 OS 기본 입력(안드로이드는 꽂힌 USB 인터페이스)을 연다 */
+/** 드롭다운 기본값: deviceId 지정 없이 OS 기본 입력(연결된 USB 인터페이스 우선)을 연다 */
 export const DEFAULT_INPUT_ID = 'default';
 
 /** Auto-Trim(볼륨 무관 레벨 고정) 기준 */
@@ -15,23 +15,20 @@ export const TRIM = {
 const NO_MIC_MSG = '이 페이지에서는 마이크를 사용할 수 없습니다 (HTTPS 주소가 아니거나 브라우저/웹뷰가 차단함)';
 export const micAvailable = () => !!navigator.mediaDevices?.getUserMedia;
 /** 노이즈 게이트: 기본 임계값(dBFS)과 무음 대기 진입 시간 */
-export const GATE = { defaultDb: -55, minDb: -70, maxDb: -20, enterMs: 2500, exitTicks: 2 } as const;
+export const GATE = { defaultDb: -50, minDb: -70, maxDb: -20, enterMs: 2500, exitTicks: 2 } as const;
+/** 브라우저 입력에서 요청하는 최대 채널 수 (다채널 인터페이스의 모든 입력을 연다) */
+export const MAX_CHANNELS = 32;
 
 /**
- * 마스터 클럭 AudioWorklet (오디오 렌더 스레드):
- *  · 100ms 마다 { type:'tick', rms, peak } 를 메인 스레드로 보냄
- *  · 입력을 출력으로 그대로 통과 (뒤에서 -120dB 게인으로 destination 에 직결 → 그래프가 '소비 중'으로 유지)
- *  · MediaStreamTrackProcessor 를 쓸 수 없을 때는 100ms 분량 원본 PCM(L/R)도 함께 보냄 (pcm 모드)
+ * AudioWorklet 모듈 (한 번에 등록)
+ *  · lm-clock : 100ms 마다 { type:'tick', rms, peak } 를 메인 스레드로 보내는 마스터 클럭 (입력 L/R 레벨도 직접 측정)
+ *  · lm-asio  : ASIO 브릿지가 보낸 Float32 인터리브 스테레오 PCM 을 링버퍼에 쌓아 2채널로 출력 (지연 약 0.1초 유지)
  */
-const CLOCK_SRC = `
+const WORKLET_SRC = `
 class LmClock extends AudioWorkletProcessor {
-  constructor() {
-    super(); this.acc = 0; this.every = Math.round(sampleRate / 10); this.sq = [0, 0]; this.pk = [0, 0]; this.n = 0;
-    this.pcm = false; this.bl = new Float32Array(this.every + 512); this.br = new Float32Array(this.every + 512); this.bn = 0;
-    this.port.onmessage = e => { if (e.data && e.data.type === 'pcm') { this.pcm = !!e.data.on; this.bn = 0; } };
-  }
-  process(inputs, outputs) {
-    const inp = inputs[0], out = outputs[0];
+  constructor() { super(); this.acc = 0; this.every = Math.round(sampleRate / 10); this.sq = [0, 0]; this.pk = [0, 0]; this.n = 0; }
+  process(inputs) {
+    const inp = inputs[0];
     if (inp && inp.length) {
       const L = inp[0], R = inp[1] || inp[0];
       for (let i = 0; i < L.length; i++) {
@@ -42,27 +39,46 @@ class LmClock extends AudioWorkletProcessor {
         if (pb > this.pk[1]) this.pk[1] = pb;
       }
       this.n += L.length;
-      if (this.pcm && this.bn + L.length <= this.bl.length) { this.bl.set(L, this.bn); this.br.set(R, this.bn); this.bn += L.length; }
-      if (out) for (let c = 0; c < out.length; c++) out[c].set(c === 0 ? L : R);
     }
     this.acc += 128;
     if (this.acc >= this.every) {
       this.acc -= this.every;
       const db = x => (x > 1e-7 ? 20 * Math.log10(x) : -120), n = this.n || 1;
-      const msg = { type: 'tick',
+      this.port.postMessage({ type: 'tick',
         rms: [db(Math.sqrt(this.sq[0] / n)), db(Math.sqrt(this.sq[1] / n))],
-        peak: [db(this.pk[0]), db(this.pk[1])] };
-      if (this.pcm && this.bn) {
-        const l = this.bl.slice(0, this.bn), r = this.br.slice(0, this.bn);
-        msg.pcm = [l, r]; this.bn = 0;
-        this.port.postMessage(msg, [l.buffer, r.buffer]);
-      } else this.port.postMessage(msg);
+        peak: [db(this.pk[0]), db(this.pk[1])] });
       this.sq[0] = this.sq[1] = 0; this.pk[0] = this.pk[1] = 0; this.n = 0;
     }
     return true;
   }
 }
-registerProcessor('lm-clock', LmClock);`;
+registerProcessor('lm-clock', LmClock);
+
+class LmAsio extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.cap = Math.round(sampleRate * 2); this.buf = new Float32Array(this.cap * 2);
+    this.w = 0; this.r = 0; this.n = 0; this.primed = false;
+    this.target = Math.round(sampleRate * 0.1);
+    this.port.onmessage = e => {
+      const d = new Float32Array(e.data), frames = d.length >> 1;
+      if (this.n + frames > this.cap) { const drop = this.n + frames - this.cap; this.r = (this.r + drop) % this.cap; this.n -= drop; }
+      for (let i = 0; i < frames; i++) { const k = this.w * 2; this.buf[k] = d[2 * i]; this.buf[k + 1] = d[2 * i + 1]; this.w = (this.w + 1) % this.cap; }
+      this.n += frames;
+    };
+  }
+  process(_inputs, outputs) {
+    const out = outputs[0], L = out[0], R = out[1] || out[0];
+    if (!this.primed) { if (this.n < this.target) return true; this.primed = true; }
+    if (this.n > this.target * 4) { const drop = this.n - this.target; this.r = (this.r + drop) % this.cap; this.n -= drop; }   // 지연이 쌓이면 따라잡기
+    for (let i = 0; i < L.length; i++) {
+      if (this.n > 0) { const k = this.r * 2; L[i] = this.buf[k]; R[i] = this.buf[k + 1]; this.r = (this.r + 1) % this.cap; this.n--; }
+      else { L[i] = 0; R[i] = 0; this.primed = false; }
+    }
+    return true;
+  }
+}
+registerProcessor('lm-asio', LmAsio);registerProcessor('lm-clock', LmClock);`;
 
 /** 마이크 권한 팝업을 띄워 승인받는다 (승인 후에야 enumerateDevices 가 실제 장치 이름/ID를 돌려줌) */
 export async function requestMicPermission(): Promise<void> {
@@ -89,7 +105,7 @@ export async function findUsbInput(): Promise<MediaDeviceInfo | null> {
 
 /**
  * 3단계 Fallback 으로 입력을 연다.
- *  1차: (실제 ID가 있을 때만 deviceId exact) + 스테레오 + EC/NS/AGC OFF
+ *  1차: (실제 ID가 있을 때만 deviceId exact) + 최대 32채널 + EC/NS/AGC OFF
  *       ※ 크롬은 deviceId 를 ideal 로 주면 선택을 무시하고 기본 장치를 열기 때문에 exact 를 쓴다.
  *         ID가 더 이상 유효하지 않으면 여기서 실패하고 2차(ID 제외)로 넘어간다.
  *  2차: deviceId 없이 EC/NS/AGC OFF
@@ -98,8 +114,9 @@ export async function findUsbInput(): Promise<MediaDeviceInfo | null> {
 export async function openInput(deviceId?: string): Promise<{ stream: MediaStream; step: 1 | 2 | 3 }> {
   if (!micAvailable()) throw new Error(NO_MIC_MSG);
   const realId = !!deviceId && deviceId !== DEFAULT_INPUT_ID;
-  const raw = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
-  const first: MediaTrackConstraints = { channelCount: { ideal: 2 }, ...raw };
+  // 다채널 인터페이스의 모든 입력을 연다 (브라우저/드라이버가 허용하는 만큼)
+  const raw: MediaTrackConstraints = { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: MAX_CHANNELS } };
+  const first: MediaTrackConstraints = { ...raw };
   if (realId) first.deviceId = { exact: deviceId };
   const attempts: (MediaTrackConstraints | true)[] = [first, raw, true];
   let firstErr: unknown = null;
@@ -164,17 +181,17 @@ export class AudioEngine {
   private anRaw: AnalyserNode[] = [];    // 보정 전 원본 L/R 레벨 (Auto-Trim 추적용)
   private sp?: ScriptProcessorNode;      // AudioWorklet 을 쓸 수 없을 때만 쓰는 오디오 스레드 하트비트
   private clockNode?: AudioWorkletNode;  // 마스터 클럭 (오디오 스레드 100ms 박동)
-  private pilotSrc: AudioScheduledSourceNode[] = [];
-  /** 🧮 PCM 직결 분석기 (MediaStreamTrackProcessor 또는 AudioWorklet 원본 샘플) */
-  private dsp = new PcmDsp();
-  private mstpReader: any = null;
-  /** PCM 공급 경로 */
-  pcmKind: 'mstp' | 'worklet' | 'none' = 'none';
-  /** 이번 틱의 측정 소스: AnalyserNode / PCM 직결 */
-  source: 'analyser' | 'pcm' = 'analyser';
-  private pcmWin: PcmWindow | null = null;
-  private anRawDb = -120;
-  private srcCount = { analyser: 0, pcm: 0, cached: 0 };
+  /** 입력 라우팅: 장치의 N 채널 중 L/R 로 쓸 채널 (0부터) */
+  private split?: ChannelSplitterNode;
+  private merge?: ChannelMergerNode;
+  private asio?: AsioBridge;
+  private asioNode?: AudioWorkletNode;
+  route = { l: 0, r: 1 };
+  /** 입력 종류: 브라우저 장치 / ASIO 브릿지 */
+  kind: 'browser' | 'asio' = 'browser';
+  /** 장치가 실제로 연 입력 채널 수 */
+  deviceChannels = 0;
+  private srcCount = { analyser: 0, cached: 0 };
   /** 무음 버퍼(-80dBFS 이하) 대체용: 직전 유효 틱(최대 3초 = 30틱) 이동평균 캐시 */
   private cache: { band: { ms: number; pk: number }[]; full: { ms: number; pk: number } }[] = [];
   private specCache: Float64Array | null = null;
@@ -212,34 +229,72 @@ export class AudioEngine {
   ctxState = '';
 
   /**
-   * USB 오디오 인터페이스(콘솔 2트랙) 단일 입력: getUserMedia 무보정 스테레오(EC/NS/AGC OFF) · 3단계 Fallback
-   * 장치를 따로 고르지 않았으면 연결된 USB 인터페이스를 내장 마이크보다 먼저 연다.
+   * 입력 시작.
+   *  · browser: getUserMedia(EC/NS/AGC OFF · 최대 32채널 · 3단계 Fallback) → ChannelSplitter(N) → 선택한 L/R → ChannelMerger(2)
+   *  · asio   : 로컬 ASIO 브릿지가 보내는 L/R PCM → AudioWorklet(lm-asio) 2채널 출력
+   * 이후 분석 경로(Auto-Trim · L/R 미터 · 6밴드 · FFT · 지표)는 두 경로가 같다.
    */
-  async start(deviceId?: string) {
+  async start(opt: { kind: 'browser'; deviceId?: string; l: number; r: number } | { kind: 'asio'; bridge: AsioBridge; device: number; l: number; r: number }) {
     await this.stop();
-    let id = deviceId, usb = false;
-    if (!id || id === DEFAULT_INPUT_ID) {
-      const u = await findUsbInput().catch(() => null);
-      if (u) { id = u.deviceId; usb = true; }
+    this.kind = opt.kind;
+    this.route = { l: Math.max(0, opt.l | 0), r: Math.max(0, opt.r | 0) };
+    let ctx: AudioContext;
+    let input: AudioNode;
+    if (opt.kind === 'browser') {
+      let id = opt.deviceId, usb = false;
+      if (!id || id === DEFAULT_INPUT_ID) {
+        const u = await findUsbInput().catch(() => null);
+        if (u) { id = u.deviceId; usb = true; }
+      }
+      const o = await openInput(id);
+      this.stream = o.stream;
+      const step = o.step;
+      this.usbPicked = usb && step === 1;
+      const track = this.stream!.getAudioTracks()[0];
+      track.addEventListener('ended', () => { if (this.running) this.onEnded(); });
+      const settings = track.getSettings();
+      this.openInfo = { step, label: track.label || '', settings, usb: this.usbPicked };
+      ctx = new AudioContext({ latencyHint: 'interactive' });
+      const src = ctx.createMediaStreamSource(this.stream!);
+      this.src = src;
+      const n = Math.max(1, settings.channelCount ?? src.channelCount ?? 2);
+      this.deviceChannels = n;
+      // 장치 채널 수보다 큰 번호를 고르면 1번(·2번) 채널로
+      if (this.route.l >= n) this.route.l = 0;
+      if (this.route.r >= n) this.route.r = Math.min(1, n - 1);
+      const split = ctx.createChannelSplitter(n);
+      const merge = ctx.createChannelMerger(2);
+      src.connect(split);
+      this.split = split; this.merge = merge;
+      this.applyRoute();
+      input = merge;
+    } else {
+      const bridge = opt.bridge;
+      const o = await bridge.open(opt.device, this.route.l, this.route.r);
+      this.asio = bridge;
+      this.deviceChannels = o.channels;
+      this.route = { l: o.l, r: o.r };
+      this.openInfo = { step: 1, label: `[ASIO] ${o.name}`, settings: { sampleRate: o.sampleRate, channelCount: o.channels }, usb: false };
+      this.usbPicked = false;
+      try { ctx = new AudioContext({ latencyHint: 'interactive', sampleRate: o.sampleRate }); }
+      catch { ctx = new AudioContext({ latencyHint: 'interactive' }); }   // 샘플레이트 지정 불가 → 기본값 (브라우저가 재샘플링하지 않으므로 피치 오차 가능)
+      if (!ctx.audioWorklet) { bridge.close(); throw new Error('이 브라우저는 AudioWorklet 을 지원하지 않아 ASIO 입력을 쓸 수 없습니다'); }
+      await this.loadWorklets(ctx);
+      const node = new AudioWorkletNode(ctx, 'lm-asio', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
+      bridge.onPcm = buf => { try { node.port.postMessage(buf, [buf]); } catch { /* ignore */ } };
+      bridge.onLost = () => { if (this.running) this.onEnded(); };
+      this.asioNode = node;
+      this.src = node;
+      input = node;
     }
-    const o = await openInput(id);
-    this.stream = o.stream;
-    const step = o.step;
-    this.usbPicked = usb && step === 1;
-    const track = this.stream!.getAudioTracks()[0];
-    track.addEventListener('ended', () => { if (this.running) this.onEnded(); });
-    const settings = track.getSettings();
-    this.channels = settings.channelCount ?? 0;
-    this.openInfo = { step, label: track.label || '', settings, usb: this.usbPicked };
+    this.channels = 2;   // 분석 경로는 항상 L/R 2채널 (모노 선택 시 L=R)
 
-    const ctx = new AudioContext({ latencyHint: 'interactive' });
     // resume() 이 자동재생 정책 때문에 끝나지 않는 경우에도 시작이 멈추지 않도록 1.5초만 기다림
     await Promise.race([ctx.resume().catch(() => {}), new Promise(r => setTimeout(r, 1500))]);
     this.ctx = ctx;
     this.ctxState = ctx.state;
-    ctx.onstatechange = () => { if (ctx.state === 'suspended') ctx.resume().catch(() => {}); };   // 백그라운드 전환 시 자동 복구
-    const src = ctx.createMediaStreamSource(this.stream!);
-    this.src = src;
+    ctx.onstatechange = () => { if (ctx.state === 'suspended') ctx.resume().catch(() => {}); };   // suspended → 자동 resume
+    const src = input;
     // Auto-Trim: 원본 → trim(게인) → 모든 분석 노드.  원본 레벨은 anRaw 로 따로 측정
     const trim = ctx.createGain();
     trim.gain.value = 1;
@@ -247,18 +302,11 @@ export class AudioEngine {
     this.trim = trim;
     this.trimDb = 0; this.trimIntDb = -120; this.trimInit = false; this.trimLastAt = 0; this.startedAt = performance.now();
     const an = trim;   // 이하 분석 노드는 모두 trim 출력에 연결
-    // 출력 그래프: audioCtx.destination 에 직결해 크롬 SilentSinkSuspender 가 컨텍스트를 멈추지 못하게 한다.
-    //  · 분석 노드들 → 무음 싱크(Gain 0) → out(Gain 0.000001 ≈ -120dB) → destination
-    //  · 입력 → AnalyserNode → AudioWorklet(통과) → out(-120dB) → destination
-    //  · 19kHz 오실레이터 → Gain 0.01(약 -40dBFS) → destination
-    const out = ctx.createGain();
-    out.gain.value = 0.000001;
-    out.connect(ctx.destination);
+    // 무음 싱크: 분석 노드들을 destination 에 연결해 그래프가 계속 처리되게 함 (소리는 나가지 않음 · 입력은 스피커로 보내지 않음)
     const sink = ctx.createGain();
     sink.gain.value = 0;
-    sink.connect(out);
-    this.cache = []; this.specCache = null; this.srcCount = { analyser: 0, pcm: 0, cached: 0 };
-    this.dsp = new PcmDsp(); this.pcmWin = null; this.source = 'analyser';
+    sink.connect(ctx.destination);
+    this.cache = []; this.specCache = null; this.srcCount = { analyser: 0, cached: 0 };
 
     // 원본 L/R 을 따로 측정 (Analyser 는 스테레오를 모노로 평균내 레벨이 낮게 나오므로 Splitter 로 분리)
     const rawSplit = ctx.createChannelSplitter(2);
@@ -309,15 +357,8 @@ export class AudioEngine {
     this.bandAcc = BANDS.map(() => ({ sumSq: 0, n: 0, peak: 0 }));
     this.fullAcc = { sumSq: 0, n: 0, peak: 0 }; this.series = [[], [], []];
     this.idle = false; this.belowSince = 0; this.aboveCount = 0;
-    // 19kHz 파일럿(destination 직결) · AudioWorklet 마스터 클럭 · PCM 직결 분석 경로
-    try { this.startPilot(); } catch (e) { console.warn('파일럿 톤 생성 실패 (분석은 계속)', e); }
-    const pre = ctx.createAnalyser();
-    pre.fftSize = 256;
-    src.connect(pre);
-    await this.startClock(pre, out, sink);
-    if (this.startMstp(track)) this.pcmKind = 'mstp';
-    else if (this.clockNode) { this.clockNode.port.postMessage({ type: 'pcm', on: true }); this.pcmKind = 'worklet'; }
-    else this.pcmKind = 'none';
+    // AudioWorklet 마스터 클럭 (100ms 박동 · L/R 레벨)
+    await this.startClock(src, sink);
     this.specAcc.fill(0); this.specN = 0;
     this.fbTrack = { bin: -1, n: 0, maxDb: -200 };
     this.running = true;
@@ -327,16 +368,14 @@ export class AudioEngine {
     this.running = false;
     if (this.sp) { this.sp.onaudioprocess = null; try { this.sp.disconnect(); } catch { /* ignore */ } }
     if (this.clockNode) { this.clockNode.port.onmessage = null; try { this.clockNode.disconnect(); } catch { /* ignore */ } }
-    const rd = this.mstpReader; this.mstpReader = null;
-    if (rd) { try { rd.cancel(); } catch { /* ignore */ } }
-    this.pcmKind = 'none'; this.pcmWin = null;
+    if (this.asio) { this.asio.onPcm = () => {}; this.asio.onLost = () => {}; if (this.asio.opened) this.asio.close(); }
+    this.asio = undefined; this.asioNode = undefined; this.split = undefined; this.merge = undefined;
     this.stream?.getTracks().forEach(t => t.stop());
     await this.ctx?.close().catch(() => {});
     this.ctx = undefined; this.stream = undefined; this.src = undefined; this.bandAn = [];
     this.trim = undefined; this.anRaw = []; this.sp = undefined;
     this.anL = undefined; this.anR = undefined; this.anFb = undefined;
     this.clockNode = undefined; this.clockKind = 'none';
-    this.pilotSrc = [];
   }
 
   /** 피드백 민감도 슬라이더 (0=둔감 … 1=예민). 반환: 적용된 판정 기준 */
@@ -360,67 +399,23 @@ export class AudioEngine {
     return true;
   }
   get state() { return this.ctx?.state ?? 'closed'; }
-  /** 원본 입력 스트림 (getUserMedia 그대로 · MediaRecorder/WebRTC 직결용) */
-  get rawStream(): MediaStream | undefined { return this.stream; }
-
-  /**
-   * 🧮 MediaStreamTrackProcessor(WebCodecs) 리더 루프: AudioContext 가 얼어도 캡처 스레드에서 원본 PCM 을 직접 받는다.
-   * 지원하지 않으면 false (→ AudioWorklet 이 PCM 을 대신 보냄)
-   */
-  private startMstp(track: MediaStreamTrack): boolean {
-    const MSTP = (window as any).MediaStreamTrackProcessor;
-    if (typeof MSTP !== 'function') return false;
-    let reader: any;
-    try { reader = new MSTP({ track }).readable.getReader(); } catch (e) { console.warn('MediaStreamTrackProcessor 실패', e); return false; }
-    this.mstpReader = reader;
-    let L = new Float32Array(4096), R = new Float32Array(4096);
-    void (async () => {
-      while (this.mstpReader === reader) {
-        let r: any;
-        try { r = await reader.read(); } catch { break; }
-        if (r.done || !r.value) break;
-        const ad = r.value;
-        try {
-          if (ad.numberOfFrames > L.length) { L = new Float32Array(ad.numberOfFrames); R = new Float32Array(ad.numberOfFrames); }
-          const n = readAudioData(ad, L, R);
-          this.dsp.feed(L, R, n, ad.sampleRate, 'mstp');
-        } catch (e) { console.warn('AudioData 읽기 실패', e); }
-        finally { try { ad.close(); } catch { /* ignore */ } }
-      }
-    })();
-    return true;
+  /** L/R 채널 변경 (분석 중에도 즉시 적용). r === l 이면 모노 */
+  setRoute(l: number, r: number) {
+    const n = this.deviceChannels || MAX_CHANNELS;
+    this.route = { l: Math.min(Math.max(0, l | 0), n - 1), r: Math.min(Math.max(0, r | 0), n - 1) };
+    if (!this.running) return;
+    if (this.kind === 'asio') this.asio?.route(this.route.l, this.route.r);
+    else this.applyRoute();
+    this.resetAccum();
   }
-
-  /**
-   * 매 틱 시작 시 호출: 이번 틱에 쓸 측정 소스를 고른다.
-   * 화면 꺼짐/백그라운드(document.hidden)이거나 AnalyserNode RMS 가 -70dBFS 이하이면 PCM 직결 분석값을 쓴다.
-   */
-  selectSource(hidden: boolean) {
-    let pw = 0;
-    for (const a of this.anRaw) {
-      a.getFloatTimeDomainData(this.rawBuf);
-      let sq = 0;
-      for (let k = 0; k < this.rawBuf.length; k++) sq += this.rawBuf[k] * this.rawBuf[k];
-      pw += sq / this.rawBuf.length / (this.anRaw.length || 1);
-    }
-    this.anRawDb = toDb(Math.sqrt(pw));
-    this.pcmWin = this.dsp.take();
-    const now = performance.now();
-    // MSTP 가 1.5초 넘게 샘플을 못 주면 AudioWorklet PCM 으로 전환
-    if (this.pcmKind === 'mstp' && this.running && now - this.dsp.lastFeedAt > 1500 && this.clockNode) {
-      this.mstpReader = null;
-      this.clockNode.port.postMessage({ type: 'pcm', on: true });
-      this.pcmKind = 'worklet';
-    }
-    const fresh = !!this.pcmWin && now - this.dsp.lastFeedAt < 600;
-    this.source = fresh && (hidden || this.anRawDb <= -70) ? 'pcm' : 'analyser';
-    this.srcCount[this.source]++;
+  private applyRoute() {
+    if (!this.split || !this.merge) return;
+    try { this.split.disconnect(); } catch { /* ignore */ }
+    this.split.connect(this.merge, this.route.l, 0);
+    this.split.connect(this.merge, this.route.r, 1);
   }
-  /** 지난 AI 구간 동안 소스별 틱 수 (확인용). 호출하면 초기화 */
-  takeSourceStats() { const s = this.srcCount; this.srcCount = { analyser: 0, pcm: 0, cached: 0 }; return s; }
-  /** PCM 공급 경로 이름 */
-  get pcmVia() { return this.pcmKind === 'mstp' ? 'MediaStreamTrackProcessor' : this.pcmKind === 'worklet' ? 'AudioWorklet' : '없음'; }
-  private trimGain() { return this.trimOn ? Math.pow(10, this.trimDb / 20) : 1; }
+  /** 지난 AI 구간 동안 무음 캐시로 대체한 틱 수 (확인용). 호출하면 초기화 */
+  takeSourceStats() { const s = this.srcCount; this.srcCount = { analyser: 0, cached: 0 }; return s; }
 
   /** 노이즈 게이트 설정. 끄면 즉시 무음 대기 해제 */
   setGate(on: boolean, db: number) {
@@ -467,8 +462,15 @@ export class AudioEngine {
    */
   updateTrim(): number {
     if (!this.anRaw.length || !this.ctx || !this.trim) return -120;
-    // 원본 L/R 평균 파워: 이번 틱 소스(AnalyserNode / PCM 직결)의 값
-    let rawDb = this.source === 'pcm' && this.pcmWin ? this.pcmWin.rawDb : this.anRawDb;
+    let pw = 0;
+    for (const a of this.anRaw) {                    // L/R 평균 파워 (미터의 채널별 RMS 와 같은 기준)
+      a.getFloatTimeDomainData(this.rawBuf);
+      let sq = 0;
+      for (let k = 0; k < this.rawBuf.length; k++) sq += this.rawBuf[k] * this.rawBuf[k];
+      pw += sq / this.rawBuf.length / this.anRaw.length;
+    }
+    let rawDb = toDb(Math.sqrt(pw));
+    this.srcCount.analyser++;
     const now = performance.now();
     // 백그라운드에서 AnalyserNode 가 갱신되지 않아도 AudioWorklet 이 잰 값이 있으면 더 큰(유효한) 값을 기준으로 삼는다
     if (this.wk && now - this.wk.at < 600) {
@@ -500,25 +502,31 @@ export class AudioEngine {
     return rawDb;
   }
 
+  private workletCtx?: AudioContext;
+  private async loadWorklets(ctx: AudioContext) {
+    if (this.workletCtx === ctx) return;
+    const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'text/javascript' }));
+    try { await ctx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
+    this.workletCtx = ctx;
+  }
+
   /**
-   * 마스터 클럭: 입력 → AnalyserNode → AudioWorkletNode(통과) → Gain 0.000001 → destination.
-   * 워클릿이 100ms 마다 메인 스레드로 박동(+레벨, 필요하면 원본 PCM)을 보낸다. (AudioWorklet 을 쓸 수 없을 때만 ScriptProcessor 로 대체)
+   * 마스터 클럭: 입력 → AudioWorkletNode(lm-clock) → 무음 싱크 → destination.
+   * 워클릿이 100ms 마다 메인 스레드로 박동(+L/R 레벨)을 보낸다. (AudioWorklet 을 쓸 수 없을 때만 ScriptProcessor 로 대체)
    */
-  private async startClock(src: AudioNode, out: AudioNode, sink: AudioNode) {
+  private async startClock(src: AudioNode, sink: AudioNode) {
     const ctx = this.ctx!;
     try {
       if (!ctx.audioWorklet || typeof AudioWorkletNode === 'undefined') throw new Error('AudioWorklet 미지원');
-      const url = URL.createObjectURL(new Blob([CLOCK_SRC], { type: 'text/javascript' }));
-      try { await ctx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
+      await this.loadWorklets(ctx);
       const node = new AudioWorkletNode(ctx, 'lm-clock', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] });
       node.port.onmessage = ev => {
         const d = ev.data;
         if (d?.type !== 'tick') return;
         if (Array.isArray(d.rms) && Array.isArray(d.peak)) this.wk = { rms: [d.rms[0], d.rms[1]], peak: [d.peak[0], d.peak[1]], at: performance.now() };
-        if (d.pcm && this.pcmKind === 'worklet') this.dsp.feed(d.pcm[0], d.pcm[1], d.pcm[0].length, ctx.sampleRate, 'worklet');
         try { this.onAudioBeat(); } catch { /* ignore */ }
       };
-      src.connect(node); node.connect(out);
+      src.connect(node); node.connect(sink);
       this.clockNode = node; this.clockKind = 'worklet';
     } catch (e) {
       console.warn('AudioWorklet 마스터 클럭 실패 → ScriptProcessor 대체', e);
@@ -531,30 +539,18 @@ export class AudioEngine {
     }
   }
 
-  /** 19kHz 파일럿 → Gain 0.01(약 -40dBFS) → destination 직결: 하드웨어 출력 콜백이 멈추지 않게 한다 */
-  private startPilot() {
-    const ctx = this.ctx!;
-    const o = ctx.createOscillator(); o.type = 'sine'; o.frequency.value = Math.min(19000, ctx.sampleRate / 2 - 1000);
-    const g = ctx.createGain(); g.gain.value = 0.01;
-    o.connect(g); g.connect(ctx.destination); o.start();
-    this.pilotSrc.push(o);
-  }
-
   /** L/R 입력 레벨 (rAF/타이머에서 호출) */
   readLevels(): [ChannelLevel, ChannelLevel] | null {
     if (!this.anL || !this.anR) return null;
     if (this.idle) return [{ rmsDb: -120, peakDb: -120, clip: false }, { rmsDb: -120, peakDb: -120, clip: false }];   // 무음 대기: 미터 -∞
     const now = performance.now();
-    const w = this.source === 'pcm' ? this.pcmWin : null, g = this.trimGain();
     const out = [this.anL, this.anR].map((an, i) => {
-      let sum = 0, peak = 0, len = this.buf.length;
-      if (w) { sum = w.sq[i] * g * g; peak = w.pk[i] * g; len = w.n; }       // PCM 직결 측정값
-      else {
-        an.getFloatTimeDomainData(this.buf);
-        for (let k = 0; k < this.buf.length; k++) {
-          const v = Math.abs(this.buf[k]);
-          sum += v * v; if (v > peak) peak = v;
-        }
+      let sum = 0, peak = 0;
+      const len = this.buf.length;
+      an.getFloatTimeDomainData(this.buf);
+      for (let k = 0; k < this.buf.length; k++) {
+        const v = Math.abs(this.buf[k]);
+        sum += v * v; if (v > peak) peak = v;
       }
       let rmsDb = toDb(Math.sqrt(sum / len));
       let peakDb = toDb(peak);
@@ -571,23 +567,14 @@ export class AudioEngine {
 
   /**
    * 100ms 틱마다 호출: 6밴드·전대역 누적.
-   * 소스는 selectSource() 가 고른 AnalyserNode 또는 PCM 직결 분석값.
    * 게이트 OFF 에서 이번 틱이 -80dBFS 이하(완전 무음 버퍼)면 직전 3초 이동평균 캐시로 대체해 분석이 끊기지 않게 한다.
    */
   pollBands() {
     if (this.idle) return;                       // 무음 대기 중에는 누적하지 않음
     type T = { band: { ms: number; pk: number }[]; full: { ms: number; pk: number } };
-    let t: T, n: number;
-    const w = this.source === 'pcm' ? this.pcmWin : null;
-    if (w) {
-      const g2 = this.trimGain() ** 2, g = Math.sqrt(g2);
-      n = w.n;
-      t = {
-        band: w.band.map(b => ({ ms: b.sq / w.n * g2, pk: b.pk * g })),
-        full: { ms: (w.sq[0] + w.sq[1]) / (2 * w.n) * g2, pk: Math.max(w.pk[0], w.pk[1]) * g },
-      };
-    } else {
-      n = this.buf.length;
+    let t: T;
+    const n = this.buf.length;
+    {
       const meas = (an: AnalyserNode | undefined) => {
         if (!an) return { ms: 0, pk: 0 };
         an.getFloatTimeDomainData(this.buf);
@@ -760,11 +747,8 @@ export class AudioEngine {
       this.specN++;
       return null;
     }
-    let d: Float32Array = this.fbBuf;
-    if (this.source === 'pcm') {
-      d = this.dsp.spectrumDb();                 // PCM 직결 FFT (AnalyserNode 와 같은 dB 척도)
-      if (this.trimOn && this.trimDb) for (let k = 0; k < d.length; k++) d[k] += this.trimDb;
-    } else this.anFb.getFloatFrequencyData(this.fbBuf);
+    const d = this.fbBuf;
+    this.anFb.getFloatFrequencyData(d);
     if (!this.specCache) this.specCache = new Float64Array(d.length);
     const first = !this.cache.length || this.cache.length === 1;
     for (let k = 0; k < d.length; k++) {

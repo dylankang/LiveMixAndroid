@@ -1,4 +1,16 @@
-# Live Mix Assistant (Android 단독 앱)
+# Live Mix Assistant G2 — PC 분석기 + Even G2 HUD
+
+- **분석기 (PC 브라우저)**: https://dylankang.github.io/LiveMixAndroid/
+  - 오디오 입력: 브라우저 장치(WASAPI/CoreAudio · 최대 32채널 열기 · L/R 채널 선택) 또는 **ASIO 브릿지**(`asio-bridge/`)
+  - 콘솔 2트랙 매트릭스 출력을 받아 6밴드·트랜지언트·크레스트·음성비율을 분석하고 Gemini 로 믹싱 조언
+- **수신기 (Even G2 / 폰)**: `https://dylankang.github.io/LiveMixAndroid/?mode=hud&code=XXXX`
+  - PC 분석기 상단의 **4자리 연결 코드**로 연결 (클라우드 MQTT · PC 유선 LAN ↔ 폰 5G/LTE 처럼 네트워크가 달라도 됨)
+  - 토픽 `livemix/g2/{CODE}/hud` (상태, retain) · `livemix/g2/{CODE}/status` (PC 하트비트 2초)
+- **ASIO 브릿지**: [`asio-bridge/README.md`](asio-bridge/README.md) — `pip install -r asio-bridge/requirements.txt` 후 `python asio-bridge/bridge.py`
+
+---
+
+## (보류) Android 단독 앱
 
 웹앱(분석기 + G2 HUD 수신기)이 **APK 안에 통째로 포함**되어 있어서 Netlify·별도 웹 서버 없이 이 앱만으로 동작합니다.
 인터넷은 AI API(Gemini 등)와 MQTT 연결에만 사용합니다.

@@ -1,20 +1,37 @@
-// 분석기(크롬) ↔ G2 HUD 수신기(Even Hub 웹뷰) 무설정 자동 연결
-//  1) MQTT over WebSocket — 1순위 브로커 하나로 고정 (크롬·Even 앱이 항상 같은 브로커에서 만나도록)
-//  2) BroadcastChannel('g2-live-mix-hud-v1') — 같은 브라우저 안
-//  3) localStorage storage 이벤트            — BroadcastChannel 차단 시 백업
-// 전체 상태 패킷(state)은 retain:true 로 발행 → 수신기는 언제 열리든 브로커에 남은 마지막 상태를 즉시 받는다.
-// 실행 중이 아닌 분석기 화면은 아무것도 발행하지 않는다 (빈 HUD로 덮어쓰기 방지).
+// PC 분석기 ↔ G2 HUD 수신기(Even Hub 웹뷰) 연결: 4자리 '연결 코드' 기반 클라우드 MQTT 하나로 통일
+//  · 서로 다른 네트워크(FOH PC 유선 LAN ↔ 폰 5G/LTE)여도 같은 브로커·같은 코드면 연결된다.
+//  · 토픽: livemix/g2/{CODE}/hud    — 전체 상태(state, retain:true) + L/R 레벨(lv)
+//          livemix/g2/{CODE}/status — PC 하트비트(hb, 2초) · 수신기 hello/ack
+// 전체 상태 패킷(state)은 retain 으로 발행 → 수신기는 언제 열리든 브로커에 남은 마지막 상태를 즉시 받는다.
 import { setTicker, later } from './ticker';
 
 declare const mqtt: any;
 
-export const CHANNEL = 'g2-live-mix-hud-v1';
-export const MQTT_TOPIC = 'g2-live-mix-onax/hud/stream';
 export const MQTT_URL = 'wss://broker.emqx.io:8084/mqtt';
+export const topicsFor = (code: string) => ({ hud: `livemix/g2/${code}/hud`, status: `livemix/g2/${code}/status` });
 const LIVE_MS = 3500;          // 이 시간 안에 상태 패킷이 오면 "실시간"
 export const STALE_CLEAR_MS = 8000;   // 신호가 이만큼 끊기면 수신기 HUD·G2 렌즈의 오래된 조언을 지움
-export const NO_SIGNAL_LINES = ['⏸ 분석기 신호 없음', '', '', '', ''];
+export const HB_MS = 2000;            // PC 하트비트 주기
+export const HB_LOST_MS = 10000;      // 이 시간 넘게 하트비트가 없으면 'PC 신호 대기중'
+export const NO_SIGNAL_LINES = ['⚠️ PC 신호 대기중', '', '', '', ''];
 const MAX_AGE_MS = 6 * 3600_000; // 이보다 오래된 retained 상태는 버림 (지난 공연 데이터)
+
+// ───────── 4자리 연결 코드 ─────────
+export const isCode = (s: unknown): s is string => typeof s === 'string' && /^\d{4}$/.test(s);
+export function genCode(): string {
+  const a = new Uint32Array(1);
+  try { crypto.getRandomValues(a); } catch { a[0] = Math.floor(Math.random() * 1e9); }
+  return String(a[0] % 10000).padStart(4, '0');
+}
+let curCode = '';
+/** 현재 연결 코드 */
+export const linkCode = () => curCode;
+/** 연결 코드 설정/변경 (처음 호출은 연결 전에, 이후 호출은 구독 토픽을 바로 바꿈) */
+export function setLinkCode(code: string) {
+  if (!isCode(code) || code === curCode) return;
+  curCode = code;
+  busSingleton?.changeCode();
+}
 
 export interface LevelPkt { rmsDb: number; peakDb: number; clip: boolean }
 export interface BandRow { name: string; avgDb: number; crestDb: number; deltaDb: number | null; character: string; over: boolean }
@@ -30,7 +47,7 @@ export interface MixState {
   status: string;                        // 분석기 상태 줄
   frozen?: boolean;                      // 분석기가 백그라운드로 가며 멈추기 직전에 보낸 마지막 패킷
 }
-export type Via = 'MQTT' | 'BC' | 'LS';
+export type Via = 'MQTT';
 export type MqttState = 'off' | 'connecting' | 'on';
 
 const rand = () => Math.random().toString(36).slice(2, 10);
@@ -40,32 +57,22 @@ export const emptyState = (): MixState => ({
   running: false, lines: ['', '', '', '', ''], bands: null, levels: null, genre: '', genreAt: 0, aiLog: null, status: '',
 });
 
-interface PostOpts { mqtt?: boolean; ls?: boolean; retain?: boolean }
+interface PostOpts { topic?: 'hud' | 'status'; retain?: boolean }
 type Handler = (m: any, via: Via) => void;
 
-/** 페이지당 하나의 연결 (MQTT 접속 1개를 송신기·수신기가 같이 씀) */
+/** 페이지당 하나의 MQTT 연결 (송신기·수신기가 같이 씀) */
 class Bus {
   private handlers: Handler[] = [];
-  private bc: BroadcastChannel | null = null;
   private client: any = null;
   private state: MqttState = 'off';
   private upFns: (() => void)[] = [];
   private stateFns: (() => void)[] = [];
+  private codeFns: (() => void)[] = [];
+  private subCode = '';
 
   constructor() {
-    try {
-      if (typeof BroadcastChannel !== 'undefined') {
-        this.bc = new BroadcastChannel(CHANNEL);
-        this.bc.onmessage = e => this.recv(e.data, 'BC');
-      }
-    } catch { this.bc = null; }
-    window.addEventListener('storage', e => {
-      if (e.key === CHANNEL && e.newValue) { try { this.recv(JSON.parse(e.newValue), 'LS'); } catch { /* ignore */ } }
-    });
     this.connectMqtt();
-
-    // 앱 전환·화면 꺼짐에서 돌아오면, 끊겼을 수 있는 연결을 기다리지 않고 바로 새로 연결
-    // (안드로이드는 백그라운드에서 웹소켓을 조용히 끊는 경우가 많고, 끊긴 걸 알아채는 데 수십 초가 걸린다)
+    // 절전·네트워크 전환에서 돌아오면 끊겼을 수 있는 연결을 바로 새로 연결
     const wake = (why: string) => {
       const away = this.hiddenAt ? Date.now() - this.hiddenAt : 0;
       if (why === 'visible' && away < 3000 && this.client?.connected) return;
@@ -77,7 +84,7 @@ class Bus {
     });
     window.addEventListener('pageshow', e => { if ((e as PageTransitionEvent).persisted) wake('pageshow'); });
     window.addEventListener('online', () => wake('online'));
-    // 백그라운드에서 끊겼는데 close 이벤트가 늦게 오는 경우 대비: 5초마다 상태 확인 (Worker 타이머)
+    // close 이벤트가 늦게 오는 경우 대비: 5초마다 상태 확인
     setTicker(() => { if (this.state === 'on' && !this.client?.connected) this.reconnectNow(); }, 5000);
   }
 
@@ -106,11 +113,28 @@ class Bus {
   on(h: Handler) { this.handlers.push(h); }
   onUp(f: () => void) { this.upFns.push(f); }
   onMqttState(f: () => void) { this.stateFns.push(f); }
+  onCode(f: () => void) { this.codeFns.push(f); }
   mqttState(): MqttState { return this.state; }
   private setState(s: MqttState) { if (this.state !== s) { this.state = s; this.stateFns.forEach(f => f()); } }
 
+  /** 코드가 바뀌면: 이전 코드 토픽 구독 해제 → 새 코드 토픽 구독 → 송신기 재발행/수신기 초기화 */
+  changeCode() {
+    this.codeFns.forEach(f => f());
+    const c = this.client;
+    if (!c?.connected) return;
+    if (this.subCode) { const o = topicsFor(this.subCode); try { c.unsubscribe([o.hud, o.status]); } catch { /* ignore */ } }
+    this.subscribe(c);
+    this.upFns.forEach(f => f());
+  }
+  private subscribe(c: any) {
+    if (!isCode(curCode)) return;
+    const t = topicsFor(curCode);
+    c.subscribe([t.hud, t.status], { qos: 0 });   // 구독 즉시 retained 상태가 도착
+    this.subCode = curCode;
+  }
+
   private connectMqtt() {
-    if (typeof mqtt === 'undefined') { this.setState('off'); return; }   // CDN 로드 실패 → BC/LS만 사용
+    if (typeof mqtt === 'undefined') { this.setState('off'); return; }   // CDN 로드 실패
     if (this.connecting) return;
     this.connecting = true;
     this.setState('connecting');
@@ -122,11 +146,14 @@ class Bus {
     c.on('connect', () => {
       if (this.client !== c) { try { c.end(true); } catch { /* ignore */ } return; }
       this.connecting = false;
-      c.subscribe(MQTT_TOPIC, { qos: 0 });   // 구독 즉시 retained 상태가 도착
+      this.subscribe(c);
       this.setState('on');
       this.upFns.forEach(f => f());
     });
-    c.on('message', (_t: string, payload: any) => {
+    c.on('message', (topic: string, payload: any) => {
+      if (!isCode(curCode)) return;
+      const t = topicsFor(curCode);
+      if (topic !== t.hud && topic !== t.status) return;   // 코드를 바꾸기 전 토픽에서 늦게 온 패킷은 무시
       const s = payload?.toString?.() ?? '';
       if (!s) return;
       try { this.recv(JSON.parse(s), 'MQTT'); } catch { /* ignore */ }
@@ -138,18 +165,15 @@ class Bus {
       this.connecting = false;
       this.setState('connecting');
       try { c.end(true); } catch { /* ignore */ }
-      later(() => { if (!this.client) this.connectMqtt(); }, 1500);   // 같은 1순위 브로커로만 재접속 (Worker 타이머)
+      later(() => { if (!this.client) this.connectMqtt(); }, 1500);
     });
   }
 
   post(m: any, o: PostOpts = {}) {
-    const pkt = { ...m, page: PAGE_ID };
-    const json = JSON.stringify(pkt);
-    try { this.bc?.postMessage(pkt); } catch { /* ignore */ }
-    if (o.ls !== false) { try { localStorage.setItem(CHANNEL, json); } catch { /* ignore */ } }
-    if (o.mqtt !== false && this.client?.connected) {
-      try { this.client.publish(MQTT_TOPIC, json, { qos: 0, retain: !!o.retain }); } catch { /* ignore */ }
-    }
+    if (!isCode(curCode) || !this.client?.connected) return;
+    const t = topicsFor(curCode);
+    const json = JSON.stringify({ ...m, page: PAGE_ID });
+    try { this.client.publish(o.topic === 'status' ? t.status : t.hud, json, { qos: 0, retain: !!o.retain }); } catch { /* ignore */ }
   }
 
   private recv(m: any, via: Via) {
@@ -164,11 +188,12 @@ export const linkWatchdog = () => bus().watchdog();
 let busSingleton: Bus | null = null;
 const bus = () => (busSingleton ??= new Bus());
 
-export interface SenderInfo { receivers: number; mqtt: MqttState; via: Via[] }
+export interface SenderInfo { receivers: number; mqtt: MqttState; via: Via[]; code: string }
 
 /**
  * 분석기 쪽 송신기.
- * - publish(): 전체 상태를 MQTT(retain:true, qos:0) + BC + LS 로 발행 — 분석기가 1초마다, 그리고 HUD가 바뀌는 즉시 호출
+ * - publish(): 전체 상태를 livemix/g2/{CODE}/hud 에 retain 발행 — 분석기가 1초마다, 그리고 HUD가 바뀌는 즉시 호출
+ * - 분석 중에는 2초마다 livemix/g2/{CODE}/status 에 하트비트(입력 레벨 dB · 분석 활성) 발행
  * - sendLevels(): L/R 레벨만 가볍게 (retain 없음)
  * - 실행 중이 아니면 아무것도 발행하지 않음 (정지 순간에 '정지됨' 상태를 한 번만 발행)
  */
@@ -184,7 +209,17 @@ export class HudSender {
     b.on((m, via) => this.onRx(m, via));
     b.onUp(() => this.publish());
     b.onMqttState(() => this.emit());
+    b.onCode(() => { this.rx.clear(); this.emit(); });
     setTicker(() => this.emit(), 1000);
+    setTicker(() => this.heartbeat(), HB_MS);
+  }
+
+  /** PC 하트비트: 분석 중일 때만 (입력 레벨 = L/R 중 큰 RMS) */
+  private heartbeat() {
+    if (!this.st.running) return;
+    const lv = this.st.levels;
+    const levelDb = lv ? Math.round(Math.max(lv[0].rmsDb, lv[1].rmsDb) * 10) / 10 : -120;
+    bus().post({ t: 'hb', ts: Date.now(), running: true, levelDb }, { topic: 'status' });
   }
 
   get state(): MixState { return this.st; }
@@ -202,6 +237,7 @@ export class HudSender {
     if (was) {   // 정지: 수신기 HUD와 G2 렌즈를 비우도록 마지막 상태 한 번 발행
       this.st = { ...this.st, lines: ['', '', '', '', ''], levels: null };
       this.publish(true);
+      bus().post({ t: 'hb', ts: Date.now(), running: false, levelDb: -120 }, { topic: 'status' });
     }
   }
 
@@ -220,7 +256,7 @@ export class HudSender {
   sendLevels(l: LevelPkt, r: LevelPkt) {
     this.st.levels = [l, r];
     if (!this.st.running) return;
-    bus().post({ t: 'lv', sid: this.sid, seq: ++this.seq, ts: Date.now(), l, r }, { ls: false });
+    bus().post({ t: 'lv', sid: this.sid, seq: ++this.seq, ts: Date.now(), l, r });
   }
 
   private onRx(m: any, via: Via) {
@@ -234,17 +270,23 @@ export class HudSender {
   private emit() {
     const now = Date.now();
     for (const [k, v] of this.rx) if (now - v.t > 6000) this.rx.delete(k);
-    this.onState({ receivers: this.rx.size, mqtt: bus().mqttState(), via: [...new Set([...this.rx.values()].map(v => v.via))] });
+    this.onState({ receivers: this.rx.size, mqtt: bus().mqttState(), via: [...new Set([...this.rx.values()].map(v => v.via))], code: curCode });
   }
 }
 
 export type Phase = 'waiting' | 'live' | 'stale' | 'stopped';
-export interface ReceiverInfo { phase: Phase; lastUpdate: number | null; via: Via | null; mqtt: MqttState; frozen: boolean }
+export interface ReceiverInfo {
+  phase: Phase; lastUpdate: number | null; via: Via | null; mqtt: MqttState; frozen: boolean;
+  code: string;
+  /** PC 하트비트: 마지막 수신 시각 · 그때 보고된 입력 레벨 · 10초 안에 받았는지 */
+  lastHb: number | null; hbLevelDb: number | null; pcAlive: boolean;
+}
 
-/** 지금 HUD·G2 렌즈에 내보낼 5줄: 신호가 끊긴 지 오래면(또는 분석기가 멈췄다고 알려 오면) 오래된 조언 대신 안내 한 줄 */
+/** 지금 HUD·G2 렌즈에 내보낼 5줄: PC 하트비트가 10초 넘게 없거나 신호가 오래 끊기면 '⚠️ PC 신호 대기중' */
 export function linesToShow(st: MixState, i: ReceiverInfo): string[] {
   if (i.phase === 'stopped') return ['', '', '', '', ''];
   if (i.phase === 'stale' && (i.frozen || (i.lastUpdate !== null && Date.now() - i.lastUpdate > STALE_CLEAR_MS))) return NO_SIGNAL_LINES;
+  if (st.running && i.lastHb !== null && !i.pcAlive) return NO_SIGNAL_LINES;
   return st.lines;
 }
 
@@ -259,6 +301,9 @@ export class HudReceiver {
   private cur: { sid: string; st: MixState; ts: number } | null = null;
   private via: Via | null = null;
   private lastPhase: Phase = 'waiting';
+  private lastHb: number | null = null;
+  private hbLevelDb: number | null = null;
+  private lastAlive = false;
   onUpdate: (st: MixState, info: ReceiverInfo) => void = () => {};
   onLevels: (lv: [LevelPkt, LevelPkt] | null) => void = () => {};
   onInfo: (info: ReceiverInfo) => void = () => {};
@@ -270,11 +315,17 @@ export class HudReceiver {
     b.on((m, via) => this.recv(m, via));
     b.onUp(() => this.hello());
     b.onMqttState(() => this.onInfo(this.info()));
+    b.onCode(() => {                         // 코드 변경: 이전 코드의 상태는 모두 버리고 새로 기다림
+      this.seqs.clear(); this.hosts.clear(); this.cur = null; this.via = null;
+      this.lastHb = null; this.hbLevelDb = null; this.lastPhase = 'waiting';
+      this.onUpdate({ ...emptyState() }, this.info());
+      this.onInfo(this.info());
+    });
     this.hello();
-    if (this.announce) setTicker(() => b.post({ t: 'ack', ts: Date.now() }, { ls: false }), 2000);
-    setTicker(() => {                       // 실시간 → 지연 전환 감지
+    if (this.announce) setTicker(() => b.post({ t: 'ack', ts: Date.now() }, { topic: 'status' }), 2000);
+    setTicker(() => {                       // 실시간 → 지연 전환, PC 하트비트 끊김 감지
       const i = this.info();
-      if (i.phase !== this.lastPhase) { this.lastPhase = i.phase; this.onInfo(i); }
+      if (i.phase !== this.lastPhase || i.pcAlive !== this.lastAlive) { this.lastPhase = i.phase; this.lastAlive = i.pcAlive; this.onInfo(i); }
     }, 500);
     this.onInfo(this.info());
   }
@@ -285,12 +336,21 @@ export class HudReceiver {
     const c = this.cur;
     let phase: Phase = 'waiting';
     if (c) phase = !c.st.running ? 'stopped' : c.st.frozen ? 'stale' : Date.now() - c.ts <= LIVE_MS ? 'live' : 'stale';
-    return { phase, lastUpdate: c?.ts ?? null, via: this.via, mqtt: bus().mqttState(), frozen: !!c?.st.frozen };
+    const pcAlive = this.lastHb !== null && Date.now() - this.lastHb <= HB_LOST_MS;
+    return { phase, lastUpdate: c?.ts ?? null, via: this.via, mqtt: bus().mqttState(), frozen: !!c?.st.frozen,
+      code: curCode, lastHb: this.lastHb, hbLevelDb: this.hbLevelDb, pcAlive };
   }
 
-  private hello() { bus().post({ t: 'hello', ts: Date.now() }, { ls: false }); }
+  private hello() { bus().post({ t: 'hello', ts: Date.now() }, { topic: 'status' }); }
 
   private recv(m: any, via: Via) {
+    if (m.t === 'hb') {                              // PC 하트비트 (2초)
+      if (m.running === false) { this.lastHb = null; this.hbLevelDb = null; }
+      else { this.lastHb = Date.now(); this.hbLevelDb = typeof m.levelDb === 'number' ? m.levelDb : null; }
+      const i = this.info();
+      if (i.pcAlive !== this.lastAlive) { this.lastAlive = i.pcAlive; this.onInfo(i); }
+      return;
+    }
     if (typeof m.sid !== 'string' || typeof m.seq !== 'number') return;
     if (m.t !== 'state' && m.t !== 'lv') return;
     const prev = this.seqs.get(m.sid) ?? -1;
@@ -299,11 +359,12 @@ export class HudReceiver {
     const ts = Number(m.ts) || Date.now();
 
     if (m.t === 'lv') {
-      if (this.cur?.sid !== m.sid) return;
-      this.cur.st.levels = [m.l, m.r];
-      this.cur.ts = Math.max(this.cur.ts, ts);
+      const c = this.cur;
+      if (!c || c.sid !== m.sid) return;
+      c.st.levels = [m.l, m.r];
+      c.ts = Math.max(c.ts, ts);
       this.via = via;
-      this.onLevels(this.cur.st.levels);
+      this.onLevels(c.st.levels);
       return;
     }
     if (Date.now() - ts > MAX_AGE_MS) return;
