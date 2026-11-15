@@ -1,3 +1,4 @@
+import { PipMonitor, pipSupported } from './pip';
 import { AudioEngine, type BandStat, listInputs, listOutputs, realDevices, outputSelectSupported, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE } from './audio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
 import { callAI, parseReply, buildSystemPrompt, isQuotaError, type Genre } from './ai';
@@ -503,14 +504,61 @@ document.addEventListener('resume', () => { if (running) { engine.resumeCtx(); s
 let wake: any = null;
 let wakePending = false;
 async function ensureWake() {
-  if (!running || wakePending || document.visibilityState !== 'visible') return;
+  if ((!running && !keepOn) || wakePending || document.visibilityState !== 'visible') return;
   if (wake && !wake.released) return;
   const wl: any = (navigator as any).wakeLock;
   if (!wl?.request) return;
   wakePending = true;
-  try { wake = await wl.request('screen'); } catch { wake = null; } finally { wakePending = false; }
+  try {
+    wake = await wl.request('screen');
+    wake.addEventListener?.('release', () => paintKeep());
+  } catch { wake = null; } finally { wakePending = false; paintKeep(); }
 }
-function releaseWake() { try { wake?.release?.(); } catch { /* ignore */ } wake = null; }
+function releaseWake() { try { wake?.release?.(); } catch { /* ignore */ } wake = null; paintKeep(); }
+
+// ───────── 🔒 휴대폰 꺼짐 방지: 화면 켜짐 유지(WakeLock) + PiP 미니 모니터 ─────────
+// 휴대폰 크롬은 다른 앱(Even 앱 등)으로 전환하거나 화면이 꺼지면 페이지를 멈춘다.
+// 버튼을 누르면 ① 화면이 꺼지지 않게 하고 ② PiP 창을 띄워 앱을 전환해도 크롬이 화면에 떠 있는 상태로 분석을 이어 간다.
+const pip = new PipMonitor();
+let keepOn = false;
+const keepBtn = $<HTMLButtonElement>('keepBtn');
+const drawPip = () => pip.draw(localLevels, hudLines(), $('genreBadge').textContent || '', running ? `분석 중 · ${$('status').textContent || ''}` : '분석 대기 (시작을 누르세요)');
+function paintKeep() {
+  if (!isMobile) return;
+  const wakeOk = !!wake && !wake.released;
+  keepBtn.textContent = keepOn ? '🔒 꺼짐 방지 : ON' : '🔒 꺼짐 방지 : OFF';
+  keepBtn.classList.toggle('active', keepOn);
+  const pipTxt = pip.state === 'unsupported' ? 'PiP 미지원' : pip.active ? 'PiP 미니 모니터 ✔' : pip.state === 'starting' ? 'PiP 여는 중…' : pip.state === 'failed' ? 'PiP 실패' : 'PiP 닫힘';
+  $('keepInfo').textContent = keepOn
+    ? `화면 꺼짐 방지 ${wakeOk ? '✔' : '…'} · ${pipTxt}\n`
+      + (pip.active ? 'Even 앱 등으로 전환해도 PiP 창이 떠 있는 동안 분석이 계속됩니다. PiP 창을 닫지 마세요.'
+        : pip.state === 'unsupported' ? '이 브라우저는 PiP 를 지원하지 않아 화면 켜짐만 유지합니다. 분석 중에는 이 화면을 띄워 두세요.'
+        : 'PiP 창이 닫혀 있습니다. 다른 앱으로 전환하기 전에 버튼을 두 번 눌러(OFF → ON) PiP 를 다시 여세요.')
+      + '\n※ 전원 버튼으로 화면을 끄면 안드로이드가 크롬을 멈출 수 있으니 화면은 켜 둔 채 사용하세요.'
+    : '휴대폰에서는 다른 앱으로 전환하거나 화면이 꺼지면 분석이 멈춥니다. 분석 중에는 꺼짐 방지를 켜 두세요.';
+}
+keepBtn.hidden = !isMobile;
+$('keepInfo').hidden = !isMobile;
+pip.onChange = paintKeep;
+keepBtn.onclick = async () => {
+  if (!keepOn) {
+    keepOn = true; paintKeep();
+    // PiP 는 버튼을 누른 순간(사용자 동작)에만 열 수 있으므로 기다리지 않고 바로 요청
+    const p1 = pipSupported() && !pip.active ? pip.toggle(drawPip) : Promise.resolve();
+    await Promise.all([p1, ensureWake()]);
+    if (running) setStatus('🔒 꺼짐 방지 ON');
+  } else {
+    keepOn = false;
+    await pip.close();
+    if (!running) releaseWake();
+    if (running) setStatus('🔒 꺼짐 방지 OFF');
+  }
+  paintKeep();
+};
+document.addEventListener('visibilitychange', () => { if (keepOn && document.visibilityState === 'visible') void ensureWake(); });
+// 분석 전에도 PiP 창이 멈춘 화면으로 남지 않게 1초마다 그림 (분석 중에는 100ms 틱에서 그림)
+setInterval(() => { if (pip.active && !running) drawPip(); }, 1000);
+paintKeep();
 
 startBtn.onclick = async () => {
   if (starting) return;
@@ -546,7 +594,7 @@ async function stop() {
   try { sender.setRunning(false); } catch { /* ignore */ }
   clearTicker(ticker); ticker = 0;
   tellNative(false);
-  releaseWake();
+  if (!keepOn) releaseWake();
   await engine.stop();
   localLevels = null;
   paintMonitor();
@@ -599,6 +647,7 @@ function masterTick() {
   lastTickAt = t0;
   tickN++;
   void ensureWake();                          // 화면 WakeLock 이 풀려 있고 화면이 보이면 재요청
+  if (pip.active) drawPip();                  // 📌 PiP 미니 모니터 갱신
   // 워치독: suspended 면 즉시 resume
   if (engine.watchdog()) recoverCount++;
   engine.updateTrim();                        // Auto-Trim (OFF 면 측정만)

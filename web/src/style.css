@@ -110,3 +110,7 @@ dialog#settings::backdrop { background:rgba(0,0,0,.7); }
 #monBtn { width:100%; margin:8px 0 2px; font-weight:700; }
 #monBtn.active { border-color:#39ff7a; background:#0a2a14; color:#b9ffd0; }
 #monInfo { white-space:pre-line; }
+/* 휴대폰 꺼짐 방지 */
+#keepBtn { width:100%; margin:8px 0 2px; padding:12px; font-weight:800; border:2px solid #4da3ff; background:#0b2a4a; color:#cfe6ff; }
+#keepBtn.active { border-color:#39ff7a; background:#0a2a14; color:#b9ffd0; }
+#keepInfo { white-space:pre-line; }
