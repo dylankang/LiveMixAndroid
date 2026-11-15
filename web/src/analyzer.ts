@@ -6,7 +6,7 @@ import { evaluateBalance, TOL_RANGE, ALWAYS_AI_TOL } from './balance';
 import { fbParamsFor } from './config';
 import { Glasses } from './glasses';
 import { HudSender, HudReceiver, linkWatchdog, linesToShow, genCode, isCode, setLinkCode, linkCode, type BandRow, type LevelPkt, type MixState, type ReceiverInfo } from './link';
-import { renderBandTable, paintMeters, paintHud, genreText, clock } from './views';
+import { renderBandTable, paintMeters, paintHud, paintCdCount, genreText, clock } from './views';
 import { setTicker, clearTicker } from './ticker';
 import { BANDS, PROVIDERS, INTERVAL_RANGE, type ProviderId } from './config';
 
@@ -416,7 +416,17 @@ engine.setAutoTrim(trimSaved());
 applyGate();
 paintToggles();
 
-$('resetBtn').onclick = () => { advice.resetCooldown(); renderCooldown(); setStatus('쿨다운 전체 초기화됨'); };
+/** 쿨다운 전체 초기화 (버튼 · 안경 다리 더블탭 공통) */
+function resetAllCooldown(from: 'button' | 'glasses') {
+  advice.resetCooldown(); renderCooldown();
+  setStatus(from === 'glasses' ? '👓 안경 더블탭 → 쿨다운 전체 초기화됨' : '쿨다운 전체 초기화됨');
+  sender.publish();
+}
+$('resetBtn').onclick = () => resetAllCooldown('button');
+// 수신기(Even G2 · ?mode=hud)에서 안경 다리를 두 번 터치하면 명령이 온다
+sender.onCommand = cmd => { if (cmd === 'resetCooldown') resetAllCooldown('glasses'); };
+// 분석기 페이지 자체가 Even Hub 안에서 열려 안경에 직접 연결된 경우
+glasses.onDoubleTap = () => resetAllCooldown('glasses');
 
 // ───────── 렌더링 (폰 + 글래스 5줄 동기화) ─────────
 function genreLabel(): string {
@@ -464,10 +474,17 @@ function render() {
 /** ⏳ 현재 쿨다운 목록 (분석기 본체 화면 전용 · HUD 수신기에는 보내지 않음) */
 const esc = (t: string) => t.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
 let cdSig = '\u0000';
+let lastCdCount = -1;
 function renderCooldown() {
   const now = Date.now();
   const list = advice.cooldownList(now);
   $('cdCount').textContent = `(${list.length}개)`;
+  // HUD 오른쪽 위 쿨다운 개수: 화면 · G2 렌즈 · 수신기
+  if (list.length !== lastCdCount) {
+    lastCdCount = list.length;
+    if (!mirroring) { paintCdCount(list.length); glasses.setCooldownCount(list.length); }
+    sender.update({ cooldownCount: list.length }, true);
+  }
   const box = $('cdList');
   const sig = list.map(e => e.key).join('\n');
   const label = (e: (typeof list)[number]) =>
@@ -867,6 +884,7 @@ function mirrorLabel(i: ReceiverInfo) {
     : `📡 다른 기기 분석기 미러링 · 🟡 신호 지연 (마지막 업데이트: ${t})`;
 }
 function applyMirror(st: MixState, i: ReceiverInfo) {
+  if (!running && (i.phase === 'live' || i.phase === 'stale')) { paintCdCount(st.cooldownCount ?? 0); glasses.setCooldownCount(st.cooldownCount ?? 0); }
   if (running) return;
   if (i.phase !== 'live' && i.phase !== 'stale') { if (mirroring) { paintHud(st.lines); glasses.update(st.lines); endMirror(); } return; }
   mirroring = true;
@@ -889,6 +907,7 @@ function endMirror() {
   renderBandTable($('bandTable'), lastRows);
   $('aiLast').textContent = sender.state.aiLog?.text ?? '';
   paintGenre();
+  lastCdCount = -1; renderCooldown();          // 로컬 쿨다운 개수로 되돌림
 }
 mirror.onUpdate = applyMirror;
 mirror.onLevels = lv => { if (mirroring) remoteLevels = lv; };

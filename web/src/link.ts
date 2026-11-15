@@ -46,6 +46,7 @@ export interface MixState {
   aiLog: AiLog | null;                   // 마지막 AI 응답 시각 + 원문(로컬 필터 결과 포함)
   status: string;                        // 분석기 상태 줄
   frozen?: boolean;                      // 분석기가 백그라운드로 가며 멈추기 직전에 보낸 마지막 패킷
+  cooldownCount?: number;                // 현재 쿨다운 중인 조언 개수 (HUD 오른쪽 위 표시)
 }
 export type Via = 'MQTT';
 export type MqttState = 'off' | 'connecting' | 'on';
@@ -54,7 +55,7 @@ const rand = () => Math.random().toString(36).slice(2, 10);
 const PAGE_ID = rand();                  // 같은 페이지가 보낸 패킷(MQTT 에코 등)을 무시하기 위한 ID
 
 export const emptyState = (): MixState => ({
-  running: false, lines: ['', '', '', '', ''], bands: null, levels: null, genre: '', genreAt: 0, aiLog: null, status: '',
+  running: false, lines: ['', '', '', '', ''], bands: null, levels: null, genre: '', genreAt: 0, aiLog: null, status: '', cooldownCount: 0,
 });
 
 interface PostOpts { topic?: 'hud' | 'status'; retain?: boolean }
@@ -203,6 +204,8 @@ export class HudSender {
   private st: MixState = emptyState();
   private rx = new Map<string, { t: number; via: Via }>();
   onState: (i: SenderInfo) => void = () => {};
+  /** 수신기(G2 안경)가 보낸 명령 — 예: 'resetCooldown' (안경 다리 더블탭) */
+  onCommand: (cmd: string) => void = () => {};
 
   constructor() {
     const b = bus();
@@ -261,6 +264,7 @@ export class HudSender {
 
   private onRx(m: any, via: Via) {
     if (m.t === 'hello') { this.publish(); return; }               // 새 수신기 → 즉시 현재 상태
+    if (m.t === 'cmd' && typeof m.cmd === 'string') { this.onCommand(m.cmd); return; }
     if (m.t !== 'ack' || typeof m.page !== 'string') return;
     const isNew = !this.rx.has(m.page);
     this.rx.set(m.page, { t: Date.now(), via });
@@ -342,6 +346,9 @@ export class HudReceiver {
   }
 
   private hello() { bus().post({ t: 'hello', ts: Date.now() }, { topic: 'status' }); }
+
+  /** PC 분석기에 명령 보내기 (status 토픽) — 예: 'resetCooldown' */
+  sendCommand(cmd: string) { bus().post({ t: 'cmd', cmd, ts: Date.now() }, { topic: 'status' }); }
 
   private recv(m: any, via: Via) {
     if (m.t === 'hb') {                              // PC 하트비트 (2초)

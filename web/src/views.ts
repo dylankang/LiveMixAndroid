@@ -53,6 +53,15 @@ export function paintHud(lines: string[]) {
   document.getElementById('hud0')?.classList.toggle('alert', (lines[0] ?? '').startsWith('⚠'));
 }
 
+/** HUD 오른쪽 위: 쿨다운 중인 조언 개수 (0 이면 숨김) */
+export function paintCdCount(n: number) {
+  const el = document.getElementById('hudCd');
+  if (!el) return;
+  el.hidden = !(n > 0);
+  el.textContent = n > 0 ? `⏳ ${n}` : '';
+  el.title = n > 0 ? `쿨다운 중인 조언 ${n}개 · 안경 다리 더블탭으로 초기화` : '';
+}
+
 export function genreText(genre: string, genreAt: number): string {
   if (!genre) return '🎵 장르 판별 대기 중';
   if (!genreAt) return genre;          // 시각이 없는 상태 문구 (예: 무음 대기)

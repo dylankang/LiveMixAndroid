@@ -4,7 +4,7 @@
 import { Glasses } from './glasses';
 import { HudReceiver, linesToShow, isCode, setLinkCode, linkCode, HB_LOST_MS, type MixState, type ReceiverInfo } from './link';
 declare const __BUILD_TIME__: string;
-import { renderBandTable, paintMeters, paintHud, meterMarkup, genreText, clock } from './views';
+import { renderBandTable, paintMeters, paintHud, paintCdCount, meterMarkup, genreText, clock } from './views';
 
 try {
   if (navigator.mediaDevices) {
@@ -30,6 +30,7 @@ $('app').innerHTML = `
   <div id="conn" class="badge off">🔴 대기 중</div>
   <section class="card">
     <div id="hud">
+      <div id="hudCd" class="hud-cd" hidden></div>
       <div class="hud-line fb" id="hud0"></div><div class="hud-line" id="hud1"></div><div class="hud-line" id="hud2"></div>
       <div class="hud-line" id="hud3"></div><div class="hud-line" id="hud4"></div>
     </div>
@@ -125,7 +126,24 @@ function show(st: MixState, i: ReceiverInfo) {
   $('aiLast').textContent = st.aiLog ? `[${clock(st.aiLog.at)}] ${st.aiLog.text}` : '';
   $('remoteStatus').textContent = st.status ? `분석기 상태: ${st.status}` : '';
   levels = st.levels;
+  paintCount(st, i);
 }
+
+/** HUD 오른쪽 위 쿨다운 개수 (PC 신호가 끊겼거나 분석 정지면 숨김) */
+function paintCount(st: MixState, i: ReceiverInfo) {
+  const n = st.running && i.phase !== 'stopped' && !(i.lastHb !== null && !i.pcAlive) ? st.cooldownCount ?? 0 : 0;
+  paintCdCount(n);
+  glasses.setCooldownCount(n);
+}
+
+// 👓 안경 다리 더블탭 → PC 분석기에 '쿨다운 전체 초기화' 명령 (길게 누르기 = 종료 확인)
+glasses.onDoubleTap = () => {
+  if (!isCode(linkCode())) return;
+  rx.sendCommand('resetCooldown');
+  const s = $('status');
+  s.textContent = '👓 더블탭: 쿨다운 초기화 요청을 보냈습니다';
+  paintCdCount(0); glasses.setCooldownCount(0);       // 바로 반영 (PC 상태가 오면 다시 맞춰짐)
+};
 
 /** PC 하트비트가 10초 넘게 없으면 상단에 '⚠️ PC 신호 대기중' */
 function paintPcWarn(i: ReceiverInfo) {
@@ -175,6 +193,7 @@ function refresh() {
   const st = rx.state;
   if (!st) return;
   paintLines(linesToShow(st, i));
+  paintCount(st, i);
   if (i.phase !== 'live') levels = null;
 }
 setInterval(() => { refresh(); paintConn(rx.info()); }, 1000);

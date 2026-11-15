@@ -9,6 +9,10 @@ import {
 
 const W = 576, H = 288, LINES = 5;
 const LH = Math.floor(H / LINES); // 줄당 57px → 항상 정확히 5줄
+/** 1번째 줄 오른쪽 위의 쿨다운 개수 칸 */
+const BADGE_W = 120;
+const BADGE_ID = LINES + 1;
+const DOUBLE_TAP_GAP_MS = 1200;   // 더블탭 이벤트가 겹쳐 와도 한 번만 처리
 
 export type GlassesState = 'waiting' | 'ready' | 'text-fallback' | 'failed';
 
@@ -27,6 +31,13 @@ export class Glasses {
   private lastText = '';
   state: GlassesState = 'waiting';
   onState: (s: GlassesState, detail?: string) => void = () => {};
+  /** 안경 다리(터치패드) 더블탭 */
+  onDoubleTap: () => void = () => {};
+  private lastDouble = 0;
+  /** 오른쪽 위 쿨다운 개수 칸: 'box' = 별도 컨테이너 · 'inline' = 1번째 줄 끝에 붙여 표시 */
+  private badgeMode: 'box' | 'inline' = 'box';
+  private badge = '';
+  private shownBadge = '\u0000';
   get connected() { return this.state === 'ready' || this.state === 'text-fallback'; }
 
   /** 브리지가 준비되면 true. 브리지가 없는 일반 브라우저에서는 끝나지 않을 수 있다 (화면 쪽은 기다리지 않음) */
@@ -36,30 +47,42 @@ export class Glasses {
     if (!bridge) { this.set('failed', '브리지 없음'); return false; }
     this.bridge = bridge;
 
-    const objs = () => Array.from({ length: LINES }, (_, i) => new TextContainerProperty({
-      xPosition: 0, yPosition: i * LH, width: W, height: LH,
-      borderWidth: 0, borderColor: 5, paddingLength: 2,
-      containerID: i + 1, containerName: `line${i + 1}`,
-      content: ' ',
-      isEventCapture: i === 0 ? 1 : 0, // 이벤트 캡처 컨테이너는 정확히 1개
-    }));
-
-    let ok = false;
-    try {
-      const res = await bridge.createStartUpPageContainer(
-        new CreateStartUpPageContainer({ containerTotalNum: LINES, textObject: objs() }));
-      ok = Number(res ?? 0) === 0;
-      if (!ok) console.warn('createStartUpPageContainer 결과:', res);
-    } catch (e) { console.warn('createStartUpPageContainer 실패', e); }
-
-    if (!ok && typeof bridge.rebuildPageContainer === 'function') {   // 이미 시작 페이지가 있는 경우(모드 전환·새로고침)
+    // 5줄 + (가능하면) 1번째 줄 오른쪽 위의 쿨다운 개수 칸
+    const objs = (withBadge: boolean) => {
+      const list = Array.from({ length: LINES }, (_, i) => new TextContainerProperty({
+        xPosition: 0, yPosition: i * LH, width: i === 0 && withBadge ? W - BADGE_W : W, height: LH,
+        borderWidth: 0, borderColor: 5, paddingLength: 2,
+        containerID: i + 1, containerName: `line${i + 1}`,
+        content: ' ',
+        isEventCapture: i === 0 ? 1 : 0, // 이벤트 캡처 컨테이너는 정확히 1개 (더블탭 수신)
+      }));
+      if (withBadge) list.push(new TextContainerProperty({
+        xPosition: W - BADGE_W, yPosition: 0, width: BADGE_W, height: LH,
+        borderWidth: 0, borderColor: 5, paddingLength: 2,
+        containerID: BADGE_ID, containerName: 'cdcount', content: ' ', isEventCapture: 0,
+      }));
+      return list;
+    };
+    const build = async (withBadge: boolean) => {
+      const n = withBadge ? LINES + 1 : LINES;
       try {
-        const Rebuild = (SDK as any).RebuildPageContainer;
-        const arg = { containerTotalNum: LINES, textObject: objs() };
-        const r = await bridge.rebuildPageContainer(Rebuild ? new Rebuild(arg) : arg);
-        ok = r !== false;
-      } catch (e) { console.warn('rebuildPageContainer 실패', e); }
-    }
+        const res = await bridge.createStartUpPageContainer(new CreateStartUpPageContainer({ containerTotalNum: n, textObject: objs(withBadge) }));
+        if (Number(res ?? 0) === 0) return true;
+        console.warn('createStartUpPageContainer 결과:', res);
+      } catch (e) { console.warn('createStartUpPageContainer 실패', e); }
+      if (typeof bridge.rebuildPageContainer === 'function') {   // 이미 시작 페이지가 있는 경우(모드 전환·새로고침)
+        try {
+          const Rebuild = (SDK as any).RebuildPageContainer;
+          const arg = { containerTotalNum: n, textObject: objs(withBadge) };
+          const r = await bridge.rebuildPageContainer(Rebuild ? new Rebuild(arg) : arg);
+          if (r !== false) return true;
+        } catch (e) { console.warn('rebuildPageContainer 실패', e); }
+      }
+      return false;
+    };
+    let ok = await build(true);
+    if (ok) this.badgeMode = 'box';
+    else { ok = await build(false); this.badgeMode = 'inline'; }   // 6칸이 안 되면 기존 5줄 + 1번째 줄 끝에 개수 표시
 
     // 문서화된 컨테이너 방식이 안 될 때만 쓰는 예비 경로: 브리지/전역 객체에 텍스트 전송 함수가 있으면 사용
     const w = window as any;
@@ -68,9 +91,19 @@ export class Glasses {
     }
 
     try {
-      bridge.onEvenHubEvent?.((ev: any) => {   // 글래스 터치패드 더블탭 → 시스템 종료 확인 (루트 페이지 필수 규칙)
-        const t = ev?.sysEvent?.eventType ?? ev?.textEvent?.eventType;
-        if (t !== undefined && t === (OsEventTypeList as any).DOUBLE_CLICK_EVENT) bridge.shutDownPageContainer(1);
+      const L = OsEventTypeList as any;
+      const DOUBLE = L?.DOUBLE_CLICK_EVENT ?? 3, LONG = L?.LONG_PRESS_EVENT ?? 9;
+      bridge.onEvenHubEvent?.((ev: any) => {
+        const t = ev?.textEvent?.eventType ?? ev?.listEvent?.eventType ?? ev?.sysEvent?.eventType;
+        if (t === undefined || t === null) return;
+        if (t === DOUBLE) {                     // 안경 다리 더블탭 → 쿨다운 목록 초기화
+          const now = Date.now();
+          if (now - this.lastDouble < DOUBLE_TAP_GAP_MS) return;
+          this.lastDouble = now;
+          try { this.onDoubleTap(); } catch (e) { console.warn('더블탭 처리 실패', e); }
+        } else if (t === LONG) {                // 길게 누르기 → 시스템 종료 확인 창 (루트 페이지는 shutDownPageContainer(1) 로 종료)
+          bridge.shutDownPageContainer(1);
+        }
       });
     } catch { /* ignore */ }
 
@@ -83,6 +116,12 @@ export class Glasses {
 
   private set(s: GlassesState, d?: string) { this.state = s; this.onState(s, d); }
 
+  /** 오른쪽 위 쿨다운 개수 (0 이면 비움) */
+  setCooldownCount(n: number) {
+    this.badge = n > 0 ? `쿨다운 ${n}` : '';
+    this.flush();
+  }
+
   /** 5줄 전체를 받는다. 브리지 준비 전이면 보관했다가 준비되는 즉시 전송 */
   update(lines: string[]) {
     this.pending = Array.from({ length: LINES }, (_, i) => String(lines[i] ?? ''));
@@ -91,7 +130,17 @@ export class Glasses {
 
   private flush() {
     if (this.state === 'ready') {
-      this.pending.forEach((raw, i) => {
+      if (this.badgeMode === 'box') {
+        const content = this.badge || ' ';
+        if (content !== this.shownBadge) {
+          this.shownBadge = content;
+          this.chain = this.chain.then(() =>
+            this.bridge.textContainerUpgrade(new TextContainerUpgrade({ containerID: BADGE_ID, containerName: 'cdcount', content })),
+          ).catch((e: unknown) => { console.warn('glasses badge failed', e); this.shownBadge = '\u0000'; });
+        }
+      }
+      this.pending.forEach((raw0, i) => {
+        const raw = i === 0 && this.badgeMode === 'inline' && this.badge ? `${raw0}${raw0 ? '  ' : ''}[${this.badge}]` : raw0;
         const content = raw.length ? raw : ' ';
         if (content === this.shown[i]) return;
         this.shown[i] = content;
@@ -102,7 +151,7 @@ export class Glasses {
         ).catch((e: unknown) => { console.warn('glasses update failed', e); this.shown[i] = '\u0000'; });
       });
     } else if (this.state === 'text-fallback') {
-      const text = this.pending.join('\n');
+      const text = (this.badge ? [`${this.pending[0]}${this.pending[0] ? '  ' : ''}[${this.badge}]`, ...this.pending.slice(1)] : this.pending).join('\n');
       if (text === this.lastText) return;
       this.lastText = text;
       for (const f of this.textFns) { try { void f(text); } catch (e) { console.warn('sendText 실패', e); } }

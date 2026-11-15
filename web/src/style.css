@@ -114,3 +114,6 @@ dialog#settings::backdrop { background:rgba(0,0,0,.7); }
 #keepBtn { width:100%; margin:8px 0 2px; padding:12px; font-weight:800; border:2px solid #4da3ff; background:#0b2a4a; color:#cfe6ff; }
 #keepBtn.active { border-color:#39ff7a; background:#0a2a14; color:#b9ffd0; }
 #keepInfo { white-space:pre-line; }
+/* HUD 오른쪽 위 쿨다운 개수 */
+#hud { position:relative; }
+.hud-cd { position:absolute; top:6px; right:8px; padding:1px 8px; border:1px solid #6b5a1e; border-radius:999px; background:#2a2208; color:#ffe9a0; font-size:.8rem; font-weight:700; z-index:1; }
