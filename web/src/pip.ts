@@ -41,10 +41,10 @@ export class PipMonitor {
     // 피드백 경고 1줄 + 최신 AI 조언 2줄
     const advice = lines.slice(1).filter(t => t.trim()).slice(-2);
     const rows = [lines[0] ?? '', ...advice, ...Array(Math.max(0, 2 - advice.length)).fill('')];
-    c.font = 'bold 22px "Noto Sans KR", system-ui, sans-serif';
+    c.font = 'bold 16px "Noto Sans KR", system-ui, sans-serif';   // 한 줄 최대(한글 약 28자)가 480px 폭에 들어가는 크기
     rows.slice(0, 3).forEach((t, i) => {
       c.fillStyle = i === 0 && t.startsWith('⚠') ? '#ff5a4d' : '#39ff7a';
-      c.fillText(t.slice(0, 22), 10, 120 + i * 44);
+      c.fillText(t, 10, 120 + i * 44);
     });
     c.fillStyle = '#7b8f80'; c.font = '11px system-ui';
     c.fillText(status.slice(0, 60), 10, H - 6);

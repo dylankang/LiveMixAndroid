@@ -1,4 +1,4 @@
-import { BANDS, HARD_CAP_CHARS, QUEUE_SIZE, TIMING } from './config';
+import { BANDS, LINE_WIDTH_UNITS, QUEUE_SIZE, TIMING } from './config';
 
 export interface Candidate { tag: string; text: string }
 export interface AdviceItem extends Candidate { key: string; at: number }
@@ -75,28 +75,33 @@ export function normalizeAdvice(line: string): { inst: string; item: string; act
 }
 
 /**
- * EQ 를 뺀 분류는 정확한 숫자 대신 방향만: ↑ = 올림/늘림, ↓ = 낮춤/줄임 (Pan 은 ← →)
- *  예) HPF:100Hz 올림 → HPF:↑ · Comp:레시오 낮춤 → Comp:레시오 ↓ · Level:+2dB → Level:↑ · Reverb:디케이 축소 → Reverb:디케이 ↓
+ * EQ 를 뺀 분류의 표기 정리:
+ *  · dB 로 말할 수 있는 것(Level·센드·스레숄드·게인·레인지)은 지금보다 몇 dB 올리고 내릴지 상대값 ±dB
+ *      예) Level:2dB 올림 → Level:+2dB · Reverb:센드 3dB 줄이기 → Reverb:센드 -3dB
+ *  · 그 밖(주파수·레시오·시간)은 생각하는 수치 다음에 방향 화살표: ↑ = 올림/늘림, ↓ = 낮춤/줄임 (Pan 은 ← →)
+ *      예) HPF:120Hz로 올림 → HPF:120Hz ↑ · Comp:레시오 3:1로 낮춤 → Comp:레시오 3:1 ↓
  */
-export function toArrows(item: string, action: string): string {
+export function toArrows(_item: string, action: string): string {
+  const UP = () => /(올리|올려|올림|높이|높여|높임|늘리|늘려|늘림|키우|키워|키움|증가|강화|더\s*세게|up)[가-힣]*/gi;
+  const DOWN = () => /(내리|내려|내림|낮추|낮춰|낮춤|줄이|줄여|줄임|감소|축소|약하게|down)[가-힣]*/gi;
   let a = action;
-  if (item === 'Level' && !/[↑↓]/.test(a)) {
-    const m = a.match(/([+\-−])\s*\d+(?:\.\d+)?\s*dB/i);
-    if (m) a = a.replace(m[0], m[1] === '+' ? '↑' : '↓');
+  const up = UP().test(a), down = DOWN().test(a);
+  // 숫자 뒤의 조사·군더더기 (100Hz로 → 100Hz, 3:1까지 → 3:1)
+  a = a.replace(/(\d(?:\.\d+)?\s*(?:kHz|Hz|dB|ms|s|초|%|:\s*\d+)?)(?:으로|로|까지|정도|쯤|가량|에서|에)(?=\s|$)/gi, '$1')
+    .replace(/(^|\s)(설정|조정|변경|정도|으로|로)(?=\s|$)/g, ' ');
+  const db = a.match(/([+\-−±]?)(\d+(?:\.\d+)?)\s*dB/i);
+  if (db) {
+    // 상대 dB: 부호가 없으면 방향어로 정한다
+    let sign = db[1] === '−' ? '-' : db[1];
+    if (!sign) sign = down ? '-' : up ? '+' : '';
+    a = a.replace(db[0], `${sign}${db[2]}dB`).replace(UP(), '').replace(DOWN(), '').replace(/[↑↓]/g, '');
+  } else {
+    // 수치 + 화살표: 방향어는 화살표로 바꿔 맨 뒤에 둔다
+    const arrows = (a.match(/↑↑|↓↓|[↑↓←→]/g) ?? []).join('') || (up ? '↑' : down ? '↓' : '');
+    a = a.replace(UP(), '').replace(DOWN(), '').replace(/[↑↓←→]/g, '');
+    a = `${a.trim()} ${arrows.replace(/([↑↓←→])\1{2,}/g, '$1$1')}`;
   }
-  a = a
-    .replace(/(올리|올려|올림|높이|높여|높임|늘리|늘려|늘림|키우|키워|키움|증가|강화|더\s*세게|up)\S*/gi, '↑')
-    .replace(/(내리|내려|내림|낮추|낮춰|낮춤|줄이|줄여|줄임|감소|축소|약하게|down)\S*/gi, '↓');
-  if (/[↑↓←→]/.test(a)) {
-    // 방향이 있으면 부정확한 수치(100Hz, 3:1, -3dB, 30ms …)는 지운다
-    const P = '(?:으로|로|까지|정도|쯤|가량|에서|에)?';
-    a = a.replace(new RegExp(`[+\\-−]?\\d+(?:\\.\\d+)?\\s*:\\s*\\d+${P}`, 'g'), '')
-      .replace(new RegExp(`[+\\-−]?\\d+(?:\\.\\d+)?\\s*(?:kHz|Hz|dB|ms|%|초)${P}`, 'gi'), '')
-      .replace(/(^|\s)(설정|조정|변경|정도)(?=\s|$)/g, ' ');
-    a = a.replace(/\s*([↑↓←→])\s*/g, ' $1').replace(/\s{2,}/g, ' ').trim();
-    a = a.replace(/([↑↓←→])(?:\s*\1)+/g, '$1$1').replace(/(↑↑|↓↓)\1+/g, '$1');
-  }
-  return a.trim();
+  return a.replace(/\s{2,}/g, ' ').trim();
 }
 
 /** "[악기] 항목:조치" 를 나눈다 */
@@ -138,9 +143,22 @@ export function labelOf(line: string): string {
   return a ? `[${a.inst} ${a.item}]` : line.slice(0, 12);
 }
 
+/** 글자 폭: 영문·숫자·공백·기본 기호 = 1칸, 그 외(한글·화살표·이모지) = 2칸 */
+export const charUnits = (ch: string) => (/^[\x20-\x7e]$/.test(ch) ? 1 : 2);
+export const textUnits = (s: string) => Array.from(s).reduce((n, ch) => n + charUnits(ch), 0);
+
+/** HUD 한 줄 폭(LINE_WIDTH_UNITS)에 맞게 자른다. 넘치면 단어 중간이 아니라 마지막 띄어쓰기에서 자름 */
 export function clampText(s: string): string {
   const chars = Array.from(s.trim());
-  return chars.length > HARD_CAP_CHARS ? chars.slice(0, HARD_CAP_CHARS).join('') : chars.join('');
+  let used = 0, cut = chars.length, lastSpace = -1;
+  for (let i = 0; i < chars.length; i++) {
+    if (chars[i] === ' ') lastSpace = i;
+    used += charUnits(chars[i]);
+    if (used > LINE_WIDTH_UNITS) { cut = i; break; }
+  }
+  if (cut === chars.length) return chars.join('');
+  const end = lastSpace > cut * 0.6 ? lastSpace : cut;
+  return chars.slice(0, end).join('').trim();
 }
 
 export interface CooldownEntry {

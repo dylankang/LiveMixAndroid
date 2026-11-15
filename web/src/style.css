@@ -22,7 +22,7 @@ button { cursor:pointer; } button.primary { background:var(--accent); color:#041
 .clip { font-size:11px; text-align:center; padding:3px 0; border-radius:4px; background:#2a1512; color:#6b3a35; } .clip.on { background:var(--warn); color:#fff; }
 .val { font-size:11px; text-align:right; color:var(--dim); font-variant-numeric:tabular-nums; }
 #hud { background:#000; border:1px solid #1d3a26; border-radius:8px; padding:8px; font-family:"Noto Sans KR",monospace; color:#39ff7a; }
-.hud-line { height:28px; line-height:28px; white-space:nowrap; overflow:hidden; font-size:15px; }
+.hud-line { height:28px; line-height:28px; white-space:nowrap; overflow:hidden; font-size:clamp(10px, 3vw, 15px); }   /* 한 줄 최대(한글 약 28자)가 휴대폰 폭에서도 들어가게 */
 .hud-line.fb.alert { color:#ff5a4d; font-weight:700; }
 table { width:100%; border-collapse:collapse; font-size:12px; font-variant-numeric:tabular-nums; }
 th,td { padding:3px 4px; text-align:right; } th:first-child,td:first-child { text-align:left; } th { color:var(--dim); font-weight:400; }
