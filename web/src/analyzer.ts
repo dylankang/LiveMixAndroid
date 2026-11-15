@@ -1,4 +1,4 @@
-import { AudioEngine, type BandStat, listInputs, listOutputs, realDevices, outputSelectSupported, requestMicPermission, TRIM, GATE } from './audio';
+import { AudioEngine, type BandStat, listInputs, listOutputs, realDevices, outputSelectSupported, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE } from './audio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
 import { callAI, parseReply, buildSystemPrompt, isQuotaError, type Genre } from './ai';
 import { evaluateBalance, TOL_RANGE, ALWAYS_AI_TOL } from './balance';
@@ -225,38 +225,59 @@ const saveSel = (sel: HTMLSelectElement, key: string): SavedDev => {
   return v;
 };
 
-// 🎧 모니터링 모드: 선택한 입력을 분석하면서 선택한 출력 장치로 내보냄 (기본 OFF)
+// 출력 장치 특수 값: 없음(소리 안 냄 · 기본값) / 시스템 기본 출력(휴대폰처럼 개별 출력 장치 목록을 주지 않는 환경)
+const OUT_NONE = 'none';
+const OUT_SYSTEM = 'system';
+const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+const SYSTEM_OUT_LABEL = isMobile ? '📱 휴대폰 기본 출력 (스피커 · 이어폰 · USB/블루투스)' : '🔊 시스템 기본 출력';
+const SYSTEM_IN_LABEL = '📱 휴대폰 기본 입력 (꽂힌 USB 인터페이스 자동)';
+/** 엔진에 넘길 출력 장치 ID ('' = 시스템 기본) */
+const outputId = () => (outputSel.value === OUT_NONE || outputSel.value === OUT_SYSTEM ? '' : outputSel.value);
+const outputNone = () => !outputSel.value || outputSel.value === OUT_NONE;
+
+// 🎧 모니터링 모드: 선택한 입력을 분석하면서 선택한 출력 장치로 내보냄 (기본 OFF · 출력 '없음'이면 내보내지 않음)
 let monitorOn = ls.get('lm.monitor', '0') === '1';
 let monitorPct = Math.min(100, Math.max(0, Number(ls.get('lm.monVol', '80')) || 0));
+/** 실제로 소리를 내보내는지: 모니터링 ON + 출력 장치가 '없음'이 아님 */
+const monitorActive = () => monitorOn && !outputNone();
 function paintMonitor() {
-  monBtn.textContent = `🎧 모니터링 모드 : ${monitorOn ? 'ON (입력 → 출력)' : 'OFF'}`;
-  monBtn.classList.toggle('active', monitorOn);
+  const none = outputNone();
+  monBtn.disabled = none;
+  monBtn.textContent = none ? '🎧 모니터링 모드 : 출력 장치를 먼저 고르세요'
+    : `🎧 모니터링 모드 : ${monitorOn ? 'ON (입력 → 출력)' : 'OFF'}`;
+  monBtn.classList.toggle('active', monitorActive());
   monVol.value = String(monitorPct);
+  monVol.disabled = none;
   $('monVolInfo').textContent = `${monitorPct}%`;
   const out = engine.outputInfo;
-  let t = monitorOn
-    ? `선택한 입력을 분석하면서 「${outputSel.selectedOptions[0]?.textContent ?? '출력 장치'}」로 내보냅니다. 입력 장치의 소리가 다시 입력으로 들어가지 않게(하울링) 출력 연결을 확인하세요.`
+  let t = none ? '출력 없음: 분석만 하고 소리는 내보내지 않습니다.'
+    : monitorOn ? `선택한 입력을 분석하면서 「${outputSel.selectedOptions[0]?.textContent ?? '출력 장치'}」로 내보냅니다. 출력 소리가 다시 입력으로 들어가지 않게(하울링) 연결을 확인하세요.`
     : '모니터링 OFF: 분석만 하고 소리는 내보내지 않습니다.';
-  if (running && out.via !== 'none' && !out.ok) t += `\n⚠ 출력 장치를 바꾸지 못했습니다: ${out.error ?? ''}`;
-  if (!outputSelectSupported()) t += '\n⚠ 이 브라우저는 출력 장치 지정을 지원하지 않아 Windows 기본 출력으로 나갑니다.';
+  if (running && monitorActive() && out.via !== 'none' && !out.ok) t += `\n⚠ 출력 장치를 바꾸지 못했습니다: ${out.error ?? ''}`;
+  if (isMobile && !none) t += '\n📱 휴대폰은 개별 출력 장치를 고를 수 없어, 지금 휴대폰에 연결된 출력(스피커/이어폰/USB/블루투스)으로 나갑니다.';
   $('monInfo').textContent = t;
 }
 monBtn.onclick = () => {
+  if (outputNone()) return;
   monitorOn = !monitorOn;
   ls.set('lm.monitor', monitorOn ? '1' : '0');
-  engine.setMonitor(monitorOn, monitorPct / 100);
+  engine.setMonitor(monitorActive(), monitorPct / 100);
   paintMonitor();
   if (running) setStatus(`🎧 모니터링 ${monitorOn ? 'ON' : 'OFF'}`);
 };
 monVol.oninput = () => {
   monitorPct = Number(monVol.value) || 0;
   ls.set('lm.monVol', String(monitorPct));
-  engine.setMonitor(monitorOn, monitorPct / 100);
+  engine.setMonitor(monitorActive(), monitorPct / 100);
   $('monVolInfo').textContent = `${monitorPct}%`;
 };
 outputSel.onchange = async () => {
   savedOut = saveSel(outputSel, 'lm.output');
-  if (running) { await engine.setOutput(outputSel.value); setStatus(`출력 장치: ${outputSel.selectedOptions[0]?.textContent ?? ''}`); }
+  if (running) {
+    await engine.setOutput(outputId());
+    engine.setMonitor(monitorActive(), monitorPct / 100);
+    setStatus(`출력 장치: ${outputSel.selectedOptions[0]?.textContent ?? ''}`);
+  }
   paintMonitor();
 };
 
@@ -275,34 +296,50 @@ function describeError(e: unknown): string {
   return (msg || '알 수 없는 오류') + (name && name !== 'Error' ? ` (${name})` : '');
 }
 
-/** 목록 채우기: 실제 장치만. 권한 전이라 목록이 비어 있으면 안내 항목 하나 */
-function fillSelect(sel: HTMLSelectElement, devs: MediaDeviceInfo[], want: SavedDev, emptyText: string, prefix: string) {
-  const real = realDevices(devs);
-  sel.innerHTML = '';
-  if (!real.length) {
-    const o = document.createElement('option');
-    o.value = ''; o.textContent = emptyText; o.dataset.name = '';
-    sel.appendChild(o);
-    sel.value = '';
-    return;
-  }
-  real.forEach((d, i) => {
-    const o = document.createElement('option');
-    o.value = d.deviceId; o.textContent = d.label || `${prefix} ${i + 1}`; o.dataset.name = d.label || '';
-    sel.appendChild(o);
-  });
+const addOpt = (sel: HTMLSelectElement, value: string, label: string, name = '') => {
+  const o = document.createElement('option');
+  o.value = value; o.textContent = label; o.dataset.name = name;
+  sel.appendChild(o);
+};
+/** 저장값(ID → 이름 순)으로 찾아 선택. 없으면 fallback */
+function pick(sel: HTMLSelectElement, want: SavedDev, fallback: string) {
   const opts = [...sel.options];
   const hit = opts.find(o => o.value === want.device) ?? (want.name ? opts.find(o => o.dataset.name === want.name) : undefined);
-  sel.value = (hit ?? opts[0]).value;
+  sel.value = hit ? hit.value : fallback;
+}
+/**
+ * 입력 목록: Windows/휴대폰이 인식한 실제 장치. 휴대폰은 맨 위에 '휴대폰 기본 입력'도 둔다
+ * (안드로이드는 꽂은 USB 인터페이스가 기본 입력으로만 잡히는 경우가 있음). 권한 전이라 목록이 없으면 안내 항목.
+ */
+function fillInputs(devs: MediaDeviceInfo[]) {
+  const real = realDevices(devs);
+  const granted = haveLabels || devs.some(d => d.deviceId === 'default' && !!d.label);
+  deviceSel.innerHTML = '';
+  if (isMobile && (granted || real.length)) addOpt(deviceSel, DEFAULT_INPUT_ID, SYSTEM_IN_LABEL);
+  real.forEach((d, i) => addOpt(deviceSel, d.deviceId, d.label || `입력 ${i + 1}`, d.label || ''));
+  if (!deviceSel.options.length && devs.some(d => d.deviceId === 'default')) addOpt(deviceSel, DEFAULT_INPUT_ID, isMobile ? SYSTEM_IN_LABEL : '🎙️ 시스템 기본 입력');
+  if (!deviceSel.options.length) { addOpt(deviceSel, '', '🔄 [장치 찾기]를 눌러 입력 장치 목록을 불러오세요'); deviceSel.value = ''; return; }
+  pick(deviceSel, savedIn, deviceSel.options[0].value);
+}
+/**
+ * 출력 목록: [없음(기본)] + 실제 출력 장치.
+ * 휴대폰처럼 개별 출력 장치를 알려 주지 않거나 출력 지정을 지원하지 않으면 '기본 출력' 항목을 대신 둔다.
+ */
+function fillOutputs(devs: MediaDeviceInfo[]) {
+  const real = realDevices(devs);
+  outputSel.innerHTML = '';
+  addOpt(outputSel, OUT_NONE, '🔇 없음 (소리 내보내지 않음)');
+  if (isMobile || !real.length || !outputSelectSupported()) addOpt(outputSel, OUT_SYSTEM, SYSTEM_OUT_LABEL);
+  if (outputSelectSupported()) real.forEach((d, i) => addOpt(outputSel, d.deviceId, d.label || `출력 ${i + 1}`, d.label || ''));
+  pick(outputSel, savedOut, OUT_NONE);   // 고르기 전 기본값 = 없음
 }
 let haveLabels = false;
 async function refreshDevices(askPermission = false) {
   if (askPermission && !running) await requestMicPermission();
   const [ins, outs] = await Promise.all([listInputs(), listOutputs()]);
-  haveLabels = realDevices(ins).some(d => d.label);
-  fillSelect(deviceSel, ins, savedIn, '🔄 [장치 찾기]를 눌러 입력 장치 목록을 불러오세요', '입력');
-  fillSelect(outputSel, outs, savedOut, outputSelectSupported() ? '🔄 [장치 찾기]를 눌러 출력 장치 목록을 불러오세요' : '이 브라우저는 출력 장치 선택 미지원 (Windows 기본 출력)', '출력');
-  outputSel.disabled = !outputSelectSupported();
+  haveLabels = ins.some(d => !!d.label);
+  fillInputs(ins);
+  fillOutputs(outs);
   paintMonitor();
 }
 findBtn.onclick = async () => {
@@ -311,7 +348,7 @@ findBtn.onclick = async () => {
   try {
     await refreshDevices(true);
     clearError();
-    setStatus(`입력 ${realDevices(await listInputs()).length}개 · 출력 ${realDevices(await listOutputs()).length}개 찾음`);
+    setStatus(`입력 장치 ${deviceSel.options.length}개 · 출력 장치 ${Math.max(0, outputSel.options.length - 1)}개 찾음`);
   } catch (e) {
     showError(describeError(e));
     try { await refreshDevices(); } catch { /* ignore */ }
@@ -421,7 +458,7 @@ $('cdList').addEventListener('click', e => {
 });
 
 // ───────── 오디오 시작/정지 ─────────
-const modeName = () => `🎛️ 콘솔 2-Track${monitorOn ? ' · 🎧 모니터링' : ''}`;
+const modeName = () => `🎛️ 콘솔 2-Track${monitorActive() ? ' · 🎧 모니터링' : ''}`;
 
 async function startAudio() {
   engine.setAutoTrim(trimSaved());
@@ -431,14 +468,14 @@ async function startAudio() {
   if (!deviceSel.value) throw Object.assign(new Error('Windows 에 인식된 오디오 입력 장치가 없습니다'), { name: 'NotFoundError' });
   savedIn = saveSel(deviceSel, 'lm.input');
   if (outputSel.value) savedOut = saveSel(outputSel, 'lm.output');
-  await engine.start({ deviceId: deviceSel.value, outputId: outputSel.value, monitor: monitorOn, monitorGain: monitorPct / 100 });
+  await engine.start({ deviceId: deviceSel.value, outputId: outputId(), monitor: monitorActive(), monitorGain: monitorPct / 100 });
   await refreshDevices().catch(() => {});   // 권한 승인 직후: 실제 장치 이름으로 목록 갱신
   paintMonitor();
 
   const info = engine.openInfo, st = info?.settings;
   const parts: string[] = [];
   parts.push(`입력: ${info?.label || deviceSel.selectedOptions[0]?.textContent || '?'} · ${engine.deviceChannels >= 2 ? 'Ch 1-2 스테레오' : '모노'} · ${st?.sampleRate ?? '?'}Hz${info?.step && info.step > 1 ? ` · ${info.step}차 방식으로 열림` : ''}`);
-  parts.push(`출력: ${outputSel.selectedOptions[0]?.textContent || 'Windows 기본'} · 🎧 모니터링 ${monitorOn ? `ON (${monitorPct}%)` : 'OFF'}`
+  parts.push(outputNone() ? '출력: 없음 (소리 내보내지 않음)' : `출력: ${outputSel.selectedOptions[0]?.textContent ?? ''} · 🎧 모니터링 ${monitorOn ? `ON (${monitorPct}%)` : 'OFF'}`
     + (engine.outputInfo.ok || engine.outputInfo.via === 'none' ? '' : ` · ⚠ 출력 전환 실패: ${engine.outputInfo.error ?? ''}`));
   parts.push(gateOn ? `🚪 노이즈 게이트 ${gateDb} dBFS · ${GATE.enterMs / 1000}초 이상 무음이면 대기` : '🚪 노이즈 게이트 OFF (무음에도 계속 분석)');
   if (info?.step === 3) parts.push('⚠ 기본 모드로 열림: OS 음성 보정(에코 제거/노이즈 억제/AGC)이 켜져 있을 수 있습니다');

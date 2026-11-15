@@ -410,7 +410,9 @@ export class AudioEngine {
     const withTimeout = <T>(p: Promise<T>) => Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error('출력 장치 전환 시간 초과')), 4000))]);
     if (typeof (ctx as any).setSinkId === 'function') {
       mon.connect(ctx.destination);
-      if (!id) { this.outputInfo = { ok: true, via: 'context' }; return; }
+      const cur = (ctx as any).sinkId;
+      const curId = typeof cur === 'string' ? cur : '';
+      if (curId === id) { this.outputInfo = { ok: true, via: 'context' }; return; }   // '' = 시스템 기본 출력
       try { await withTimeout((ctx as any).setSinkId(id)); this.outputInfo = { ok: true, via: 'context' }; }
       catch (e) { this.outputInfo = { ok: false, via: 'context', error: e instanceof Error ? e.message : String(e) }; }
       return;
@@ -426,7 +428,7 @@ export class AudioEngine {
       this.monEl = el;
     }
     try {
-      if (id && typeof (this.monEl as any).setSinkId === 'function') await withTimeout((this.monEl as any).setSinkId(id));
+      if (typeof (this.monEl as any).setSinkId === 'function' && ((this.monEl as any).sinkId ?? '') !== id) await withTimeout((this.monEl as any).setSinkId(id));
       await this.monEl.play().catch(() => {});
       this.outputInfo = { ok: true, via: 'element' };
     } catch (e) { this.outputInfo = { ok: false, via: 'element', error: e instanceof Error ? e.message : String(e) }; }
