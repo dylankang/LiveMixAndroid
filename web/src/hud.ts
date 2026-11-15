@@ -136,12 +136,12 @@ function paintCount(st: MixState, i: ReceiverInfo) {
   glasses.setCooldownCount(n);
 }
 
-// 👓 안경 다리 더블탭 → PC 분석기에 '쿨다운 전체 초기화' 명령 (길게 누르기 = 종료 확인)
-glasses.onDoubleTap = () => {
+// 👓 안경 다리 한 번 터치 → PC 분석기에 '쿨다운 전체 초기화' 명령 (길게 누르기 = 종료 확인)
+glasses.onTap = () => {
   if (!isCode(linkCode())) return;
   rx.sendCommand('resetCooldown');
   const s = $('status');
-  s.textContent = '👓 더블탭: 쿨다운 초기화 요청을 보냈습니다';
+  s.textContent = '👓 터치: 쿨다운 초기화 요청을 보냈습니다';
   paintCdCount(0); glasses.setCooldownCount(0);       // 바로 반영 (PC 상태가 오면 다시 맞춰짐)
 };
 

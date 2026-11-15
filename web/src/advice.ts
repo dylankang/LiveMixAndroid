@@ -70,7 +70,33 @@ export function normalizeAdvice(line: string): { inst: string; item: string; act
     if (!HAS_FREQ.test(all) && !/dB/i.test(all)) return null;
     item = 'EQ'; action = all;
   } else item = normalizeItem(item);
+  if (item !== 'EQ') action = toArrows(item, action);
   return { inst, item, action };
+}
+
+/**
+ * EQ 를 뺀 분류는 정확한 숫자 대신 방향만: ↑ = 올림/늘림, ↓ = 낮춤/줄임 (Pan 은 ← →)
+ *  예) HPF:100Hz 올림 → HPF:↑ · Comp:레시오 낮춤 → Comp:레시오 ↓ · Level:+2dB → Level:↑ · Reverb:디케이 축소 → Reverb:디케이 ↓
+ */
+export function toArrows(item: string, action: string): string {
+  let a = action;
+  if (item === 'Level' && !/[↑↓]/.test(a)) {
+    const m = a.match(/([+\-−])\s*\d+(?:\.\d+)?\s*dB/i);
+    if (m) a = a.replace(m[0], m[1] === '+' ? '↑' : '↓');
+  }
+  a = a
+    .replace(/(올리|올려|올림|높이|높여|높임|늘리|늘려|늘림|키우|키워|키움|증가|강화|더\s*세게|up)\S*/gi, '↑')
+    .replace(/(내리|내려|내림|낮추|낮춰|낮춤|줄이|줄여|줄임|감소|축소|약하게|down)\S*/gi, '↓');
+  if (/[↑↓←→]/.test(a)) {
+    // 방향이 있으면 부정확한 수치(100Hz, 3:1, -3dB, 30ms …)는 지운다
+    const P = '(?:으로|로|까지|정도|쯤|가량|에서|에)?';
+    a = a.replace(new RegExp(`[+\\-−]?\\d+(?:\\.\\d+)?\\s*:\\s*\\d+${P}`, 'g'), '')
+      .replace(new RegExp(`[+\\-−]?\\d+(?:\\.\\d+)?\\s*(?:kHz|Hz|dB|ms|%|초)${P}`, 'gi'), '')
+      .replace(/(^|\s)(설정|조정|변경|정도)(?=\s|$)/g, ' ');
+    a = a.replace(/\s*([↑↓←→])\s*/g, ' $1').replace(/\s{2,}/g, ' ').trim();
+    a = a.replace(/([↑↓←→])(?:\s*\1)+/g, '$1$1').replace(/(↑↑|↓↓)\1+/g, '$1');
+  }
+  return a.trim();
 }
 
 /** "[악기] 항목:조치" 를 나눈다 */
@@ -101,7 +127,7 @@ export function keyOf(line: string, scope: CooldownScope = 'standard'): string {
   if (scope === 'strict') return base;
   const band = bandOfAction(a.action);
   if (band) return `${base}|${band}`;
-  if (a.item === 'Level') return `${base}|${/^-|−|줄|낮|다운|down/i.test(a.action) ? '-' : '+'}`;
+  if (a.item === 'Level') return `${base}|${/^-|−|줄|낮|다운|down|↓/i.test(a.action) ? '-' : '+'}`;
   const word = a.action.replace(/[+\-−]?\d+(\.\d+)?\s*(dB|ms|s|%|:1)?/gi, '').trim().split(/\s+/)[0] ?? '';
   return word ? `${base}|${word}` : base;
 }

@@ -59,7 +59,7 @@ export function paintCdCount(n: number) {
   if (!el) return;
   el.hidden = !(n > 0);
   el.textContent = n > 0 ? `⏳ ${n}` : '';
-  el.title = n > 0 ? `쿨다운 중인 조언 ${n}개 · 안경 다리 더블탭으로 초기화` : '';
+  el.title = n > 0 ? `쿨다운 중인 조언 ${n}개 · 안경 다리 한 번 터치로 초기화` : '';
 }
 
 export function genreText(genre: string, genreAt: number): string {

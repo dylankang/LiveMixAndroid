@@ -416,17 +416,46 @@ engine.setAutoTrim(trimSaved());
 applyGate();
 paintToggles();
 
-/** 쿨다운 전체 초기화 (버튼 · 안경 다리 더블탭 공통) */
+// ───────── 📜 조언 히스토리 (분석기 화면 전용 · 최신이 위 · 브라우저에 최근 500개 보관) ─────────
+interface HistItem { at: number; text: string; genre: string }
+const HIST_MAX = 500;
+let history: HistItem[] = (() => {
+  try { const a = JSON.parse(ls.get('lm.history', '[]')); return Array.isArray(a) ? a.filter(x => x && typeof x.text === 'string').slice(-HIST_MAX) : []; } catch { return []; }
+})();
+const hhmmss = (t: number) => { const d = new Date(t), p = (n: number) => String(n).padStart(2, '0'); return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; };
+const escH = (t: string) => t.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
+function renderHistory() {
+  const box = $('history');
+  $('histCount').textContent = `(${history.length}건)`;
+  if (!history.length) { box.innerHTML = '<div class="hempty">아직 조언이 없습니다. 분석을 시작하면 표시된 조언이 여기에 쌓입니다.</div>'; return; }
+  const atTop = box.scrollTop < 8;
+  box.innerHTML = history.slice().reverse().map(h =>
+    `<div class="hrow"><span class="ht">${hhmmss(h.at)}</span>${escH(h.text)}${h.genre ? `<span class="hg">${escH(h.genre)}</span>` : ''}</div>`).join('');
+  if (atTop) box.scrollTop = 0;                 // 맨 위를 보고 있을 때만 새 조언으로 따라감 (아래로 스크롤해 읽는 중이면 그대로)
+}
+function addHistory(texts: string[]) {
+  if (!texts.length) return;
+  const g = genre?.kind === 'music' ? genre.category : genre?.kind === 'solo' ? `Solo ${genre.instrument ?? ''}`.trim() : genre?.kind === 'speech' ? '스피치' : '';
+  const now = Date.now();
+  texts.forEach(text => history.push({ at: now, text, genre: g }));
+  if (history.length > HIST_MAX) history = history.slice(-HIST_MAX);
+  ls.set('lm.history', JSON.stringify(history));
+  renderHistory();
+}
+$('histClear').onclick = () => { history = []; ls.set('lm.history', '[]'); renderHistory(); };
+renderHistory();
+
+/** 쿨다운 전체 초기화 (버튼 · 안경 다리 터치 공통) */
 function resetAllCooldown(from: 'button' | 'glasses') {
   advice.resetCooldown(); renderCooldown();
-  setStatus(from === 'glasses' ? '👓 안경 더블탭 → 쿨다운 전체 초기화됨' : '쿨다운 전체 초기화됨');
+  setStatus(from === 'glasses' ? '👓 안경 터치 → 쿨다운 전체 초기화됨' : '쿨다운 전체 초기화됨');
   sender.publish();
 }
 $('resetBtn').onclick = () => resetAllCooldown('button');
-// 수신기(Even G2 · ?mode=hud)에서 안경 다리를 두 번 터치하면 명령이 온다
+// 수신기(Even G2 · ?mode=hud)에서 안경 다리를 한 번 터치하면 명령이 온다
 sender.onCommand = cmd => { if (cmd === 'resetCooldown') resetAllCooldown('glasses'); };
 // 분석기 페이지 자체가 Even Hub 안에서 열려 안경에 직접 연결된 경우
-glasses.onDoubleTap = () => resetAllCooldown('glasses');
+glasses.onTap = () => resetAllCooldown('glasses');
 
 // ───────── 렌더링 (폰 + 글래스 5줄 동기화) ─────────
 function genreLabel(): string {
@@ -832,6 +861,7 @@ async function analyze() {
     const res = parseReply(raw);
     if (res.genre) { acceptGenre(res.genre); genreAt = Date.now(); paintGenre(); sender.update({ genre: badgeForSend(), genreAt }); }
     const added = genreOnly ? [] : advice.ingest(res.advice, Date.now());
+    addHistory(added.map(a => a.text));
     const text = raw.trim().replace(/\s+/g, ' ');
     setAiLast(`${gateInfo}\nAI 응답(${new Date().toLocaleTimeString()}): ${text || '(빈 응답)'}`);
     setStatus(genreOnly ? `${solo ? 'Solo' : '밸런스'} 양호 · 조언 생략 (장르만 갱신)`

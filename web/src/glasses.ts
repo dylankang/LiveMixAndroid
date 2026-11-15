@@ -12,7 +12,7 @@ const LH = Math.floor(H / LINES); // 줄당 57px → 항상 정확히 5줄
 /** 1번째 줄 오른쪽 위의 쿨다운 개수 칸 */
 const BADGE_W = 120;
 const BADGE_ID = LINES + 1;
-const DOUBLE_TAP_GAP_MS = 1200;   // 더블탭 이벤트가 겹쳐 와도 한 번만 처리
+const TAP_GAP_MS = 1200;   // 탭 이벤트가 겹쳐 와도 한 번만 처리
 
 export type GlassesState = 'waiting' | 'ready' | 'text-fallback' | 'failed';
 
@@ -31,9 +31,9 @@ export class Glasses {
   private lastText = '';
   state: GlassesState = 'waiting';
   onState: (s: GlassesState, detail?: string) => void = () => {};
-  /** 안경 다리(터치패드) 더블탭 */
-  onDoubleTap: () => void = () => {};
-  private lastDouble = 0;
+  /** 안경 다리(터치패드) 한 번 터치 */
+  onTap: () => void = () => {};
+  private lastTap = 0;
   /** 오른쪽 위 쿨다운 개수 칸: 'box' = 별도 컨테이너 · 'inline' = 1번째 줄 끝에 붙여 표시 */
   private badgeMode: 'box' | 'inline' = 'box';
   private badge = '';
@@ -92,15 +92,17 @@ export class Glasses {
 
     try {
       const L = OsEventTypeList as any;
-      const DOUBLE = L?.DOUBLE_CLICK_EVENT ?? 3, LONG = L?.LONG_PRESS_EVENT ?? 9;
+      const CLICK = L?.CLICK_EVENT ?? 0, LONG = L?.LONG_PRESS_EVENT ?? 9;
       bridge.onEvenHubEvent?.((ev: any) => {
-        const t = ev?.textEvent?.eventType ?? ev?.listEvent?.eventType ?? ev?.sysEvent?.eventType;
-        if (t === undefined || t === null) return;
-        if (t === DOUBLE) {                     // 안경 다리 더블탭 → 쿨다운 목록 초기화
+        const e = ev?.textEvent ?? ev?.listEvent ?? ev?.sysEvent;
+        if (!e) return;
+        // 한 번 터치(CLICK_EVENT = 0)는 eventType 이 비어서(undefined) 오는 경우도 있다 (SDK 문서)
+        const t = e.eventType ?? CLICK;
+        if (t === CLICK) {                      // 안경 다리 한 번 터치 → 쿨다운 목록 초기화
           const now = Date.now();
-          if (now - this.lastDouble < DOUBLE_TAP_GAP_MS) return;
-          this.lastDouble = now;
-          try { this.onDoubleTap(); } catch (e) { console.warn('더블탭 처리 실패', e); }
+          if (now - this.lastTap < TAP_GAP_MS) return;
+          this.lastTap = now;
+          try { this.onTap(); } catch (err) { console.warn('터치 처리 실패', err); }
         } else if (t === LONG) {                // 길게 누르기 → 시스템 종료 확인 창 (루트 페이지는 shutDownPageContainer(1) 로 종료)
           bridge.shutDownPageContainer(1);
         }
