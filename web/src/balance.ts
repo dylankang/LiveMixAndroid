@@ -8,8 +8,10 @@ export const LF_CORNER_HZ = 80;
 /** Crest Factor 정상 범주(dB) */
 export const CREST_RANGE = { min: 6, max: 18 } as const;
 
-/** 조언 민감도 슬라이더: 허용 편차(±dB). 작을수록 예민 */
-export const TOL_RANGE = { min: 2, max: 10, step: 0.5, default: 8 } as const;
+/** 조언 민감도 슬라이더: 허용 편차(±dB). 작을수록 예민. 0 = 로컬 필터 없이 매번 AI 로 보내는 '항상 AI' 모드 */
+export const TOL_RANGE = { min: 0, max: 10, step: 0.5, default: 8 } as const;
+/** 이 값 이하면 로컬 사전 필터를 건너뛰고 분석 주기마다 무조건 AI 호출 */
+export const ALWAYS_AI_TOL = 0;
 
 /** 타겟 PSD(f) ∝ f^-β (β = slope/3.0103), LF_CORNER 아래는 f^2로 감쇠. 밴드별 에너지(dB)를 수치적분 후 평균 0으로 정규화 */
 function targetBandDb(slope: number): number[] {

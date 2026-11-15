@@ -1,5 +1,4 @@
 import { BANDS, FB, fbParamsFor } from './config';
-import type { AsioBridge } from './asio';
 
 /** 드롭다운 기본값: deviceId 지정 없이 OS 기본 입력(연결된 USB 인터페이스 우선)을 연다 */
 export const DEFAULT_INPUT_ID = 'default';
@@ -16,13 +15,12 @@ const NO_MIC_MSG = '이 페이지에서는 마이크를 사용할 수 없습니�
 export const micAvailable = () => !!navigator.mediaDevices?.getUserMedia;
 /** 노이즈 게이트: 기본 임계값(dBFS)과 무음 대기 진입 시간 */
 export const GATE = { defaultDb: -50, minDb: -70, maxDb: -20, enterMs: 2500, exitTicks: 2 } as const;
-/** 브라우저 입력에서 요청하는 최대 채널 수 (다채널 인터페이스의 모든 입력을 연다 · ASIO 는 드라이버가 알려 주는 채널 수를 제한 없이 사용) */
+/** WDM(브라우저 표준) 입력에서 요청하는 최대 채널 수 (다채널 인터페이스의 모든 입력을 연다) */
 export const MAX_CHANNELS = 64;
 
 /**
- * AudioWorklet 모듈 (한 번에 등록)
+ * AudioWorklet 모듈
  *  · lm-clock : 100ms 마다 { type:'tick', rms, peak } 를 메인 스레드로 보내는 마스터 클럭 (입력 L/R 레벨도 직접 측정)
- *  · lm-asio  : ASIO 브릿지가 보낸 Float32 인터리브 스테레오 PCM 을 링버퍼에 쌓아 2채널로 출력 (지연 약 0.1초 유지)
  */
 const WORKLET_SRC = `
 class LmClock extends AudioWorkletProcessor {
@@ -52,33 +50,7 @@ class LmClock extends AudioWorkletProcessor {
     return true;
   }
 }
-registerProcessor('lm-clock', LmClock);
-
-class LmAsio extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this.cap = Math.round(sampleRate * 2); this.buf = new Float32Array(this.cap * 2);
-    this.w = 0; this.r = 0; this.n = 0; this.primed = false;
-    this.target = Math.round(sampleRate * 0.1);
-    this.port.onmessage = e => {
-      const d = new Float32Array(e.data), frames = d.length >> 1;
-      if (this.n + frames > this.cap) { const drop = this.n + frames - this.cap; this.r = (this.r + drop) % this.cap; this.n -= drop; }
-      for (let i = 0; i < frames; i++) { const k = this.w * 2; this.buf[k] = d[2 * i]; this.buf[k + 1] = d[2 * i + 1]; this.w = (this.w + 1) % this.cap; }
-      this.n += frames;
-    };
-  }
-  process(_inputs, outputs) {
-    const out = outputs[0], L = out[0], R = out[1] || out[0];
-    if (!this.primed) { if (this.n < this.target) return true; this.primed = true; }
-    if (this.n > this.target * 4) { const drop = this.n - this.target; this.r = (this.r + drop) % this.cap; this.n -= drop; }   // 지연이 쌓이면 따라잡기
-    for (let i = 0; i < L.length; i++) {
-      if (this.n > 0) { const k = this.r * 2; L[i] = this.buf[k]; R[i] = this.buf[k + 1]; this.r = (this.r + 1) % this.cap; this.n--; }
-      else { L[i] = 0; R[i] = 0; this.primed = false; }
-    }
-    return true;
-  }
-}
-registerProcessor('lm-asio', LmAsio);registerProcessor('lm-clock', LmClock);`;
+registerProcessor('lm-clock', LmClock);`;
 
 /** 마이크 권한 팝업을 띄워 승인받는다 (승인 후에야 enumerateDevices 가 실제 장치 이름/ID를 돌려줌) */
 export async function requestMicPermission(): Promise<void> {
@@ -184,11 +156,7 @@ export class AudioEngine {
   /** 입력 라우팅: 장치의 N 채널 중 L/R 로 쓸 채널 (0부터) */
   private split?: ChannelSplitterNode;
   private merge?: ChannelMergerNode;
-  private asio?: AsioBridge;
-  private asioNode?: AudioWorkletNode;
   route = { l: 0, r: 1 };
-  /** 입력 종류: 브라우저 장치 / ASIO 브릿지 */
-  kind: 'browser' | 'asio' = 'browser';
   /** 장치가 실제로 연 입력 채널 수 */
   deviceChannels = 0;
   private srcCount = { analyser: 0, cached: 0 };
@@ -229,18 +197,16 @@ export class AudioEngine {
   ctxState = '';
 
   /**
-   * 입력 시작.
-   *  · browser: getUserMedia(EC/NS/AGC OFF · 최대 32채널 · 3단계 Fallback) → ChannelSplitter(N) → 선택한 L/R → ChannelMerger(2)
-   *  · asio   : 로컬 ASIO 브릿지가 보내는 L/R PCM → AudioWorklet(lm-asio) 2채널 출력
-   * 이후 분석 경로(Auto-Trim · L/R 미터 · 6밴드 · FFT · 지표)는 두 경로가 같다.
+   * 입력 시작 (WDM/브라우저 표준 입력 장치):
+   *  getUserMedia(EC/NS/AGC OFF · 최대 64채널 · 3단계 Fallback) → ChannelSplitter(N) → 선택한 L/R → ChannelMerger(2)
+   *  → 분석 경로(Auto-Trim · L/R 미터 · 6밴드 · FFT · 지표)
    */
-  async start(opt: { kind: 'browser'; deviceId?: string; l: number; r: number } | { kind: 'asio'; bridge: AsioBridge; device: number; l: number; r: number }) {
+  async start(opt: { deviceId?: string; l: number; r: number }) {
     await this.stop();
-    this.kind = opt.kind;
     this.route = { l: Math.max(0, opt.l | 0), r: Math.max(0, opt.r | 0) };
     let ctx: AudioContext;
     let input: AudioNode;
-    if (opt.kind === 'browser') {
+    {
       let id = opt.deviceId, usb = false;
       if (!id || id === DEFAULT_INPUT_ID) {
         const u = await findUsbInput().catch(() => null);
@@ -268,24 +234,6 @@ export class AudioEngine {
       this.split = split; this.merge = merge;
       this.applyRoute();
       input = merge;
-    } else {
-      const bridge = opt.bridge;
-      const o = await bridge.open(opt.device, this.route.l, this.route.r);
-      this.asio = bridge;
-      this.deviceChannels = o.channels;
-      this.route = { l: o.l, r: o.r };
-      this.openInfo = { step: 1, label: `[ASIO] ${o.name}`, settings: { sampleRate: o.sampleRate, channelCount: o.channels }, usb: false };
-      this.usbPicked = false;
-      try { ctx = new AudioContext({ latencyHint: 'interactive', sampleRate: o.sampleRate }); }
-      catch { ctx = new AudioContext({ latencyHint: 'interactive' }); }   // 샘플레이트 지정 불가 → 기본값 (브라우저가 재샘플링하지 않으므로 피치 오차 가능)
-      if (!ctx.audioWorklet) { bridge.close(); throw new Error('이 브라우저는 AudioWorklet 을 지원하지 않아 ASIO 입력을 쓸 수 없습니다'); }
-      await this.loadWorklets(ctx);
-      const node = new AudioWorkletNode(ctx, 'lm-asio', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
-      bridge.onPcm = buf => { try { node.port.postMessage(buf, [buf]); } catch { /* ignore */ } };
-      bridge.onLost = () => { if (this.running) this.onEnded(); };
-      this.asioNode = node;
-      this.src = node;
-      input = node;
     }
     this.channels = 2;   // 분석 경로는 항상 L/R 2채널 (모노 선택 시 L=R)
 
@@ -368,8 +316,7 @@ export class AudioEngine {
     this.running = false;
     if (this.sp) { this.sp.onaudioprocess = null; try { this.sp.disconnect(); } catch { /* ignore */ } }
     if (this.clockNode) { this.clockNode.port.onmessage = null; try { this.clockNode.disconnect(); } catch { /* ignore */ } }
-    if (this.asio) { this.asio.onPcm = () => {}; this.asio.onLost = () => {}; if (this.asio.opened) this.asio.close(); }
-    this.asio = undefined; this.asioNode = undefined; this.split = undefined; this.merge = undefined;
+    this.split = undefined; this.merge = undefined;
     this.stream?.getTracks().forEach(t => t.stop());
     await this.ctx?.close().catch(() => {});
     this.ctx = undefined; this.stream = undefined; this.src = undefined; this.bandAn = [];
@@ -404,8 +351,7 @@ export class AudioEngine {
     const n = this.deviceChannels || MAX_CHANNELS;
     this.route = { l: Math.min(Math.max(0, l | 0), n - 1), r: Math.min(Math.max(0, r | 0), n - 1) };
     if (!this.running) return;
-    if (this.kind === 'asio') this.asio?.route(this.route.l, this.route.r);
-    else this.applyRoute();
+    this.applyRoute();
     this.resetAccum();
   }
   private applyRoute() {

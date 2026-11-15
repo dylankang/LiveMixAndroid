@@ -98,7 +98,6 @@ dialog#settings::backdrop { background:rgba(0,0,0,.7); }
 .presets { display:flex; gap:6px; flex-wrap:wrap; margin:4px 0; }
 .presets button { width:auto; flex:0 0 auto; padding:6px 14px; font-size:.85rem; }
 .presets button.active { border-color:#39ff7a; color:#b9ffd0; }
-#asioBadge { font-size:.75rem; margin-left:6px; vertical-align:middle; cursor:help; }
 #routeInfo { white-space:pre-line; }
 /* 수신기: 연결 코드 · 키패드 · PC 신호 경고 */
 .rxcode { display:flex; align-items:center; gap:10px; margin:6px 0; }
@@ -111,3 +110,4 @@ dialog#settings::backdrop { background:rgba(0,0,0,.7); }
 .keypad .kp-grid { display:grid; grid-template-columns:repeat(3, minmax(64px, 96px)); gap:10px; }
 .keypad .kp-grid button { font-size:1.8rem; padding:14px 0; border-radius:14px; }
 .keypad .kp-msg { min-height:1.2em; color:#9fb4c8; font-size:.9rem; text-align:center; }
+#tolInfo.always { color:#39ff7a; font-weight:700; }

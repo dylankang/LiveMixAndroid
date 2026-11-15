@@ -1,8 +1,7 @@
 import { AudioEngine, type BandStat, listInputs, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE, MAX_CHANNELS } from './audio';
-import { AsioBridge, ASIO_URL } from './asio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
 import { callAI, parseReply, buildSystemPrompt, isQuotaError, type Genre } from './ai';
-import { evaluateBalance, TOL_RANGE } from './balance';
+import { evaluateBalance, TOL_RANGE, ALWAYS_AI_TOL } from './balance';
 import { fbParamsFor } from './config';
 import { Glasses } from './glasses';
 import { HudSender, HudReceiver, linkWatchdog, linesToShow, genCode, isCode, setLinkCode, linkCode, type BandRow, type LevelPkt, type MixState, type ReceiverInfo } from './link';
@@ -24,7 +23,6 @@ const ls = {
 }
 
 const engine = new AudioEngine();
-const asio = new AsioBridge();
 const advice = new AdviceManager();
 const glasses = new Glasses();
 const sender = new HudSender();
@@ -143,10 +141,14 @@ let intervalSec = clamp(Math.round(parseFloat(ls.get('lm.interval', String(INTER
 {
   const tol = $<HTMLInputElement>('tolSlider'), fb = $<HTMLInputElement>('fbSlider'), it = $<HTMLInputElement>('intSlider');
   tol.min = '0'; tol.max = String(Math.round((TOL_RANGE.max - TOL_RANGE.min) / TOL_RANGE.step));
-  $('tolLo').textContent = `둔감 ±${TOL_RANGE.max}dB`; $('tolMid').textContent = `보통 ±${(TOL_RANGE.max + TOL_RANGE.min) / 2}dB`; $('tolHi').textContent = `예민 ±${TOL_RANGE.min}dB`;
+  $('tolLo').textContent = `둔감 ±${TOL_RANGE.max}dB`; $('tolMid').textContent = `보통 ±${(TOL_RANGE.max + TOL_RANGE.min) / 2}dB`; $('tolHi').textContent = `±${TOL_RANGE.min}dB 항상 AI`;
   it.min = String(INTERVAL_RANGE.min); it.max = String(INTERVAL_RANGE.max); it.step = String(INTERVAL_RANGE.step);
   $('intLo').textContent = `${INTERVAL_RANGE.min}초`; $('intHi').textContent = `${INTERVAL_RANGE.max}초`;
-  const paintTol = () => { $('tolInfo').textContent = `허용 편차 ±${tolDb}dB`; };
+  const paintTol = () => {
+    const always = tolDb <= ALWAYS_AI_TOL;
+    $('tolInfo').textContent = always ? '±0dB · 항상 AI 전송 (로컬 필터 없음)' : `허용 편차 ±${tolDb}dB`;
+    $('tolInfo').classList.toggle('always', always);
+  };
   const paintFb = () => {
     const p = fbParamsFor(fbSens / 100);
     $('fbInfo').textContent = `돌출 ${p.prominenceDb.toFixed(0)}dB · ${(p.confirmScans / 10).toFixed(1)}초 · ${p.minLevelDb.toFixed(0)}dBFS`;
@@ -199,7 +201,7 @@ let gateOn = ls.get('lm.gateOn2', '0') === '1';   // 기본 OFF: 낮은 레벨�
 }
 function applyGate() { engine.setGate(gateOn, gateDb); }
 
-// ───────── 2) 오디오 입력: 장치(브라우저 / ASIO 브릿지) + 입력 채널(L/R) 라우팅 ─────────
+// ───────── 2) 오디오 입력: WDM(브라우저 표준) 장치 + 입력 채널(L/R) 라우팅 ─────────
 /** Auto-Trim 기본 OFF (Raw dBFS). 설정에서 켜면 기억 */
 const trimSaved = () => ls.get('lm.trim.console', '0') === '1';
 
@@ -209,7 +211,6 @@ const chL = $<HTMLSelectElement>('chL');
 const chR = $<HTMLSelectElement>('chR');
 const pairSel = $<HTMLSelectElement>('pairSel');
 const MONO = 'mono';
-const ASIO_PREFIX = 'asio:';
 
 /** 저장된 입력 선택: 장치 값 + 장치 이름(ID 가 바뀌어도 이름으로 복원) + L/R 채널(0부터, R=-1 은 모노) */
 interface SavedInput { device: string; name: string; l: number; r: number }
@@ -226,11 +227,9 @@ function saveInput() {
   saved = { device: deviceSel.value, name: opt?.dataset.name ?? '', l: Number(chL.value) || 0, r: chR.value === MONO ? -1 : Number(chR.value) || 0 };
   ls.set('lm.input', JSON.stringify(saved));
 }
-/** 지금 선택된 장치의 최대 채널 수 (ASIO = 브릿지가 알려 준 드라이버 채널 수(SoundGrid 48/64/128 등 제한 없음), 브라우저 = 실행 중이면 실제로 연 값, 아니면 64) */
+/** 지금 선택된 장치의 최대 채널 수 (실행 중이면 장치가 실제로 연 채널 수, 아니면 64) */
 function maxChannels(): number {
-  const v = deviceSel.value;
-  if (v.startsWith(ASIO_PREFIX)) return asio.devices.find(d => ASIO_PREFIX + d.id === v)?.channels ?? 2;
-  if (running && engine.kind === 'browser' && engine.deviceChannels) return engine.deviceChannels;
+  if (running && engine.deviceChannels) return engine.deviceChannels;
   return MAX_CHANNELS;
 }
 function fillChannels() {
@@ -262,18 +261,13 @@ function paintRouteInfo() {
   let t = `분석 입력: ${pair}`;
   if (running) {
     t += ` · 장치 입력 ${engine.deviceChannels}채널`;
-    if (engine.kind === 'browser' && engine.deviceChannels <= 2)
-      t += '\n※ 브라우저가 2채널만 열었습니다. 다채널 인터페이스의 3번 이후 채널이 필요하면 ASIO 브릿지를 사용하세요.';
-  }
-  // SoundGrid ASIO: 드라이버 채널 수가 48 미만이면 Driver Control Panel 설정 안내
-  const v = deviceSel.value;
-  const ad = v.startsWith(ASIO_PREFIX) ? asio.devices.find(d => ASIO_PREFIX + d.id === v) : undefined;
-  if (ad && /soundgrid|waves/i.test(ad.name)) {
-    t += `\n🌊 SoundGrid ASIO · 드라이버 입력 ${ad.channels}채널 · ${ad.sampleRate / 1000}kHz`;
-    if (ad.channels < 48) t += '\n※ 48채널 이상이 필요하면 SoundGrid Driver Control Panel 에서 채널 수(I/O)를 64 이상으로 올린 뒤 브릿지를 다시 실행하세요.';
+    if (routeClamped)
+      t += `\n※ 고른 채널(${routeClamped})이 장치의 WDM 입력 ${engine.deviceChannels}채널 밖이라 조정했습니다. 더 높은 채널이 필요하면 드라이버 설정에서 WDM 채널 수를 늘려 주세요.`;
   }
   $('routeInfo').textContent = t;
 }
+/** 시작할 때 고른 채널이 장치 채널 수를 넘어 조정됐으면 원래 고른 채널 표시 (아니면 '') */
+let routeClamped = '';
 const onRouteChange = () => {
   saveInput();
   fillChannels();
@@ -315,7 +309,7 @@ let lastBrowserDevs: MediaDeviceInfo[] = [];
 function fillDevices(devs: MediaDeviceInfo[] = lastBrowserDevs) {
   lastBrowserDevs = devs;
   const real = devs.filter(d => d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications');
-  // 사용자가 마지막으로 고른 장치(저장값)를 우선: ASIO 목록이 늦게 도착해도 선택이 기본 장치로 덮어써지지 않게
+  // 사용자가 마지막으로 고른 장치(저장값)를 우선 (ID 가 바뀌었으면 이름으로 찾음)
   const want = saved.device;
   const wantName = saved.name;
   deviceSel.innerHTML = '';
@@ -324,17 +318,8 @@ function fillDevices(devs: MediaDeviceInfo[] = lastBrowserDevs) {
     o.value = value; o.textContent = label; o.dataset.name = name;
     parent.appendChild(o);
   };
-  if (asio.state === 'on' && asio.devices.length) {
-    const g = document.createElement('optgroup');
-    g.label = 'ASIO 브릿지 (localhost:9876)';
-    asio.devices.forEach(d => add(g, ASIO_PREFIX + d.id, `[ASIO] ${d.name} · ${d.channels}ch`, `[ASIO] ${d.name}`));
-    deviceSel.appendChild(g);
-  }
-  const g2 = document.createElement('optgroup');
-  g2.label = '브라우저 오디오 입력 (WASAPI / CoreAudio)';
-  add(g2, DEFAULT_INPUT_ID, DEFAULT_LABEL, '');
-  real.forEach((d, i) => add(g2, d.deviceId, d.label || `입력 ${i + 1}`, d.label || ''));
-  deviceSel.appendChild(g2);
+  add(deviceSel, DEFAULT_INPUT_ID, DEFAULT_LABEL, '');
+  real.forEach((d, i) => add(deviceSel, d.deviceId, d.label || `입력 ${i + 1}`, d.label || ''));
   const opts = [...deviceSel.options];
   const hit = opts.find(o => o.value === want) ?? (wantName ? opts.find(o => o.dataset.name === wantName) : undefined);
   deviceSel.value = hit ? hit.value : DEFAULT_INPUT_ID;
@@ -351,7 +336,7 @@ findBtn.onclick = async () => {
     await refreshDevices(true);
     clearError();
     const n = lastBrowserDevs.filter(d => d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications').length;
-    setStatus(`브라우저 입력 ${n}개${asio.state === 'on' ? ` · ASIO ${asio.devices.length}개` : ''} 찾음`);
+    setStatus(`WDM 입력 장치 ${n}개 찾음`);
   } catch (e) {
     showError(describeError(e));
     try { fillDevices(await listInputs()); } catch { /* ignore */ }
@@ -367,19 +352,6 @@ deviceSel.onchange = async () => {
 };
 try { navigator.mediaDevices?.addEventListener?.('devicechange', () => { refreshDevices().catch(() => {}); }); } catch { /* ignore */ }
 
-// 🎛️ ASIO 브릿지 연결 상태 배지 (연결되면 장치 목록 상단에 [ASIO] 장치가 자동으로 나타남)
-function paintAsio() {
-  const b = $('asioBadge');
-  const on = asio.state === 'on';
-  b.className = `pill ${on ? 'live' : 'off'}`;
-  b.textContent = on ? `🟢 ASIO 브릿지 연결됨 · 장치 ${asio.devices.length}개` : '⚪ ASIO 브릿지 미연결';
-  b.title = on ? `${ASIO_URL} 연결됨. 장치 목록 맨 위의 [ASIO] 항목을 고르세요.`
-    : `ASIO 장치를 쓰려면 PC에서 asio-bridge/bridge.py 를 실행하세요 (${ASIO_URL}). 실행하면 자동으로 연결됩니다.`;
-  $('asioHint').hidden = on;
-}
-asio.onChange = () => { paintAsio(); fillDevices(); };
-asio.start();
-paintAsio();
 fillDevices([]);
 refreshDevices().catch(() => {});
 
@@ -479,7 +451,7 @@ $('cdList').addEventListener('click', e => {
 // ───────── 오디오 시작/정지 ─────────
 const modeName = () => {
   const { l, r } = engine.running ? engine.route : routeLR();
-  return `🎛️ 콘솔 2-Track (${engine.kind === 'asio' ? 'ASIO' : '브라우저'} · ${l === r ? `Ch ${l + 1} 모노` : `Ch ${l + 1}-${r + 1}`})`;
+  return `🎛️ 콘솔 2-Track (WDM · ${l === r ? `Ch ${l + 1} 모노` : `Ch ${l + 1}-${r + 1}`})`;
 };
 
 async function startAudio() {
@@ -487,9 +459,9 @@ async function startAudio() {
   applyGate();
   const v = deviceSel.value || DEFAULT_INPUT_ID;
   const { l, r } = routeLR();
-  if (v.startsWith(ASIO_PREFIX)) await engine.start({ kind: 'asio', bridge: asio, device: Number(v.slice(ASIO_PREFIX.length)), l, r });
-  else await engine.start({ kind: 'browser', deviceId: v, l, r });
-  if (engine.kind === 'browser') await refreshDevices().catch(() => {});   // 권한 승인 직후: 실제 장치 이름으로 목록 갱신
+  await engine.start({ deviceId: v, l, r });
+  routeClamped = engine.route.l !== l || engine.route.r !== r ? (l === r ? `Ch ${l + 1}` : `Ch ${l + 1}-${r + 1}`) : '';
+  await refreshDevices().catch(() => {});   // 권한 승인 직후: 실제 장치 이름으로 목록 갱신
   // 장치 채널 수 때문에 엔진이 채널 번호를 조정했으면 화면·저장값도 실제 라우팅에 맞춤
   {
     const er = engine.route, mono = er.l === er.r;
@@ -500,13 +472,11 @@ async function startAudio() {
 
   const info = engine.openInfo, st = info?.settings;
   const parts: string[] = [];
-  parts.push(`${modeName()} · ${info?.label || '기본 장치'} · 장치 입력 ${engine.deviceChannels || '?'}채널${engine.kind === 'browser' ? ` · ${info?.step ?? 1}차 방식으로 열림` : ` · ${st?.sampleRate ?? '?'}Hz`}`);
+  parts.push(`${modeName()} · ${info?.label || '기본 장치'} · 장치 입력 ${engine.deviceChannels || '?'}채널${` · ${st?.sampleRate ?? '?'}Hz · ${info?.step ?? 1}차 방식으로 열림`}`);
   if (info?.usb) parts.push('🔌 USB 오디오 인터페이스를 우선 연결했습니다');
   parts.push(gateOn ? `🚪 노이즈 게이트 ${gateDb} dBFS · ${GATE.enterMs / 1000}초 이상 무음이면 대기` : '🚪 노이즈 게이트 OFF (무음에도 계속 분석)');
-  if (engine.kind === 'browser') {
-    if (info?.step === 3) parts.push('⚠ 기본 모드로 열림: OS 음성 보정(에코 제거/노이즈 억제/AGC)이 켜져 있을 수 있습니다');
-    else if (st && (st.echoCancellation || st.noiseSuppression || st.autoGainControl)) parts.push('⚠ 브라우저가 음성 보정을 끄지 못했습니다 (EC/NS/AGC 일부 ON)');
-  }
+  if (info?.step === 3) parts.push('⚠ 기본 모드로 열림: OS 음성 보정(에코 제거/노이즈 억제/AGC)이 켜져 있을 수 있습니다');
+  else if (st && (st.echoCancellation || st.noiseSuppression || st.autoGainControl)) parts.push('⚠ 브라우저가 음성 보정을 끄지 못했습니다 (EC/NS/AGC 일부 ON)');
   if (engine.state !== 'running') parts.push('⚠ 오디오 엔진이 대기 상태입니다. 화면을 한 번 클릭해 주세요');
   $('inputInfo').textContent = parts.join('\n');
   paintToggles();
@@ -703,7 +673,8 @@ async function analyze() {
   showBands(bandRows(bands, solo ? null : ev.deltas));
   const modeInfo = `입력: ${modeName()}${engine.autoTrim ? ` (Auto-Trim ${engine.trimDb >= 0 ? '+' : ''}${engine.trimDb}dB)` : ' (Raw)'}`
     + ` · 신호: ${solo ? 'Solo(PFL) 추정' : 'Full Mix'} · 활성 ${ev.signal.activeBands.length}/6 (${ev.signal.activeBands.join(', ') || '없음'})`;
-  if (ev.pass) {
+  const alwaysAi = tol <= ALWAYS_AI_TOL;            // ±0dB: 로컬 필터를 건너뛰고 매 주기 AI 로 보냄
+  if (ev.pass && !alwaysAi) {
     setStatus(`${solo ? 'Solo' : '밸런스'} 양호 · AI 호출 생략 (NONE)`);
     setAiLast(`${modeInfo}\n로컬 필터 통과 → AI 호출 안 함`);
     return;
@@ -714,7 +685,8 @@ async function analyze() {
   const over = solo
     ? [ev.crestOk ? '협대역 피크' : 'Crest 범위 밖']
     : Object.entries(ev.deltas).filter(([, d]) => Math.abs(d) > tol).map(([n, d]) => `${n} ${d > 0 ? '+' : ''}${d}`);
-  const gateInfo = `${modeInfo}\n측정: ${srcStat.analyser}틱${srcStat.cached ? ` (무음 캐시 대체 ${srcStat.cached}틱)` : ''}\n필터 초과: ` + (over.length ? over.join(', ') : 'Crest 범위 밖');
+  const gateInfo = `${modeInfo}\n측정: ${srcStat.analyser}틱${srcStat.cached ? ` (무음 캐시 대체 ${srcStat.cached}틱)` : ''}\n`
+    + (alwaysAi ? '항상 AI 전송 모드 (조언 민감도 ±0dB · 로컬 필터 생략)' : '필터 초과: ' + (over.length ? over.join(', ') : 'Crest 범위 밖'));
 
   inFlight = true;
   const bandData = Object.fromEntries(Object.entries(bands).map(([n, b]) => [n, {
@@ -726,6 +698,7 @@ async function analyze() {
   const payload = {
     windowSec,
     toleranceDb: tol,
+    alwaysSend: alwaysAi,
     inputMode: 'console-2track-raw',
     levelReference: engine.autoTrim ? `auto-trim normalized to ${TRIM.targetDb} dBFS (absolute level not meaningful)` : 'raw dBFS from console',
     captureNote: captureNote(),
@@ -769,7 +742,7 @@ async function analyze() {
 /** AI 에 알려 줄 수음 경로 특성 */
 function captureNote(): string {
   const { l, r } = engine.route;
-  return `콘솔 2트랙 매트릭스 출력 직결 (${engine.kind === 'asio' ? 'ASIO' : '브라우저 입력'} · ${l === r ? `Ch ${l + 1} 모노` : `Ch ${l + 1}-${r + 1}`} · Raw)`;
+  return `콘솔 2트랙 매트릭스 출력 직결 (WDM 입력 · ${l === r ? `Ch ${l + 1} 모노` : `Ch ${l + 1}-${r + 1}`} · Raw)`;
 }
 
 function bandRows(b: Record<string, BandStat>, deltas: Record<string, number> | null): BandRow[] {

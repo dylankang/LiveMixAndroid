@@ -1,12 +1,12 @@
 # Live Mix Assistant G2 — PC 분석기 + Even G2 HUD
 
 - **분석기 (PC 브라우저)**: https://dylankang.github.io/LiveMixAndroid/
-  - 오디오 입력: 브라우저 장치(WASAPI/CoreAudio · 최대 32채널 열기 · L/R 채널 선택) 또는 **ASIO 브릿지**(`asio-bridge/`)
+  - 오디오 입력: WDM(브라우저 표준) 입력 장치 · 최대 64채널 열기 · L/R 채널 선택(스테레오 페어 빠른 선택)
   - 콘솔 2트랙 매트릭스 출력을 받아 6밴드·트랜지언트·크레스트·음성비율을 분석하고 Gemini 로 믹싱 조언
 - **수신기 (Even G2 / 폰)**: `https://dylankang.github.io/LiveMixAndroid/?mode=hud&code=XXXX`
   - PC 분석기 상단의 **4자리 연결 코드**로 연결 (클라우드 MQTT · PC 유선 LAN ↔ 폰 5G/LTE 처럼 네트워크가 달라도 됨)
   - 토픽 `livemix/g2/{CODE}/hud` (상태, retain) · `livemix/g2/{CODE}/status` (PC 하트비트 2초)
-- **ASIO 브릿지**: [`asio-bridge/README.md`](asio-bridge/README.md) — `pip install -r asio-bridge/requirements.txt` 후 `python asio-bridge/bridge.py`
+- **조언 민감도**: ±10dB(둔감) ~ ±0dB. ±0dB 는 로컬 필터 없이 분석 주기마다 무조건 AI 로 보내는 '항상 AI' 모드
 
 ---
 
