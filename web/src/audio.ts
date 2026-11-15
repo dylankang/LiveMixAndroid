@@ -16,8 +16,8 @@ const NO_MIC_MSG = '이 페이지에서는 마이크를 사용할 수 없습니�
 export const micAvailable = () => !!navigator.mediaDevices?.getUserMedia;
 /** 노이즈 게이트: 기본 임계값(dBFS)과 무음 대기 진입 시간 */
 export const GATE = { defaultDb: -50, minDb: -70, maxDb: -20, enterMs: 2500, exitTicks: 2 } as const;
-/** 브라우저 입력에서 요청하는 최대 채널 수 (다채널 인터페이스의 모든 입력을 연다) */
-export const MAX_CHANNELS = 32;
+/** 브라우저 입력에서 요청하는 최대 채널 수 (다채널 인터페이스의 모든 입력을 연다 · ASIO 는 드라이버가 알려 주는 채널 수를 제한 없이 사용) */
+export const MAX_CHANNELS = 64;
 
 /**
  * AudioWorklet 모듈 (한 번에 등록)
@@ -105,7 +105,7 @@ export async function findUsbInput(): Promise<MediaDeviceInfo | null> {
 
 /**
  * 3단계 Fallback 으로 입력을 연다.
- *  1차: (실제 ID가 있을 때만 deviceId exact) + 최대 32채널 + EC/NS/AGC OFF
+ *  1차: (실제 ID가 있을 때만 deviceId exact) + 최대 64채널 + EC/NS/AGC OFF
  *       ※ 크롬은 deviceId 를 ideal 로 주면 선택을 무시하고 기본 장치를 열기 때문에 exact 를 쓴다.
  *         ID가 더 이상 유효하지 않으면 여기서 실패하고 2차(ID 제외)로 넘어간다.
  *  2차: deviceId 없이 EC/NS/AGC OFF

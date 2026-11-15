@@ -207,6 +207,7 @@ const deviceSel = $<HTMLSelectElement>('device');
 const findBtn = $<HTMLButtonElement>('findBtn');
 const chL = $<HTMLSelectElement>('chL');
 const chR = $<HTMLSelectElement>('chR');
+const pairSel = $<HTMLSelectElement>('pairSel');
 const MONO = 'mono';
 const ASIO_PREFIX = 'asio:';
 
@@ -225,7 +226,7 @@ function saveInput() {
   saved = { device: deviceSel.value, name: opt?.dataset.name ?? '', l: Number(chL.value) || 0, r: chR.value === MONO ? -1 : Number(chR.value) || 0 };
   ls.set('lm.input', JSON.stringify(saved));
 }
-/** 지금 선택된 장치의 최대 채널 수 (ASIO = 브릿지가 알려 준 값, 브라우저 = 실행 중이면 실제로 연 값, 아니면 32) */
+/** 지금 선택된 장치의 최대 채널 수 (ASIO = 브릿지가 알려 준 드라이버 채널 수(SoundGrid 48/64/128 등 제한 없음), 브라우저 = 실행 중이면 실제로 연 값, 아니면 64) */
 function maxChannels(): number {
   const v = deviceSel.value;
   if (v.startsWith(ASIO_PREFIX)) return asio.devices.find(d => ASIO_PREFIX + d.id === v)?.channels ?? 2;
@@ -244,6 +245,11 @@ function fillChannels() {
     b.disabled = pr >= n;
     b.classList.toggle('active', pl === l && pr === r);
   });
+  // 스테레오 페어 빠른 선택: 장치 채널 수만큼 Ch 1-2 … Ch 47-48 …
+  const pairs = Math.floor(n / 2);
+  pairSel.innerHTML = '<option value="">스테레오 페어 선택…</option>'
+    + Array.from({ length: pairs }, (_, k) => `<option value="${2 * k}">Ch ${2 * k + 1}-${2 * k + 2}</option>`).join('');
+  pairSel.value = r === l + 1 && l % 2 === 0 ? String(l) : '';
   paintRouteInfo();
 }
 function routeLR(): { l: number; r: number } {
@@ -259,6 +265,13 @@ function paintRouteInfo() {
     if (engine.kind === 'browser' && engine.deviceChannels <= 2)
       t += '\n※ 브라우저가 2채널만 열었습니다. 다채널 인터페이스의 3번 이후 채널이 필요하면 ASIO 브릿지를 사용하세요.';
   }
+  // SoundGrid ASIO: 드라이버 채널 수가 48 미만이면 Driver Control Panel 설정 안내
+  const v = deviceSel.value;
+  const ad = v.startsWith(ASIO_PREFIX) ? asio.devices.find(d => ASIO_PREFIX + d.id === v) : undefined;
+  if (ad && /soundgrid|waves/i.test(ad.name)) {
+    t += `\n🌊 SoundGrid ASIO · 드라이버 입력 ${ad.channels}채널 · ${ad.sampleRate / 1000}kHz`;
+    if (ad.channels < 48) t += '\n※ 48채널 이상이 필요하면 SoundGrid Driver Control Panel 에서 채널 수(I/O)를 64 이상으로 올린 뒤 브릿지를 다시 실행하세요.';
+  }
   $('routeInfo').textContent = t;
 }
 const onRouteChange = () => {
@@ -272,6 +285,12 @@ const onRouteChange = () => {
 };
 chL.onchange = onRouteChange;
 chR.onchange = onRouteChange;
+pairSel.onchange = () => {
+  if (pairSel.value === '') return;
+  const l = Number(pairSel.value);
+  chL.value = String(l); chR.value = String(l + 1);
+  onRouteChange();
+};
 document.querySelectorAll<HTMLButtonElement>('#presets button').forEach(b => {
   b.onclick = () => { chL.value = b.dataset.l!; chR.value = b.dataset.r!; onRouteChange(); };
 });

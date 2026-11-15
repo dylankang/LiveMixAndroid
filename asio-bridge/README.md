@@ -41,6 +41,18 @@ ASIO 브릿지 실행 중: ws://localhost:9876  (종료: Ctrl+C)
 
 선택한 장치와 채널은 브라우저에 저장되어 다음에 열 때 자동으로 복원됩니다.
 
+## Waves SoundGrid ASIO (48채널 이상)
+
+SoundGrid Driver 는 ASIO 장치 하나(예: `SoundGrid ASIO`)로 많은 채널을 제공합니다. 브릿지는 드라이버가 알려 주는 **채널 수를 제한 없이** 그대로 웹앱에 전달하고, 고른 **L/R 두 채널만** 열어서 보내므로 48·64·128채널 구성에서도 부하가 거의 없습니다.
+
+1. **SoundGrid Driver Control Panel** → 드라이버 채널 수(I/O)를 **64 이상**으로 설정 (48채널을 쓰려면 48 이상이 보이는 설정)
+2. SoundGrid Studio(또는 Inventory)에서 드라이버가 네트워크에 **할당(Assign)** 되어 있고, 콘솔 2트랙 매트릭스 출력이 원하는 SoundGrid 드라이버 입력 채널(예: 47·48)로 패치되어 있는지 확인
+3. `python bridge.py --list` 로 `SoundGrid ASIO · 64ch` 처럼 채널 수가 보이는지 확인 → `python bridge.py`
+4. 웹앱에서 `[ASIO] SoundGrid …` 선택 → **빠른 선택**에서 `Ch 47-48` 처럼 스테레오 페어를 고르거나 L/R 을 각각 지정
+5. 샘플레이트(48k/96k)는 드라이버 설정을 그대로 따릅니다. 전송 블록은 자동으로 약 10ms 단위로 맞춰집니다.
+
+> ASIO 드라이버는 보통 한 프로그램만 열 수 있습니다. 같은 PC에서 DAW(멀티트랙 녹음 등)가 SoundGrid ASIO 를 쓰고 있으면 브릿지가 장치를 열지 못할 수 있으니, 그 경우 DAW 쪽 설정이나 별도 PC를 사용하세요.
+
 ## 옵션
 
 | 옵션 | 설명 |
@@ -48,7 +60,7 @@ ASIO 브릿지 실행 중: ws://localhost:9876  (종료: Ctrl+C)
 | `--list` | 장치 목록만 출력하고 종료 |
 | `--all` | ASIO 외 모든 입력 장치(WASAPI/MME/macOS CoreAudio)도 목록에 표시 (테스트용) |
 | `--port 9876` | 포트 변경 (웹앱은 9876을 기다리므로 보통 그대로 두세요) |
-| `--blocksize 480` | 전송 블록 크기(프레임). 48kHz 기준 480 = 10ms |
+| `--blocksize 0` | 전송 블록 크기(프레임). 기본 0 = 자동(약 10ms: 48kHz 480 / 96kHz 960) |
 | `--allow-origin URL` | 연결을 허용할 웹앱 주소 추가 |
 | `--any-origin` | 모든 웹페이지의 연결 허용 (권장하지 않음) |
 

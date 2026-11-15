@@ -110,7 +110,7 @@ class Session:
         sr = float(d["default_samplerate"])
         extra = None
         if "ASIO" in api and hasattr(sd, "AsioSettings"):
-            # ASIO: 필요한 두 채널만 연다 (모노면 한 채널)
+            # ASIO: 필요한 두 채널만 연다 (모노면 한 채널) — SoundGrid 처럼 48/64/128 채널 드라이버도 Ch 47·48 두 개만 연다
             sel = [l] if l == r else [l, r]
             extra = sd.AsioSettings(channel_selectors=sel)
             channels = len(sel)
@@ -122,9 +122,11 @@ class Session:
             self.selectors = False
         with self.lock:
             self.pick = pick
+        # 전송 블록: 지정이 없으면 샘플레이트에 맞춰 약 10ms (48kHz → 480, 96kHz → 960 · SoundGrid 96k 대응)
+        bs = self.blocksize or max(64, int(round(sr / 100)))
         stream = sd.InputStream(
             device=device, channels=channels, samplerate=sr, dtype="float32",
-            blocksize=self.blocksize, latency="low", extra_settings=extra, callback=self._callback,
+            blocksize=bs, latency="low", extra_settings=extra, callback=self._callback,
         )
         stream.start()
         self.stream = stream
@@ -242,7 +244,7 @@ def main():
     p.add_argument("--port", type=int, default=9876)
     p.add_argument("--all", action="store_true", help="ASIO 외 모든 입력 장치(WASAPI/MME/CoreAudio)도 표시")
     p.add_argument("--list", action="store_true", help="장치 목록만 출력하고 종료")
-    p.add_argument("--blocksize", type=int, default=480, help="전송 블록 크기(프레임) · 기본 480 (48kHz 기준 10ms)")
+    p.add_argument("--blocksize", type=int, default=0, help="전송 블록 크기(프레임) · 기본 0 = 자동(약 10ms: 48kHz 480 / 96kHz 960)")
     p.add_argument("--allow-origin", action="append", help="연결을 허용할 웹앱 주소 추가 (예: https://example.com)")
     p.add_argument("--any-origin", action="store_true", help="모든 웹페이지의 연결 허용 (권장하지 않음)")
     args = p.parse_args()
