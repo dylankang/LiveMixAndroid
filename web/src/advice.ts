@@ -13,25 +13,69 @@ export interface CooldownCfg {
 export const COOLDOWN_DEFAULT: CooldownCfg = { holdSec: 120, trigger: 2, scope: 'standard' };
 export const COOLDOWN_RANGE = { min: 0, max: 600, step: 10 } as const;
 
-/** 항목 이름 정규화: 대소문자·표기 흔들림을 하나로 (예: deesser → De-Esser) */
+/** 조언 '분류'(처리 종류) 표준 이름 — [대상] 분류:내용 의 가운데 자리 */
+export const CATEGORIES = ['Level', 'EQ', 'Comp', 'HPF', 'LPF', 'Gate', 'De-Esser', 'DynEQ', 'Reverb', 'Delay', 'Pan', 'Width', 'Limiter', 'Saturation'] as const;
+
+/** 분류 이름 정규화: 대소문자·한글 표기 흔들림을 하나로 (예: deesser → De-Esser, 컴프 → Comp) */
 const ITEM_ALIASES: [RegExp, string][] = [
-  [/^eq$/i, 'EQ'], [/^comp(ressor)?$/i, 'Comp'], [/^level|^fader|^vol(ume)?$/i, 'Level'],
-  [/^hpf|^low[- ]?cut$/i, 'HPF'], [/^lpf|^high[- ]?cut$/i, 'LPF'],
-  [/^rev(erb)?$/i, 'Reverb'], [/^delay$/i, 'Delay'], [/^de-?ess(er)?$/i, 'De-Esser'],
-  [/^gate$/i, 'Gate'], [/^dyn-?eq$/i, 'DynEQ'], [/^mask(ing)?$/i, 'Masking'],
-  [/^pan$/i, 'Pan'], [/^width$/i, 'Width'], [/^limiter$/i, 'Limiter'], [/^sat(uration)?$/i, 'Saturation'],
+  [/^(eq|이큐|이퀄라이저|equali[sz]er)$/i, 'EQ'], [/^(comp(ressor|ression)?|컴프|컴프레서|압축)$/i, 'Comp'],
+  [/^(level|fader|vol(ume)?|gain|레벨|볼륨|페이더|게인|음량)$/i, 'Level'],
+  [/^(hpf|low[- ]?cut|high[- ]?pass|하이패스|로우컷)$/i, 'HPF'], [/^(lpf|high[- ]?cut|low[- ]?pass|로우패스|하이컷)$/i, 'LPF'],
+  [/^(rev(erb)?|리버브|잔향)$/i, 'Reverb'], [/^(delay|딜레이)$/i, 'Delay'], [/^(de-?ess(er)?|디에서|치찰음)$/i, 'De-Esser'],
+  [/^(gate|게이트|노이즈게이트)$/i, 'Gate'], [/^(dyn(amic)?-?eq|다이나믹eq|다이내믹eq|mask(ing)?|마스킹)$/i, 'DynEQ'],
+  [/^(pan|팬|패닝|정위)$/i, 'Pan'], [/^(width|stereo|스테레오|폭)$/i, 'Width'],
+  [/^(limiter|리미터)$/i, 'Limiter'], [/^(sat(uration)?|새츄레이션|포화)$/i, 'Saturation'],
 ];
 export function normalizeItem(raw: string): string {
-  const s = raw.trim();
+  const s = raw.trim().replace(/\s+/g, '');
   for (const [re, name] of ITEM_ALIASES) if (re.test(s)) return name;
-  return s;
+  return raw.trim();
+}
+
+/** 분류 자리에 주파수 대역명이 온 경우 (예: low-mid, 저역) → 표시용 대역 이름 */
+const BAND_ITEM: [RegExp, string][] = [
+  [/^(sub|subs|서브|초저역|초저음)$/i, 'Sub'], [/^(low-?mids?|lo-?mid|로우-?미드|중저역|저중역)$/i, 'Low-Mid'],
+  [/^(high-?mids?|hi-?mid|하이-?미드|중고역|고중역|presence|프레즌스)$/i, 'High-Mid'], [/^(lows?|bass|로우|저역|저음)$/i, 'Low'],
+  [/^(mids?|middle|미드|중역|중음)$/i, 'Mid'], [/^(highs?|hi|treble|air|하이|고역|고음|에어)$/i, 'High'],
+];
+const bandItem = (raw: string) => { const t = raw.trim().replace(/\s+/g, ''); for (const [re, n] of BAND_ITEM) if (re.test(t)) return n; return null; };
+
+/** 단위 표기 통일: 250hz → 250Hz, 2.5 khz → 2.5kHz, -3db → -3dB */
+export function tidyUnits(s: string): string {
+  return s.replace(/(\d(?:\.\d+)?)\s*k\s*hz\b/gi, '$1kHz').replace(/(\d(?:\.\d+)?)\s*hz\b/gi, '$1Hz').replace(/(\d(?:\.\d+)?)\s*db\b/gi, '$1dB').replace(/\s{2,}/g, ' ').trim();
+}
+
+const HAS_FREQ = /\d\s*(k\s*)?hz|\d\s*k\b/i;
+
+/**
+ * AI 가 쓴 조언 한 줄을 표준 형식 \`[대상] 분류:내용\` 으로 정리한다.
+ *  · 분류 자리에 대역명이나 주파수가 오면 EQ 로 (예: \`[음성]low-mid:250hz -3db\` → \`[음성] EQ:250Hz -3dB\`)
+ *  · 한글/약어 분류는 표준 이름으로 (컴프 → Comp, 볼륨 → Level …)
+ *  · 콜론이 없어도 주파수/dB 가 있으면 EQ 로 본다
+ */
+export function normalizeAdvice(line: string): { inst: string; item: string; action: string } | null {
+  const m = line.trim().match(/^\[([^\[\]]{1,16})\]\s*(.+)$/);
+  if (!m) return null;
+  const inst = m[1].trim();
+  const rest = m[2].trim();
+  const ci = rest.search(/[:：]/);
+  let item = ci >= 0 ? rest.slice(0, ci).trim() : '';
+  let action = tidyUnits(ci >= 0 ? rest.slice(ci + 1).trim() : rest);
+  if (!action) return null;
+  const band = item ? bandItem(item) : null;
+  if (band) { item = 'EQ'; if (!HAS_FREQ.test(action)) action = `${band} ${action}`; }
+  else if (!item || HAS_FREQ.test(item) || /^[+\-−]?\d/.test(item)) {
+    // 분류가 없거나 숫자/주파수로 시작 → 주파수가 있으면 EQ
+    const all = tidyUnits(rest.replace(/[:：]/, ' '));
+    if (!HAS_FREQ.test(all) && !/dB/i.test(all)) return null;
+    item = 'EQ'; action = all;
+  } else item = normalizeItem(item);
+  return { inst, item, action };
 }
 
 /** "[악기] 항목:조치" 를 나눈다 */
 export function splitAdvice(line: string): { inst: string; item: string; action: string } | null {
-  const m = line.trim().match(/^\[([^\[\]]{1,12})\]\s*([A-Za-z가-힣][A-Za-z가-힣\-/]{0,11})\s*[:：]\s*(.+)$/);
-  if (!m) return null;
-  return { inst: m[1].trim(), item: normalizeItem(m[2]), action: m[3].trim() };
+  return normalizeAdvice(line);
 }
 
 /** 조치 문구에서 주파수(Hz)를 찾아 6밴드 이름으로 */

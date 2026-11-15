@@ -20,11 +20,16 @@ export const MAX_CHANNELS = 64;
 
 /**
  * AudioWorklet 모듈
- *  · lm-clock : 100ms 마다 { type:'tick', rms, peak } 를 메인 스레드로 보내는 마스터 클럭 (입력 L/R 레벨도 직접 측정)
+ *  · lm-clock : 100ms 마다 { type:'tick', rms, peak, envLow, envFull } 를 메인 스레드로 보내는 마스터 클럭
+ *               (입력 L/R 레벨 + 템포 추정용 10ms 단위 에너지 엔벨로프: 150Hz 이하 저역 · 전 대역)
  */
 const WORKLET_SRC = `
 class LmClock extends AudioWorkletProcessor {
-  constructor() { super(); this.acc = 0; this.every = Math.round(sampleRate / 10); this.sq = [0, 0]; this.pk = [0, 0]; this.n = 0; }
+  constructor() {
+    super(); this.acc = 0; this.every = Math.round(sampleRate / 10); this.sq = [0, 0]; this.pk = [0, 0]; this.n = 0;
+    this.frame = Math.round(sampleRate / 100); this.fn = 0; this.eLow = 0; this.eFull = 0; this.lp = 0;
+    this.a = 1 - Math.exp(-2 * Math.PI * 150 / sampleRate); this.envLow = []; this.envFull = [];
+  }
   process(inputs) {
     const inp = inputs[0];
     if (inp && inp.length) {
@@ -35,6 +40,10 @@ class LmClock extends AudioWorkletProcessor {
         const pa = a < 0 ? -a : a, pb = b < 0 ? -b : b;
         if (pa > this.pk[0]) this.pk[0] = pa;
         if (pb > this.pk[1]) this.pk[1] = pb;
+        const m = (a + b) * 0.5;
+        this.lp += this.a * (m - this.lp);
+        this.eLow += this.lp * this.lp; this.eFull += m * m;
+        if (++this.fn >= this.frame) { this.envLow.push(this.eLow / this.fn); this.envFull.push(this.eFull / this.fn); this.fn = 0; this.eLow = 0; this.eFull = 0; }
       }
       this.n += L.length;
     }
@@ -44,8 +53,10 @@ class LmClock extends AudioWorkletProcessor {
       const db = x => (x > 1e-7 ? 20 * Math.log10(x) : -120), n = this.n || 1;
       this.port.postMessage({ type: 'tick',
         rms: [db(Math.sqrt(this.sq[0] / n)), db(Math.sqrt(this.sq[1] / n))],
-        peak: [db(this.pk[0]), db(this.pk[1])] });
+        peak: [db(this.pk[0]), db(this.pk[1])],
+        envLow: this.envLow, envFull: this.envFull });
       this.sq[0] = this.sq[1] = 0; this.pk[0] = this.pk[1] = 0; this.n = 0;
+      this.envLow = []; this.envFull = [];
     }
     return true;
   }
@@ -119,9 +130,13 @@ export interface DynStats {
   /** 잔향 지속도: 골짜기/피크 에너지 비율(%) · 어택 직후 감쇠 속도(dB/s, 작을수록 잔향 김) */
   decayTail: { ratioPct: number; decayDbPerSec: number | null };
   activeSec: number;
+  /** 템포 추정(BPM, 최근 약 20초) · confidence 0~1 (낮으면 리듬이 불분명) */
+  tempo: { bpm: number | null; confidence: number };
 }
 
 const toDb = (x: number) => (x > 1e-7 ? 20 * Math.log10(x) : -120);
+/** 템포 추정용 엔벨로프 보관 길이 (10ms × 2000 = 20초) */
+const ENV_MAX = 2000;
 const r1 = (x: number) => Math.round(x * 10) / 10;
 
 export async function listInputs(): Promise<MediaDeviceInfo[]> {
@@ -179,6 +194,50 @@ export class AudioEngine {
   private specCache: Float64Array | null = null;
   private tickQuiet = false;
   private tickCached = false;
+  /** 템포 추정용 10ms 에너지 엔벨로프 (최근 20초) */
+  private envLow: number[] = [];
+  private envFull: number[] = [];
+
+  /**
+   * 템포(BPM) 추정: 저역(킥·베이스) + 전 대역 온셋 강도의 자기상관.
+   * 50~200 BPM 범위에서 찾고, 사람이 느끼는 박(대략 70~160 BPM)에 가중치를 둔다. 리듬이 불분명하면 bpm=null.
+   */
+  estimateTempo(): { bpm: number | null; confidence: number } {
+    const lo = this.envLow, fu = this.envFull, n = lo.length;
+    if (n < 600) return { bpm: null, confidence: 0 };          // 6초 미만
+    const ldb = (x: number) => 10 * Math.log10(x + 1e-12);
+    const o: number[] = new Array(n - 1);
+    for (let t = 1; t < n; t++) {
+      o[t - 1] = Math.max(0, ldb(lo[t]) - ldb(lo[t - 1])) + 0.5 * Math.max(0, ldb(fu[t]) - ldb(fu[t - 1]));
+    }
+    const mean = o.reduce((a, b) => a + b, 0) / o.length;
+    for (let i = 0; i < o.length; i++) o[i] -= mean;
+    let ac0 = 0;
+    for (let i = 0; i < o.length; i++) ac0 += o[i] * o[i];
+    if (ac0 <= 1e-9) return { bpm: null, confidence: 0 };
+    const minLag = 30, maxLag = 120;                            // 200 ~ 50 BPM (10ms 프레임)
+    const ac = new Array(maxLag + 2).fill(0);
+    for (let lag = minLag - 1; lag <= maxLag + 1; lag++) {
+      let s2 = 0;
+      for (let t = lag; t < o.length; t++) s2 += o[t] * o[t - lag];
+      ac[lag] = s2 / (o.length - lag);
+    }
+    let best = -1, bestScore = -Infinity;
+    for (let lag = minLag; lag <= maxLag; lag++) {
+      if (ac[lag] < ac[lag - 1] || ac[lag] < ac[lag + 1]) continue;           // 국소 최대만
+      const w = Math.exp(-0.5 * Math.pow(Math.log2(lag / 55) / 0.9, 2));       // 약 110 BPM 중심 가중
+      const sc = ac[lag] * w;
+      if (sc > bestScore) { bestScore = sc; best = lag; }
+    }
+    if (best < 0) return { bpm: null, confidence: 0 };
+    const y0 = ac[best - 1], y1 = ac[best], y2 = ac[best + 1];
+    const den = y0 - 2 * y1 + y2;
+    const lagF = best + (den !== 0 ? 0.5 * (y0 - y2) / den : 0);
+    const conf = Math.max(0, Math.min(1, y1 / (ac0 / o.length)));
+    const bpm = Math.round(6000 / lagF);
+    return conf < 0.08 ? { bpm: null, confidence: r1(conf) } : { bpm, confidence: Math.round(conf * 100) / 100 };
+  }
+
   /** AudioWorklet 이 직접 측정한 입력 레벨 (dBFS) · 100ms 마다 갱신 */
   private wk: { rms: [number, number]; peak: [number, number]; at: number } | null = null;
   /** 마스터 클럭 종류 */
@@ -281,7 +340,7 @@ export class AudioEngine {
     const sink = ctx.createGain();
     sink.gain.value = 0;
     sink.connect(ctx.destination);
-    this.cache = []; this.specCache = null; this.srcCount = { analyser: 0, cached: 0 };
+    this.cache = []; this.specCache = null; this.srcCount = { analyser: 0, cached: 0 }; this.envLow = []; this.envFull = [];
     // 🎧 모니터링 경로: L/R 원음(보정 전) → 모니터 게인 → 출력 장치. OFF 면 게인 0
     const mon = ctx.createGain();
     mon.gain.value = this.monitorOn ? this.monitorGain : 0;
@@ -553,6 +612,10 @@ export class AudioEngine {
         const d = ev.data;
         if (d?.type !== 'tick') return;
         if (Array.isArray(d.rms) && Array.isArray(d.peak)) this.wk = { rms: [d.rms[0], d.rms[1]], peak: [d.peak[0], d.peak[1]], at: performance.now() };
+        if (Array.isArray(d.envLow) && Array.isArray(d.envFull) && !this.idle) {
+          for (let k = 0; k < d.envLow.length; k++) { this.envLow.push(d.envLow[k]); this.envFull.push(d.envFull[k] ?? 0); }
+          if (this.envLow.length > ENV_MAX) { const cut = this.envLow.length - ENV_MAX; this.envLow.splice(0, cut); this.envFull.splice(0, cut); }
+        }
         try { this.onAudioBeat(); } catch { /* ignore */ }
       };
       src.connect(node); node.connect(sink);
@@ -691,6 +754,7 @@ export class AudioEngine {
       transientFluxDb: { low: r1(std(low)), mid: r1(std(mid)), highMid: r1(std(hm)) },
       decayTail: { ratioPct, decayDbPerSec: decay },
       activeSec: r1(sec),
+      tempo: this.estimateTempo(),
     };
   }
 

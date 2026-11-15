@@ -1,13 +1,49 @@
 import { PROVIDERS, type ProviderId, MAX_LINE_CHARS } from './config';
 import type { Candidate } from './advice';
-import { clampText, splitAdvice } from './advice';
+import { clampText, normalizeAdvice, CATEGORIES } from './advice';
 
-/** tolDb = 슬라이더로 정한 허용 편차. 로컬 필터와 AI가 같은 기준(±tolDb)을 쓴다 */
+/** 장르 판별 지침 (조언 프롬프트와 장르 전용 프롬프트가 같이 씀) */
+const GENRE_GUIDE = `[장르/상태 판별 — 선택지 제한 없음]
+고정 목록에서 고르지 말고 지표를 근거로 전 세계 음악 장르와 세부 스타일 중 가장 정확한 것을 짧은 한국어로 적어라.
+예시일 뿐 제한이 아니다: 모던 워십, CCM 발라드, 팝 발라드, 록/얼터너티브, 메탈/하드록, K-Pop/댄스, R&B/소울, 펑크(Funk)/디스코, 어쿠스틱/포크, 재즈/스윙, 재즈 퓨전, 블루스, 레게, 라틴, 힙합/트랩, EDM/하우스, 시티팝, 트로트, 국악, 클래식/오케스트라, 합창, 앰비언트.
+판단 순서 (하나의 지표만 보고 단정하지 마라):
+1) 템포·리듬: features.tempo.bpm(최근 약 20초 자기상관 추정) 과 confidence. confidence 가 0.3 이상이면 신뢰. 하프타임·더블타임(절반·두 배 BPM)일 가능성도 고려.
+   대략: 발라드·워십 발라드 60~85, R&B/힙합 70~100(하프타임 느낌), 팝·록·CCM 90~140, 하우스/EDM 118~130(저역 어택이 매우 규칙적), 댄스/K-Pop 100~130, 펑크·디스코 100~125, 메탈·펑크록 140~200, 레게 70~90 오프비트. confidence 가 낮으면(<0.15) 리듬이 약한 발라드·앰비언트·클래식·스피치 쪽.
+2) 저역 구조: Sub/Low 비율, subVsMidDb, sub20to80SharePct, Low 대역 Crest·어택 밀도. 강한 Sub+낮은 Crest+촘촘한 저역 어택 → 힙합/트랩/EDM.
+3) 타악 밀도: transientDensityPerMin(highMid 많으면 하이햇·스네어가 바쁜 록/댄스), transientFluxDb.
+4) 음색: spectralCentroidHz, High-Mid/High 비율(밝고 공격적이면 록·메탈·댄스, 어둡고 둥글면 재즈·발라드·R&B), voiceBandSharePct.
+5) 공간감: decayTail(잔향 많으면 워십·발라드·합창·앰비언트·클래식).
+features.longTerm 은 최근 약 1분 평균이다. 이번 구간(features)과 다르면 곡이 바뀌었을 수 있으니 이번 구간을 우선하되, 한 구간만 튀는 경우에는 longTerm 을 더 믿어라.
+특수 상태:
+- 스피치/설교·강연: 반주 리듬 없이 음성 대역만 활성 → \`GENRE:스피치/설교\`, 대상 자리에 \`음성\`
+- 단일 악기 Solo(PFL): 특정 대역만 활성, 나머지 -50dBFS 이하 → \`GENRE:Solo|<악기이름>\`. 비어 있는 대역 부스트·Level 조언 금지, 그 악기 자체의 처리만 조언`;
+
+/** 장르만 판별하는 짧은 프롬프트 — 로컬 필터를 통과해 조언이 필요 없는 주기에도 장르는 AI 조언 주기마다 갱신 */
+export function buildGenrePrompt(): string {
+  return `너는 시니어 음향 엔지니어다. 2트랙(스테레오 믹스) 분석 JSON 을 보고 지금 연주 중인 음악의 장르/상태만 판별한다.
+${GENRE_GUIDE}
+
+출력 형식(엄수): 한 줄만 \`GENRE:<장르/세부 스타일>\` (Solo 는 \`GENRE:Solo|<악기이름>\`). 그 밖의 글, 조언, 설명은 출력하지 마라.`;
+}
+
+/** tolDb = 슬라이더로 정한 허용 편차. 로컬 필터와 AI가 같은 기준(±tolDb)을 쓴다. 0 = '항상 AI' 적극 조언 모드 */
 export function buildSystemPrompt(tolDb: number): string {
   const th = tolDb;
-  return `너는 라이브 FOH와 스튜디오 믹싱을 모두 해 본 시니어 음향 엔지니어다. 꼭 필요할 때만 말한다.
+  const eager = th <= 0;
+  const cats = CATEGORIES.join(', ');
+  return `너는 라이브 FOH와 스튜디오 믹싱을 모두 해 본 시니어 음향 엔지니어다. ${eager
+    ? 'FOH 옆에서 귀 역할을 하며, 지표에서 개선할 여지를 적극적으로 찾아 구체적으로 말한다.'
+    : '분명한 문제를 우선해서 짧고 구체적으로 말한다.'}
 
-[최우선 규칙 — [대상] 표기]
+[최우선 규칙 1 — 조언 한 줄의 형식]
+\`[조절 대상] 분류:내용\`
+- 분류는 반드시 다음 중 하나만: ${cats}
+- 분류 자리에 주파수 대역명(low-mid, 미드 등)이나 숫자(250Hz)를 쓰지 마라. 대역·주파수는 내용에 쓴다.
+  잘못: \`[음성]low-mid:250hz -3db\`  →  올바름: \`[음성] EQ:250Hz -3dB\`
+  잘못: \`[보컬] 컴프레서 어택 빠르게\`  →  올바름: \`[메인보컬] Comp:어택 빠르게\`
+- 단위 표기: Hz, kHz, dB, ms. 공백 포함 ${MAX_LINE_CHARS}자 이내 (G2 안경 HUD 한 줄)
+
+[최우선 규칙 2 — [조절 대상] 표기]
 - \`[]\` 안에는 실제로 콘솔에서 조절해야 할 대상(채널·그룹·버스)을 적어라. 무엇을 적을지는 분석 지표를 근거로 네가 판단해라.
   · 개별 악기: 예) [킥], [스네어], [하이햇], [탐], [오버헤드], [베이스], [일렉기타], [어쿠스틱기타], [피아노], [건반], [신스], [브라스], [스트링]
   · 보컬: 가능하면 남/여를 구분해라. 예) [남성보컬], [여성보컬], [메인보컬], [코러스]
@@ -16,7 +52,9 @@ export function buildSystemPrompt(tolDb: number): string {
 - \`[]\` 안에 \`[서브]\`, \`[로우]\`, \`[로우-미드]\`, \`[미드]\`, \`[하이-미드]\`, \`[하이]\`, \`[저역]\`, \`[중역]\`, \`[고역]\` 같은 주파수 대역명을 넣지 마라. 대역은 조절 대상이 아니라 조치 내용(예: EQ:250Hz -3dB)에 적는다.
 - 남/여 보컬 구분 참고: voiceBandSharePct 가 높게 활성화돼 있을 때 spectralCentroidHz 와 relativeSpectralBalanceDb 의 Low-Mid(150~350Hz) 대비 Mid·High-Mid 비율을 본다. Low-Mid 우세·무게중심이 낮으면 남성, Mid·High-Mid 우세·무게중심이 높으면 여성 쪽이다. 가를 수 없으면 [메인보컬].
 
-일반적인 다이내믹 변화나 편곡상 악기가 치고 나오는 자연스러운 강조는 문제로 지적하지 마라. 밸런스가 무난하거나 완성된 음원 수준이면 억지로 조언을 짜내지 말고 \`NONE\`을 출력해라. 애매하면 \`NONE\`.
+${eager
+    ? '지금은 "항상 AI" 적극 조언 모드다. 완성된 음원 수준이라도 라이브 믹스에서 더 좋아질 수 있는 점(명료도, 악기 분리, 저역 정리, 다이내믹, 공간감, 보컬 존재감 등)을 찾아 매번 우선순위대로 2~4줄 조언해라. NONE 은 신호가 거의 없거나 Solo 에서 손댈 곳이 정말 없을 때만 쓴다. 이번에 이미 화면에 있는 조언과 다른 관점(다른 악기나 다른 분류)을 골라라.'
+    : '일반적인 다이내믹 변화나 편곡상 악기가 치고 나오는 자연스러운 강조는 문제로 지적하지 마라. 밸런스가 무난하면 억지로 조언을 짜내지 말고 \`NONE\`을 출력해라.'}
 
 입력은 2트랙(스테레오 믹스) 분석 JSON이다:
 - inputMode: console-2track-raw(FOH 콘솔 → USB 인터페이스 2트랙 직결, 절대 레벨 의미 있음). levelReference 가 auto-trim 이면 레벨은 -18dBFS 기준으로 정규화된 것이므로 상대 비율로 판단. captureNote 가 있으면 고려.
@@ -33,22 +71,17 @@ export function buildSystemPrompt(tolDb: number): string {
 - peaks: 평균 스펙트럼의 협대역 피크(hz, levelDb, prominenceDb)
 - toleranceDb, currentDisplay(현재 HUD 표시 중), cooldownList(쿨다운 중: [악기 항목])
 
-[1단계: 장르/상태 판별 — 선택지 제한 없음]
-고정 목록에서 고르지 말고, 위 지표(상대 스펙트럼 밸런스, 대역별 트랜지언트 밀도·변동폭, Crest, 무게중심, 잔향 지속도)를 근거로 전 세계 음악 장르와 세부 스타일 중 가장 정확한 것을 스스로 추론해 짧은 한국어로 적어라.
-예시일 뿐 제한이 아니다: 모던 워십, CCM 발라드, 팝 발라드, 록/얼터너티브, 메탈/하드록, K-Pop/댄스, R&B/소울, 펑크(Funk)/디스코, 어쿠스틱/포크, 재즈/스윙, 재즈 퓨전, 블루스, 레게, 라틴, 힙합/트랩, EDM/하우스, 시티팝, 트로트, 국악, 클래식/오케스트라, 합창, 앰비언트.
-판별 단서: 강한 Sub와 낮은 Crest·촘촘한 저역 어택 → 힙합/트랩/EDM 계열 / highMid 어택 밀도 높고 Low-Mid~Mid 밀집 → 록·팝록·워십 밴드 / 높은 Crest·낮은 어택 밀도·높은 decayTail → 발라드·어쿠스틱·클래식·앰비언트 / 스윙감 있는 중역 어택과 높은 Crest → 재즈 / 음성 대역만 활성·리듬 없음 → 스피치.
-특수 상태:
-- 스피치/설교·강연: 반주 리듬 없이 음성 대역만 활성 → \`GENRE:스피치/설교\`, 악기 자리에 \`음성\`
-- 단일 악기 Solo(PFL): 특정 대역만 활성, 나머지 -50dBFS 이하(콘솔에서 한 채널만 Solo) → \`GENRE:Solo|<악기이름>\`. 비어 있는 대역 부스트·Level 조언 금지, 그 악기 자체의 처리만 조언
+[1단계]
+${GENRE_GUIDE}
 deltaDb 는 "일반 음악" 타겟 기준이므로, 판별한 장르 특성(힙합의 강한 서브, 발라드의 비어 있는 초저역 등)으로 설명되는 편차는 문제로 보지 마라. ${th <= 0
-    ? '지금은 "항상 분석" 모드(허용 편차 ±0dB)라 로컬 필터 없이 매번 데이터가 온다. 편차 크기 기준은 두지 말고, 장르 기준으로 실제 믹스를 개선할 점이 보이면 작은 것이라도 지적해라. 정말 손댈 곳이 없을 때만 NONE.'
+    ? '지금은 "항상 분석" 모드(허용 편차 ±0dB)라 로컬 필터 없이 매번 데이터가 온다. 편차 크기 기준은 두지 말고, 장르 기준으로 개선할 점이면 작은 것(±1~2dB 수준)이라도 지적해라.'
     : `장르 기준으로도 이상하고 편차가 ±${th}dB 를 넘을 때만 지적해라.`}
 
 [2단계: 조언 — 믹싱 전 영역]
 최우선 3개 영역을 먼저 판단하라:
-- Level: 악기 간 페이더 밸런스 (예: \`[보컬] Level:+2dB\`, \`[하이햇] Level:-3dB\`)
-- EQ: 주파수 부스트/컷 (예: \`[보컬] EQ:250Hz -3dB\`, \`[스네어] EQ:3kHz -2dB\`)
-- Comp: 어택/릴리즈/레이시오/타격감 (예: \`[스네어] Comp:어택 완화\`, \`[보컬] Comp:비율 4:1\`)
+- Level: 악기 간 페이더 밸런스 (예: \`[메인보컬] Level:+2dB\`, \`[하이햇] Level:-3dB\`)
+- EQ: 주파수 부스트/컷 (예: \`[남성보컬] EQ:250Hz -3dB\`, \`[스네어] EQ:3kHz -2dB\`)
+- Comp: 어택/릴리즈/레이시오/타격감 (예: \`[스네어] Comp:어택 완화\`, \`[여성보컬] Comp:비율 4:1\`)
 그다음 전문 엔지니어 관점에서 필요하면 아래 영역도 자율적으로 조언해라 (목록 밖 항목도 허용):
 - HPF / LPF: 로우컷·하이컷 (예: \`[보컬] HPF:100Hz 설정\`, \`[어쿠스틱] HPF:80Hz 정리\`)
 - Reverb / Delay: 잔향 과다로 먹먹함·명료도 저하, 또는 공간감 부족 (예: \`[보컬] Reverb:디케이 축소\`, \`[스네어] Reverb:잔향 -2dB\`) — decayTail 이 높고 Mid/High-Mid 명료도가 낮을 때
@@ -60,8 +93,8 @@ deltaDb 는 "일반 음악" 타겟 기준이므로, 판별한 장르 특성(힙�
 
 출력 형식(엄수):
 1줄: \`GENRE:<장르/세부 스타일>\` (Solo는 \`GENRE:Solo|<악기이름>\`)
-2줄부터: \`NONE\` 또는 조언 최대 4줄 (중요한 순서대로, 보통 1~2줄이면 충분)
-- 각 조언 줄 형식: \`[조절 대상] 항목:조치내용\` (대상 = 악기·보컬·그룹/마스터, 대역명 금지) · 공백 포함 ${MAX_LINE_CHARS}자 이내 단문 (G2 안경 HUD 한 줄)
+2줄부터: ${eager ? '조언 2~4줄 (중요한 순서대로 · NONE 은 예외적인 경우만)' : '\`NONE\` 또는 조언 최대 4줄 (중요한 순서대로, 보통 1~3줄)'}
+- 각 조언 줄 형식: \`[조절 대상] 분류:내용\` (분류 = ${cats} 중 하나 · 대상에 대역명 금지) · 공백 포함 ${MAX_LINE_CHARS}자 이내
 - currentDisplay 나 cooldownList 와 같은 악기·같은 항목의 지적은 출력하지 마라.
 - 그 밖의 설명, 번호, 마크다운은 출력하지 마라.`;
 }
@@ -121,13 +154,13 @@ export async function callAI(provider: ProviderId, model: string, apiKey: string
         {
           systemInstruction: { parts: [{ text: systemPrompt }] },
           contents: [{ role: 'user', parts: [{ text: userContent }] }],
-          generationConfig: { temperature: 0.3, maxOutputTokens: 768 },   // 생각(thinking) 토큰 여유 포함
+          generationConfig: { temperature: 0.45, maxOutputTokens: 768 },   // 생각(thinking) 토큰 여유 포함
         });
       return (j.candidates?.[0]?.content?.parts ?? []).map((p: any) => p.text ?? '').join('');
     }
     case 'openai': {
       const j = await post('https://api.openai.com/v1/chat/completions', { Authorization: `Bearer ${apiKey}` }, {
-        model, temperature: 0.3, max_tokens: 300,
+        model, temperature: 0.45, max_tokens: 300,
         messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }],
       });
       return j.choices?.[0]?.message?.content ?? '';
@@ -138,7 +171,7 @@ export async function callAI(provider: ProviderId, model: string, apiKey: string
         'anthropic-version': '2023-06-01',
         'anthropic-dangerous-direct-browser-access': 'true', // 브라우저 CORS 허용
       }, {
-        model, max_tokens: 300, temperature: 0.3, system: systemPrompt,
+        model, max_tokens: 300, temperature: 0.45, system: systemPrompt,
         messages: [{ role: 'user', content: userContent }],
       });
       return (j.content ?? []).filter((b: any) => b.type === 'text').map((b: any) => b.text).join('');
@@ -171,7 +204,7 @@ export function parseReply(raw: string): ParsedReply {
     const g = s.match(/^GENRE\s*[:：]\s*([^|]+?)\s*(?:\|\s*(.+))?$/i);
     if (g) { genre = parseGenre(g[1], g[2]); continue; }
     if (/^NONE$/i.test(s)) { sawNone = true; continue; }
-    const a = splitAdvice(s);
+    const a = normalizeAdvice(s);      // [대상] 분류:내용 으로 정리 (분류 자리의 대역명 → EQ, 단위 표기 통일)
     if (a && advice.length < 4) {
       const text = clampText(`[${a.inst}] ${a.item}:${a.action}`);
       if (!advice.some(x => x.tag === text)) advice.push({ tag: text, text });

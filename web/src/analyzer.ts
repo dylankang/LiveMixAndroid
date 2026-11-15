@@ -1,7 +1,7 @@
 import { PipMonitor, pipSupported } from './pip';
 import { AudioEngine, type BandStat, listInputs, listOutputs, realDevices, outputSelectSupported, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE } from './audio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
-import { callAI, parseReply, buildSystemPrompt, isQuotaError, type Genre } from './ai';
+import { callAI, parseReply, buildSystemPrompt, buildGenrePrompt, isQuotaError, type Genre } from './ai';
 import { evaluateBalance, TOL_RANGE, ALWAYS_AI_TOL } from './balance';
 import { fbParamsFor } from './config';
 import { Glasses } from './glasses';
@@ -42,6 +42,37 @@ let lastCollectAt = Date.now();
 let aiPaused = false;
 let genre: Genre | null = null;
 let genreAt = 0;
+/** 장르 안정화: 최근 판별 3개 중 2번 이상 나온 장르로만 바꾼다 (한 번 튄 판별로 배지가 흔들리지 않게) */
+const genreHist: string[] = [];
+function acceptGenre(g: Genre) {
+  if (g.kind !== 'music') { genre = g; genreHist.length = 0; return; }   // Solo·스피치는 바로 반영
+  genreHist.push(g.category);
+  if (genreHist.length > 3) genreHist.shift();
+  const count = (c: string) => genreHist.filter(x => x === c).length;
+  const shown = genre?.kind === 'music' ? genre.category : '';
+  const best = [...genreHist].reverse().find(c => count(c) >= 2);
+  if (best) genre = { ...g, category: best };
+  else if (!shown || !genreHist.includes(shown)) genre = g;            // 처음이거나 기존 장르가 최근 판별에 없으면 최신값
+}
+/** 장르 판별 정확도용: 최근 약 1분(분석 구간 기준 최대 3개) 지표 평균 */
+interface FeatSnap { at: number; rel: Record<string, number>; centroid: number; density: { low: number; mid: number; highMid: number }; bpm: number | null; voice: number; decay: number }
+const featHist: FeatSnap[] = [];
+function longTermFeatures(cur: FeatSnap) {
+  featHist.push(cur);
+  while (featHist.length > 1 && cur.at - featHist[0].at > 65_000) featHist.shift();
+  if (featHist.length > 6) featHist.shift();
+  const n = featHist.length, avg = (f: (x: FeatSnap) => number) => Math.round(featHist.reduce((a, x) => a + f(x), 0) / n * 10) / 10;
+  const bpms = featHist.map(x => x.bpm).filter((x): x is number => x !== null).sort((a, b) => a - b);
+  return {
+    windows: n,
+    relativeSpectralBalanceDb: Object.fromEntries(Object.keys(cur.rel).map(k => [k, avg(x => x.rel[k] ?? 0)])),
+    spectralCentroidHz: Math.round(avg(x => x.centroid)),
+    transientDensityPerMin: { low: avg(x => x.density.low), mid: avg(x => x.density.mid), highMid: avg(x => x.density.highMid) },
+    tempoBpmMedian: bpms.length ? bpms[Math.floor(bpms.length / 2)] : null,
+    voiceBandSharePct: avg(x => x.voice),
+    decayTailRatioPct: avg(x => x.decay),
+  };
+}
 const QUOTA_MSG = '⚠️ API 할당량 소진: AI 조언 정지됨';
 const FB_HOLD_MS = 2000;
 
@@ -580,6 +611,7 @@ startBtn.onclick = async () => {
   running = true;
   endMirror();
   lastCollectAt = Date.now(); lastAnalyzeAt = Date.now(); lastSecondAt = 0;
+  genreHist.length = 0; featHist.length = 0;     // 새 분석: 장르 안정화 기록·1분 평균 지표 초기화
   startBtn.disabled = false; startBtn.textContent = '정지'; startBtn.classList.add('on');
   startTicker();
   void ensureWake();
@@ -725,19 +757,19 @@ async function analyze() {
   const modeInfo = `입력: ${modeName()}${engine.autoTrim ? ` (Auto-Trim ${engine.trimDb >= 0 ? '+' : ''}${engine.trimDb}dB)` : ' (Raw)'}`
     + ` · 신호: ${solo ? 'Solo(PFL) 추정' : 'Full Mix'} · 활성 ${ev.signal.activeBands.length}/6 (${ev.signal.activeBands.join(', ') || '없음'})`;
   const alwaysAi = tol <= ALWAYS_AI_TOL;            // ±0dB: 로컬 필터를 건너뛰고 매 주기 AI 로 보냄
-  if (ev.pass && !alwaysAi) {
-    setStatus(`${solo ? 'Solo' : '밸런스'} 양호 · AI 호출 생략 (NONE)`);
-    setAiLast(`${modeInfo}\n로컬 필터 통과 → AI 호출 안 함`);
-    return;
-  }
+  // 로컬 필터를 통과한 주기: 조언은 생략하되 장르는 AI 조언 주기마다 판별 (장르 전용 짧은 요청)
+  const genreOnly = ev.pass && !alwaysAi;
   if (inFlight) return;
   const key = apiKeyInp.value.trim();
   if (!key) { setStatus('⚙️ 설정에서 API Key를 입력하면 AI 조언이 시작됩니다'); setAiLast(`${modeInfo}\nAPI Key 없음 → AI 호출 안 함`); return; }
   const over = solo
     ? [ev.crestOk ? '협대역 피크' : 'Crest 범위 밖']
     : Object.entries(ev.deltas).filter(([, d]) => Math.abs(d) > tol).map(([n, d]) => `${n} ${d > 0 ? '+' : ''}${d}`);
-  const gateInfo = `${modeInfo}\n측정: ${srcStat.analyser}틱${srcStat.cached ? ` (무음 캐시 대체 ${srcStat.cached}틱)` : ''}\n`
-    + (alwaysAi ? '항상 AI 전송 모드 (조언 민감도 ±0dB · 로컬 필터 생략)' : '필터 초과: ' + (over.length ? over.join(', ') : 'Crest 범위 밖'));
+  const tempoTxt = dyn.tempo.bpm ? `템포 약 ${dyn.tempo.bpm} BPM (신뢰도 ${dyn.tempo.confidence})` : '템포 불분명';
+  const gateInfo = `${modeInfo}\n측정: ${srcStat.analyser}틱${srcStat.cached ? ` (무음 캐시 대체 ${srcStat.cached}틱)` : ''} · ${tempoTxt}\n`
+    + (alwaysAi ? '항상 AI 전송 모드 (조언 민감도 ±0dB · 로컬 필터 생략)'
+      : genreOnly ? `로컬 필터 통과 → 조언 생략 · 장르만 판별`
+      : '필터 초과: ' + (over.length ? over.join(', ') : 'Crest 범위 밖'));
 
   inFlight = true;
   const bandData = Object.fromEntries(Object.entries(bands).map(([n, b]) => [n, {
@@ -746,6 +778,8 @@ async function analyze() {
     active: ev.signal.activeBands.includes(n),
     character: b.character,
   }]));
+  const rel = Object.fromEntries(Object.entries(bands).map(([n, b]) => [n, b.relDb]));
+  const longTerm = longTermFeatures({ at: nowMs, rel, centroid: spec.spectralCentroidHz, density: dyn.transientDensityPerMin, bpm: dyn.tempo.bpm, voice: spec.voiceBandSharePct, decay: dyn.decayTail.ratioPct });
   const payload = {
     windowSec,
     toleranceDb: tol,
@@ -755,7 +789,8 @@ async function analyze() {
     captureNote: captureNote(),
     signal: ev.signal,
     features: {
-      relativeSpectralBalanceDb: Object.fromEntries(Object.entries(bands).map(([n, b]) => [n, b.relDb])),
+      relativeSpectralBalanceDb: rel,
+      tempo: dyn.tempo,
       bandCrestDb: Object.fromEntries(Object.entries(bands).map(([n, b]) => [n, b.crestDb])),
       transientDensityPerMin: dyn.transientDensityPerMin,
       transientFluxDb: dyn.transientFluxDb,
@@ -767,6 +802,7 @@ async function analyze() {
       sub20to80SharePct: spec.sub20to80SharePct,
       voiceBandSharePct: spec.voiceBandSharePct,
       measuredSec: dyn.activeSec,
+      longTerm,
     },
     bands: bandData,
     peaks,
@@ -774,14 +810,15 @@ async function analyze() {
     cooldownList: advice.cooldownTags(nowMs),
   };
   try {
-    const raw = await callAI(provider(), currentModel(), key, buildSystemPrompt(tol),
+    const raw = await callAI(provider(), currentModel(), key, genreOnly ? buildGenrePrompt() : buildSystemPrompt(tol),
       `최근 ${windowSec}초 분석 데이터(JSON):\n${JSON.stringify(payload)}`);
     const res = parseReply(raw);
-    if (res.genre) { genre = res.genre; genreAt = Date.now(); paintGenre(); sender.update({ genre: badgeForSend(), genreAt }); }
-    const added = advice.ingest(res.advice, Date.now());
+    if (res.genre) { acceptGenre(res.genre); genreAt = Date.now(); paintGenre(); sender.update({ genre: badgeForSend(), genreAt }); }
+    const added = genreOnly ? [] : advice.ingest(res.advice, Date.now());
     const text = raw.trim().replace(/\s+/g, ' ');
     setAiLast(`${gateInfo}\nAI 응답(${new Date().toLocaleTimeString()}): ${text || '(빈 응답)'}`);
-    setStatus(!text ? 'AI 빈 응답' : res.none ? 'AI: NONE (지적 없음)' : !res.advice.length ? 'AI 응답 형식 불일치'
+    setStatus(genreOnly ? `${solo ? 'Solo' : '밸런스'} 양호 · 조언 생략 (장르만 갱신)`
+      : !text ? 'AI 빈 응답' : res.none ? 'AI: NONE (지적 없음)' : !res.advice.length ? 'AI 응답 형식 불일치'
       : `AI: ${added.length}건 표시` + (res.advice.length > added.length ? ` · ${res.advice.length - added.length}건 제외(중복/쿨다운)` : ''));
     render(); renderCooldown();
   } catch (e) {
