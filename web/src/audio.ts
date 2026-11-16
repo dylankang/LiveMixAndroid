@@ -1,6 +1,6 @@
 import { BANDS, FB, fbParamsFor } from './config';
 import { ClipRing } from './clip';
-import { NATIVE_MEDIA_ID, NATIVE_MEDIA_LABEL, startNativeMedia, stopNativeMedia, createNativePcmNode, detachNativePcm, onNativeEvent } from './native';
+import { NATIVE_MEDIA_ID, NATIVE_MEDIA_LABEL, NATIVE_IN_PREFIX, startNativeMedia, startNativeInput, stopNativeMedia, createNativePcmNode, detachNativePcm, onNativeEvent } from './native';
 
 /** 드롭다운 기본값: deviceId 지정 없이 OS 기본 입력(연결된 USB 인터페이스 우선)을 연다 */
 export const DEFAULT_INPUT_ID = 'default';
@@ -316,17 +316,18 @@ export class AudioEngine {
     if (typeof opt.monitorGain === 'number') this.monitorGain = opt.monitorGain;
     let ctx: AudioContext;
     let input: AudioNode;
-    if (opt.deviceId === NATIVE_MEDIA_ID) {
-      // 📱 앱 전용: 휴대폰에서 재생 중인 미디어를 볼륨 전단(단위 이득)에서 캡처한 PCM 을 그대로 분석
-      const fmt = await startNativeMedia();
+    if (opt.deviceId === NATIVE_MEDIA_ID || opt.deviceId?.startsWith(NATIVE_IN_PREFIX)) {
+      // 📱 앱 전용: (1) 휴대폰에서 재생 중인 미디어를 볼륨 전단에서 캡처 · (2) USB 인터페이스 등 입력을 AudioRecord 로 직접 스테레오 캡처
+      const isMedia = opt.deviceId === NATIVE_MEDIA_ID;
+      const fmt = isMedia ? await startNativeMedia() : await startNativeInput(parseInt(opt.deviceId!.slice(NATIVE_IN_PREFIX.length), 10));
       this.nativeMedia = true;
       this.nativeOff = onNativeEvent(e => { if (e.type === 'media' && e.state === 'stopped' && this.running) this.onEnded(); });
       try { ctx = new AudioContext({ latencyHint: 'interactive', sampleRate: fmt.rate }); }
       catch { ctx = new AudioContext({ latencyHint: 'interactive' }); }
       input = await createNativePcmNode(ctx);
-      this.deviceChannels = 2;
-      this.usbPicked = false;
-      this.openInfo = { step: 1, label: NATIVE_MEDIA_LABEL, settings: { sampleRate: fmt.rate, channelCount: 2 } as MediaTrackSettings, usb: false };
+      this.deviceChannels = Math.max(1, fmt.channels);   // 실제 장치 채널 (모노 장치면 앱이 L=R 로 복제해 보냄)
+      this.usbPicked = !isMedia && /USB/i.test(fmt.label);
+      this.openInfo = { step: 1, label: isMedia ? NATIVE_MEDIA_LABEL : (fmt.label || '네이티브 입력'), settings: { sampleRate: fmt.rate, channelCount: this.deviceChannels } as MediaTrackSettings, usb: this.usbPicked };
     } else {
       let id = opt.deviceId, usb = false;
       if (!id || id === DEFAULT_INPUT_ID) {

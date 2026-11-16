@@ -11,7 +11,20 @@ export const NATIVE_MEDIA_ID = 'native-media';
 export const NATIVE_MEDIA_LABEL = '📱 휴대폰 미디어 출력 (재생 중인 소리 · 볼륨 무관)';
 export const nativeMediaSupported = () => { try { return !!nat()?.mediaCaptureSupported?.(); } catch { return false; } };
 
-export interface NativeEvent { type: string; state?: string; rate?: number; channels?: number; msg?: string }
+export interface NativeEvent { type: string; state?: string; rate?: number; channels?: number; msg?: string; label?: string }
+
+// 🎛️ 네이티브 오디오 입력 (USB 오디오 인터페이스 등)
+//  안드로이드의 Chromium(WebView)은 getUserMedia 입력을 기본으로 모노로 연다(Chromium audio_manager_android 기본값)
+//  → 2채널 인터페이스도 L/R 이 합쳐져 들어오므로, 앱에서는 안드로이드 AudioRecord 로 직접 스테레오 캡처한다.
+export const NATIVE_IN_PREFIX = 'native-in:';
+export interface NativeInput { id: number; name: string; type: string; usb: boolean; channels: number[]; rates: number[] }
+export function nativeInputs(): NativeInput[] {
+  try { const v = JSON.parse(nat()?.listNativeInputs?.() ?? '[]'); return Array.isArray(v) ? v : []; } catch { return []; }
+}
+export const nativeInputLabel = (d: NativeInput) => {
+  const maxCh = d.channels.length ? Math.max(...d.channels) : 0;
+  return `${d.usb ? '🎛️' : '🎙️'} ${d.name} · ${d.type}${maxCh ? ` · 최대 ${maxCh}ch` : ''} (앱 직접 입력 · 스테레오)`;
+};
 const listeners = new Set<(e: NativeEvent) => void>();
 (window as any).__lmNativeEvent = (j: string) => {
   let e: NativeEvent;
@@ -20,21 +33,26 @@ const listeners = new Set<(e: NativeEvent) => void>();
 };
 export function onNativeEvent(f: (e: NativeEvent) => void) { listeners.add(f); return () => listeners.delete(f); }
 
+export interface NativeStart { rate: number; channels: number; label: string }
 /** 미디어 출력 캡처 시작 (화면 녹화 동의 창 → 승인되면 rate/channels 반환) */
-export function startNativeMedia(): Promise<{ rate: number; channels: number }> {
+export function startNativeMedia(): Promise<NativeStart> { return startNative(() => nat()?.startMediaCapture?.(), !!nat()?.startMediaCapture, '이 기기에서는 미디어 출력 캡처를 쓸 수 없습니다 (안드로이드 10 이상 앱 전용)'); }
+/** 🎛️ 입력 장치 네이티브 캡처 시작 (실제 채널 수 반환: USB 인터페이스면 보통 2) */
+export function startNativeInput(id: number): Promise<NativeStart> { return startNative(() => nat()?.startNativeInput?.(id), !!nat()?.startNativeInput, '이 앱 버전은 네이티브 입력을 지원하지 않습니다'); }
+
+function startNative(call: () => void, ok: boolean, unsupported: string): Promise<NativeStart> {
   return new Promise((resolve, reject) => {
     const n = nat();
-    if (!n?.startMediaCapture) { reject(new Error('이 기기에서는 미디어 출력 캡처를 쓸 수 없습니다 (안드로이드 10 이상 앱 전용)')); return; }
-    const timer = setTimeout(() => { off(); reject(new Error('미디어 캡처 동의가 2분 안에 완료되지 않았습니다')); }, 120_000);
+    if (!ok) { reject(new Error(unsupported)); return; }
+    const timer = setTimeout(() => { off(); reject(new Error('오디오 캡처가 2분 안에 시작되지 않았습니다 (권한·동의 창을 확인하세요)')); }, 120_000);
     const off = onNativeEvent(e => {
       if (e.type !== 'media') return;
-      if (e.state === 'started') { clearTimeout(timer); off(); resolve({ rate: e.rate || 48000, channels: e.channels || 2 }); }
+      if (e.state === 'started') { clearTimeout(timer); off(); resolve({ rate: e.rate || 48000, channels: e.channels || 2, label: e.label || '' }); }
       else if (e.state === 'denied' || e.state === 'error') {
         clearTimeout(timer); off();
         reject(Object.assign(new Error(e.state === 'denied' ? '미디어 캡처(화면 녹화) 동의가 거부되었습니다' : `미디어 캡처 실패: ${e.msg ?? ''}`), { name: e.state === 'denied' ? 'NotAllowedError' : 'Error' }));
       }
     });
-    try { n.startMediaCapture(); } catch (e) { clearTimeout(timer); off(); reject(e); }
+    try { void n; call(); } catch (e) { clearTimeout(timer); off(); reject(e); }
   });
 }
 export function stopNativeMedia() { try { nat()?.stopMediaCapture?.(); } catch { /* ignore */ } }

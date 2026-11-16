@@ -14,6 +14,9 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
+import android.media.AudioDeviceInfo;
+import android.media.AudioManager;
+import android.media.MediaRecorder;
 import android.media.AudioFormat;
 import android.media.AudioPlaybackCaptureConfiguration;
 import android.media.AudioRecord;
@@ -44,6 +47,8 @@ public class KeepAliveService extends Service {
     static final String ACTION_KEEP = "keep";
     static final String ACTION_MEDIA_START = "media_start";
     static final String ACTION_MEDIA_STOP = "media_stop";
+    static final String ACTION_INPUT_START = "input_start";
+    static final String EXTRA_DEVICE = "device";
     static final String EXTRA_CODE = "code";
     static final String EXTRA_DATA = "data";
     static final int RATE = 48000;
@@ -51,7 +56,8 @@ public class KeepAliveService extends Service {
     /** 캡처한 PCM·상태를 받는 곳 (MainActivity 가 등록) */
     interface Sink {
         void onPcm(String base64);
-        void onMediaState(String state, String msg);
+        /** state: started / denied / error / stopped · started 일 때 rate·channels(실제 장치 채널)·label */
+        void onMediaState(String state, String msg, int rate, int channels, String label);
     }
     static volatile Sink sink;
 
@@ -82,6 +88,21 @@ public class KeepAliveService extends Service {
             Log.w(TAG, "미디어 캡처 서비스 시작 실패", e);
             Sink s = sink;
             if (s != null) s.onMediaState("error", String.valueOf(e.getMessage()));
+        }
+    }
+
+    /**
+     * 🎛️ 오디오 입력(USB 오디오 인터페이스 등)을 안드로이드 AudioRecord 로 직접 스테레오 캡처.
+     * 웹(Chromium/WebView)의 getUserMedia 는 안드로이드에서 입력을 모노로 고정해 열기 때문에(Chromium 기본값),
+     * 2채널 장치도 L/R 이 합쳐진다 → 앱에서는 네이티브로 열어 L/R 을 그대로 받는다.
+     */
+    public static void startInput(Context c, int deviceId) {
+        try {
+            c.startForegroundService(new Intent(c, KeepAliveService.class).setAction(ACTION_INPUT_START).putExtra(EXTRA_DEVICE, deviceId));
+        } catch (Exception e) {
+            Log.w(TAG, "입력 캡처 서비스 시작 실패", e);
+            Sink s = sink;
+            if (s != null) s.onMediaState("error", String.valueOf(e.getMessage()), 0, 0, null);
         }
     }
 
@@ -141,6 +162,16 @@ public class KeepAliveService extends Service {
             stopCapture();
             mediaMode = false;
             goForeground(false);
+            return START_NOT_STICKY;
+        }
+        if (ACTION_INPUT_START.equals(action)) {
+            mediaMode = false;
+            if (!goForeground(false)) {
+                emitState("error", "포그라운드 서비스를 시작하지 못했습니다");
+                return START_NOT_STICKY;
+            }
+            startInputCapture(intent.getIntExtra(EXTRA_DEVICE, -1));
+            acquireLocks();
             return START_NOT_STICKY;
         }
         if (ACTION_MEDIA_START.equals(action)) {
@@ -224,10 +255,10 @@ public class KeepAliveService extends Service {
             recorder.startRecording();
             capturing = true;
             final AudioRecord rec = recorder;
-            reader = new Thread(() -> readLoop(rec), "livemix-capture");
+            reader = new Thread(() -> readLoop(rec, 2, RATE), "livemix-capture");
             reader.setPriority(Thread.MAX_PRIORITY);
             reader.start();
-            emitState("started", null);
+            emitStarted(RATE, 2, "📱 휴대폰 미디어 출력 (볼륨 전단)");
         } catch (Exception e) {
             Log.w(TAG, "미디어 캡처 실패", e);
             emitState("error", String.valueOf(e.getMessage()));
@@ -235,11 +266,81 @@ public class KeepAliveService extends Service {
         }
     }
 
-    /** 100ms(4800프레임 × 2채널 × 16bit = 19,200바이트)씩 읽어 Base64 로 WebView 에 전달 */
-    private void readLoop(AudioRecord rec) {
+    // ───────── 🎛️ 오디오 입력 직접 캡처 (USB 오디오 인터페이스 · 스테레오) ─────────
+    @SuppressLint("MissingPermission")
+    private void startInputCapture(int deviceId) {
+        stopCapture();
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            emitState("error", "마이크(오디오 녹음) 권한이 필요합니다"); return;
+        }
+        try {
+            AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            AudioDeviceInfo dev = null;
+            for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_INPUTS)) if (d.getId() == deviceId) dev = d;
+            if (dev == null && deviceId != -1) { emitState("error", "선택한 입력 장치가 연결되어 있지 않습니다 (USB 를 다시 꽂고 [장치 찾기])"); return; }
+            // 샘플레이트: 48kHz 우선 (장치가 지원 목록을 알려 주면 그 안에서)
+            int rate = 48000;
+            int[] rates = dev != null ? dev.getSampleRates() : new int[0];
+            if (rates.length > 0) {
+                boolean has48 = false;
+                for (int r : rates) if (r == 48000) has48 = true;
+                if (!has48) { rate = rates[0]; for (int r : rates) if (r > rate && r <= 48000) rate = r; }
+            }
+            // 원음 그대로: UNPROCESSED(지원 시) → VOICE_RECOGNITION(대부분 AGC/NS 없음) 순
+            String unp = am.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED);
+            int[] sources = "true".equals(unp)
+                    ? new int[]{MediaRecorder.AudioSource.UNPROCESSED, MediaRecorder.AudioSource.VOICE_RECOGNITION, MediaRecorder.AudioSource.MIC}
+                    : new int[]{MediaRecorder.AudioSource.VOICE_RECOGNITION, MediaRecorder.AudioSource.MIC};
+            // 채널: 항상 스테레오를 먼저 요청, 장치가 못 하면 모노
+            int[] masks = {AudioFormat.CHANNEL_IN_STEREO, AudioFormat.CHANNEL_IN_MONO};
+            AudioRecord rec = null;
+            String srcName = "";
+            outer:
+            for (int mask : masks) {
+                for (int src : sources) {
+                    try {
+                        int min = AudioRecord.getMinBufferSize(rate, mask, AudioFormat.ENCODING_PCM_16BIT);
+                        if (min <= 0) continue;
+                        AudioRecord r = new AudioRecord.Builder()
+                                .setAudioSource(src)
+                                .setAudioFormat(new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(rate).setChannelMask(mask).build())
+                                .setBufferSizeInBytes(Math.max(min * 4, rate * 4 / 2))
+                                .build();
+                        if (r.getState() != AudioRecord.STATE_INITIALIZED) { r.release(); continue; }
+                        if (dev != null) r.setPreferredDevice(dev);
+                        rec = r;
+                        srcName = src == MediaRecorder.AudioSource.UNPROCESSED ? "UNPROCESSED" : src == MediaRecorder.AudioSource.VOICE_RECOGNITION ? "VOICE_RECOGNITION" : "MIC";
+                        break outer;
+                    } catch (Exception ignored) { }
+                }
+            }
+            if (rec == null) { emitState("error", "이 장치를 AudioRecord 로 열지 못했습니다"); return; }
+            recorder = rec;
+            rec.startRecording();
+            int ch = rec.getChannelCount();
+            AudioDeviceInfo routed = rec.getRoutedDevice();
+            String name = routed != null ? String.valueOf(routed.getProductName()) : dev != null ? String.valueOf(dev.getProductName()) : "기본 입력";
+            capturing = true;
+            final int fch = ch, frate = rec.getSampleRate();
+            final AudioRecord frec = rec;
+            reader = new Thread(() -> readLoop(frec, fch, frate), "livemix-input");
+            reader.setPriority(Thread.MAX_PRIORITY);
+            reader.start();
+            emitStarted(frate, ch, "🎛️ " + name + " · 네이티브 " + (ch >= 2 ? "스테레오" : "모노") + " (" + srcName + ")");
+        } catch (Exception e) {
+            Log.w(TAG, "입력 캡처 실패", e);
+            emitState("error", String.valueOf(e.getMessage()));
+            stopCapture();
+        }
+    }
+
+    /** 100ms 씩 읽어 16-bit 스테레오 인터리브(L,R)로 Base64 → WebView. 모노 장치면 L=R 로 복제 */
+    private void readLoop(AudioRecord rec, int channels, int rate) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
-        final int chunk = RATE / 10 * 4;
+        final int frameBytes = channels >= 2 ? 4 : 2;
+        final int chunk = rate / 10 * frameBytes;
         byte[] buf = new byte[chunk];
+        byte[] st = channels >= 2 ? null : new byte[chunk * 2];
         while (capturing) {
             int off = 0;
             while (off < chunk && capturing) {
@@ -247,9 +348,15 @@ public class KeepAliveService extends Service {
                 if (r <= 0) { if (r < 0) { capturing = false; } break; }
                 off += r;
             }
+            off -= off % frameBytes;
             if (off <= 0) continue;
             Sink s = sink;
-            if (s != null) s.onPcm(Base64.encodeToString(buf, 0, off - (off % 4), Base64.NO_WRAP));
+            if (s == null) continue;
+            if (st == null) s.onPcm(Base64.encodeToString(buf, 0, off, Base64.NO_WRAP));
+            else {
+                for (int i = 0, o = 0; i < off; i += 2, o += 4) { st[o] = buf[i]; st[o + 1] = buf[i + 1]; st[o + 2] = buf[i]; st[o + 3] = buf[i + 1]; }
+                s.onPcm(Base64.encodeToString(st, 0, off * 2, Base64.NO_WRAP));
+            }
         }
     }
 
@@ -271,7 +378,12 @@ public class KeepAliveService extends Service {
 
     private void emitState(String state, String msg) {
         Sink s = sink;
-        if (s != null) s.onMediaState(state, msg);
+        if (s != null) s.onMediaState(state, msg, 0, 0, null);
+    }
+
+    private void emitStarted(int rate, int channels, String label) {
+        Sink s = sink;
+        if (s != null) s.onMediaState("started", null, rate, channels, label);
     }
 
     @Override

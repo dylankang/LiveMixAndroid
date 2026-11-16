@@ -5,7 +5,7 @@ import { callAI, parseReply, buildSystemPrompt, setUploadMbps, timeoutFor, SENS_
 import { analyzeClip, encodeWav, clipRmsDb, CLIP_LEN, WAV_RATES, wavLabel, wavWireBytes, type WavFormat } from './clip';
 import { evaluateBalance } from './balance';
 import { qrSvg } from './qrcode';
-import { NATIVE_MEDIA_ID, NATIVE_MEDIA_LABEL, nativeMediaSupported, isApp, nat } from './native';
+import { NATIVE_MEDIA_ID, NATIVE_MEDIA_LABEL, NATIVE_IN_PREFIX, nativeMediaSupported, nativeInputs, nativeInputLabel, isApp, nat } from './native';
 import { fbParamsFor } from './config';
 import { Glasses } from './glasses';
 import { HudSender, HudReceiver, linkWatchdog, linesToShow, genCode, isCode, setLinkCode, linkCode, type BandRow, type LevelPkt, type MixState, type ReceiverInfo } from './link';
@@ -506,9 +506,15 @@ function fillInputs(devs: MediaDeviceInfo[]) {
   const real = realDevices(devs);
   const granted = haveLabels || devs.some(d => d.deviceId === 'default' && !!d.label);
   deviceSel.innerHTML = '';
+  // 🎛️ 앱: 안드로이드가 인식한 입력을 AudioRecord 로 직접 스테레오로 연다 (USB 인터페이스 먼저).
+  //    웹(getUserMedia) 입력은 안드로이드 Chromium 이 모노로 고정하므로 앱에서는 목록에 넣지 않는다.
+  const natIns = isApp() ? nativeInputs() : [];
+  natIns.forEach(d => addOpt(deviceSel, `${NATIVE_IN_PREFIX}${d.id}`, nativeInputLabel(d), d.name));
   if (nativeMediaSupported()) addOpt(deviceSel, NATIVE_MEDIA_ID, NATIVE_MEDIA_LABEL);   // 📱 앱: 다른 앱에서 재생 중인 소리
-  if (isMobile && (granted || real.length)) addOpt(deviceSel, DEFAULT_INPUT_ID, SYSTEM_IN_LABEL);
-  real.forEach((d, i) => addOpt(deviceSel, d.deviceId, d.label || `입력 ${i + 1}`, d.label || ''));
+  if (!natIns.length) {
+    if (isMobile && (granted || real.length)) addOpt(deviceSel, DEFAULT_INPUT_ID, SYSTEM_IN_LABEL);
+    real.forEach((d, i) => addOpt(deviceSel, d.deviceId, d.label || `입력 ${i + 1}`, d.label || ''));
+  }
   if (!deviceSel.options.length && devs.some(d => d.deviceId === 'default')) addOpt(deviceSel, DEFAULT_INPUT_ID, isMobile ? SYSTEM_IN_LABEL : '🎙️ 시스템 기본 입력');
   if (!deviceSel.options.length) { addOpt(deviceSel, '', '🔄 [장치 찾기]를 눌러 입력 장치 목록을 불러오세요'); deviceSel.value = ''; return; }
   pick(deviceSel, savedIn, deviceSel.options[0].value);
@@ -703,7 +709,7 @@ async function startAudio() {
   engine.setAutoTrim(trimSaved());
   applyGate();
   // 목록이 아직 없으면(권한 전) 권한을 받아 Windows 장치 목록을 먼저 불러온다
-  if (!deviceSel.value || (!haveLabels && deviceSel.value !== NATIVE_MEDIA_ID)) await refreshDevices(true);
+  if (!deviceSel.value || (!haveLabels && !deviceSel.value.startsWith('native'))) await refreshDevices(true);
   if (!deviceSel.value) throw Object.assign(new Error('Windows 에 인식된 오디오 입력 장치가 없습니다'), { name: 'NotFoundError' });
   savedIn = saveSel(deviceSel, 'lm.input');
   if (outputSel.value) savedOut = saveSel(outputSel, 'lm.output');
@@ -714,7 +720,10 @@ async function startAudio() {
   const info = engine.openInfo, st = info?.settings;
   const parts: string[] = [];
   parts.push(`입력: ${info?.label || deviceSel.selectedOptions[0]?.textContent || '?'} · ${engine.deviceChannels >= 2 ? 'Ch 1-2 스테레오' : '모노'} · ${st?.sampleRate ?? '?'}Hz${info?.step && info.step > 1 ? ` · ${info.step}차 방식으로 열림` : ''}`);
-  if (engine.nativeMedia) parts.push('📱 다른 앱에서 재생 중인 소리를 휴대폰 볼륨과 무관하게(볼륨 전단) 받습니다 · 앱 자체 볼륨 슬라이더는 반영됨 · 캡처를 막은 앱(일부 OTT 등)은 무음');
+  if (engine.nativeMedia && deviceSel.value === NATIVE_MEDIA_ID) parts.push('📱 다른 앱에서 재생 중인 소리를 휴대폰 볼륨과 무관하게(볼륨 전단) 받습니다 · 앱 자체 볼륨 슬라이더는 반영됨 · 캡처를 막은 앱(일부 OTT 등)은 무음');
+  else if (engine.nativeMedia) parts.push(engine.deviceChannels >= 2
+    ? '🎛️ 안드로이드 AudioRecord 로 L/R 을 따로 받습니다 (웹 입력은 안드로이드에서 모노로 고정되므로 앱이 직접 엽니다)'
+    : '⚠ 장치가 1채널로만 열렸습니다 (L=R) — 인터페이스의 USB 오디오 모드/채널 설정과 케이블을 확인하세요');
   parts.push(outputNone() ? '출력: 없음 (소리 내보내지 않음)' : `출력: ${outputSel.selectedOptions[0]?.textContent ?? ''} · 🎧 모니터링 ${monitorOn ? `ON (${monitorPct}%)` : 'OFF'}`
     + (engine.outputInfo.ok || engine.outputInfo.via === 'none' ? '' : ` · ⚠ 출력 전환 실패: ${engine.outputInfo.error ?? ''}`));
   parts.push(gateOn ? `🚪 노이즈 게이트 ${gateDb} dBFS · ${GATE.enterMs / 1000}초 이상 무음이면 대기` : '🚪 노이즈 게이트 OFF (무음에도 계속 분석)');

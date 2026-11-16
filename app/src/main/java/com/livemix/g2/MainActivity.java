@@ -161,11 +161,11 @@ public class MainActivity extends Activity {
         // 📱 미디어 출력 캡처 PCM·상태 → WebView
         KeepAliveService.sink = new KeepAliveService.Sink() {
             @Override public void onPcm(String b64) { ui.post(() -> js("window.__lmPcm&&window.__lmPcm('" + b64 + "')")); }
-            @Override public void onMediaState(String state, String msg) {
+            @Override public void onMediaState(String state, String msg, int rate, int channels, String label) {
                 ui.post(() -> {
                     try {
                         JSONObject o = new JSONObject().put("type", "media").put("state", state);
-                        if ("started".equals(state)) o.put("rate", KeepAliveService.RATE).put("channels", 2);
+                        if ("started".equals(state)) { o.put("rate", rate).put("channels", channels); if (label != null) o.put("label", label); }
                         if (msg != null) o.put("msg", msg);
                         emitEvent(o);
                     } catch (Exception ignored) { }
@@ -207,6 +207,66 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ───────── 🎛️ 네이티브 오디오 입력 (USB 인터페이스 스테레오) ─────────
+    private int pendingInputId = Integer.MIN_VALUE;
+    private static final int REQ_AUDIO_INPUT = 6;
+
+    private void beginNativeInput(int id) {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            pendingInputId = id;
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO_INPUT);
+            return;
+        }
+        KeepAliveService.startInput(this, id);
+    }
+
+    private static String typeName(int t) {
+        switch (t) {
+            case android.media.AudioDeviceInfo.TYPE_USB_DEVICE: return "USB";
+            case android.media.AudioDeviceInfo.TYPE_USB_HEADSET: return "USB 헤드셋";
+            case android.media.AudioDeviceInfo.TYPE_USB_ACCESSORY: return "USB 액세서리";
+            case android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET: return "유선 헤드셋";
+            case android.media.AudioDeviceInfo.TYPE_BUILTIN_MIC: return "내장 마이크";
+            case android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO: return "블루투스";
+            case android.media.AudioDeviceInfo.TYPE_LINE_ANALOG: return "라인 입력";
+            case android.media.AudioDeviceInfo.TYPE_LINE_DIGITAL: return "디지털 입력";
+            default: return "입력";
+        }
+    }
+
+    private String nativeInputsJson() {
+        org.json.JSONArray arr = new org.json.JSONArray();
+        try {
+            android.media.AudioManager am = (android.media.AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            List<android.media.AudioDeviceInfo> usb = new ArrayList<>(), other = new ArrayList<>();
+            for (android.media.AudioDeviceInfo d : am.getDevices(android.media.AudioManager.GET_DEVICES_INPUTS)) {
+                int t = d.getType();
+                if (t == android.media.AudioDeviceInfo.TYPE_TELEPHONY || t == android.media.AudioDeviceInfo.TYPE_FM_TUNER
+                        || t == android.media.AudioDeviceInfo.TYPE_REMOTE_SUBMIX || t == android.media.AudioDeviceInfo.TYPE_IP) continue;
+                if (t == android.media.AudioDeviceInfo.TYPE_USB_DEVICE || t == android.media.AudioDeviceInfo.TYPE_USB_HEADSET
+                        || t == android.media.AudioDeviceInfo.TYPE_USB_ACCESSORY) usb.add(d); else other.add(d);
+            }
+            usb.addAll(other);
+            boolean builtinSeen = false;
+            for (android.media.AudioDeviceInfo d : usb) {
+                if (d.getType() == android.media.AudioDeviceInfo.TYPE_BUILTIN_MIC) { if (builtinSeen) continue; builtinSeen = true; }   // 내장 마이크는 하나만
+                JSONObject o = new JSONObject();
+                o.put("id", d.getId());
+                o.put("name", String.valueOf(d.getProductName()));
+                o.put("type", typeName(d.getType()));
+                o.put("usb", d.getType() == android.media.AudioDeviceInfo.TYPE_USB_DEVICE || d.getType() == android.media.AudioDeviceInfo.TYPE_USB_HEADSET || d.getType() == android.media.AudioDeviceInfo.TYPE_USB_ACCESSORY);
+                org.json.JSONArray ch = new org.json.JSONArray();
+                for (int c : d.getChannelCounts()) ch.put(c);
+                o.put("channels", ch);
+                org.json.JSONArray sr = new org.json.JSONArray();
+                for (int r : d.getSampleRates()) sr.put(r);
+                o.put("rates", sr);
+                arr.put(o);
+            }
+        } catch (Exception ignored) { }
+        return arr.toString();
+    }
+
     // ───────── 웹 ↔ 앱 연결 ─────────
     private class NativeBridge {
         @JavascriptInterface
@@ -223,6 +283,14 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void startMediaCapture() { ui.post(MainActivity.this::beginMediaCapture); }
+
+        /** 🎛️ 안드로이드가 인식한 오디오 입력 목록 (USB 오디오 인터페이스를 맨 앞에) — JSON 배열 */
+        @JavascriptInterface
+        public String listNativeInputs() { return nativeInputsJson(); }
+
+        /** 🎛️ 입력 장치를 네이티브 스테레오로 캡처 시작 (id = -1 이면 기본 입력) */
+        @JavascriptInterface
+        public void startNativeInput(final int id) { ui.post(() -> beginNativeInput(id)); }
 
         @JavascriptInterface
         public void stopMediaCapture() { ui.post(() -> KeepAliveService.stopMedia(MainActivity.this)); }
@@ -279,6 +347,14 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode == REQ_AUDIO_INPUT) {
+            boolean ok = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
+            int id = pendingInputId;
+            pendingInputId = Integer.MIN_VALUE;
+            if (ok) KeepAliveService.startInput(this, id);
+            else emitMedia("denied", "오디오 녹음 권한이 필요합니다");
+            return;
+        }
         if (requestCode == REQ_AUDIO_MEDIA) {
             boolean ok = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
             if (ok) beginMediaCapture();
