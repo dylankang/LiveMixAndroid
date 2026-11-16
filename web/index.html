@@ -91,6 +91,7 @@
     <!-- 5) 5줄 HUD 프리뷰 -->
     <section class="card">
       <h2>HUD <small>G2 동기화 · 1줄 피드백 / 2~5줄 조언</small></h2>
+      <div id="aiHeard" class="ai-heard" title="AI 가 첨부 오디오를 듣고 판단한 소스 (디버그)">🎧 AI 청취: 아직 없음</div>
       <div id="hud">
         <div id="hudCd" class="hud-cd" hidden></div>
         <div class="hud-line fb" id="hud0"></div>
@@ -131,6 +132,10 @@
 
       <h3>AI</h3>
       <label>AI 서비스 <select id="provider"></select></label>
+      <div id="syncRow" class="sync-row">
+        <button id="syncModels" class="small" type="button">🔄 AI Studio 모델 목록 불러오기</button>
+        <div id="syncInfo" class="hint">API Key 가 있으면 AI Studio 에서 텍스트 출력(generateContent) 모델 목록을 자동으로 받아 아래 드롭다운에 합칩니다.</div>
+      </div>
       <div class="prio">
         <label>1순위 모델 <select id="model1"></select></label>
         <input id="custom1" type="text" placeholder="1순위 모델 ID 직접 입력" hidden />

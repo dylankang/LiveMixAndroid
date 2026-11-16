@@ -30,7 +30,8 @@ class LmClock extends AudioWorkletProcessor {
     super(); this.acc = 0; this.every = Math.round(sampleRate / 10); this.sq = [0, 0]; this.pk = [0, 0]; this.n = 0;
     this.frame = Math.round(sampleRate / 100); this.fn = 0; this.eLow = 0; this.eFull = 0; this.lp = 0;
     this.a = 1 - Math.exp(-2 * Math.PI * 150 / sampleRate); this.envLow = []; this.envFull = [];
-    this.cl = new Float32Array(this.every + 512); this.cr = new Float32Array(this.every + 512); this.cn = 0;   // 최근 3초 오디오 클립용 원음 L/R (합치지 않음)
+    // 오디오 클립용 원음 L/R: process() 콜백이 받는 모든 프레임을 1샘플도 빠짐·겹침 없이 그대로 기록 (L/R 합치지 않음)
+    this.cap = this.every * 2 + 1024; this.cl = new Float32Array(this.cap); this.cr = new Float32Array(this.cap); this.cn = 0; this.total = 0;
   }
   process(inputs) {
     const inp = inputs[0];
@@ -43,26 +44,34 @@ class LmClock extends AudioWorkletProcessor {
         if (pa > this.pk[0]) this.pk[0] = pa;
         if (pb > this.pk[1]) this.pk[1] = pb;
         const m = (a + b) * 0.5;
-        if (this.cn < this.cl.length) { this.cl[this.cn] = a; this.cr[this.cn] = b; this.cn++; }
+        this.cl[this.cn] = a; this.cr[this.cn] = b;
+        if (++this.cn >= this.cap) this.flush();      // 버퍼가 차면 즉시 보냄 (절대 버리지 않음)
         this.lp += this.a * (m - this.lp);
         this.eLow += this.lp * this.lp; this.eFull += m * m;
         if (++this.fn >= this.frame) { this.envLow.push(this.eLow / this.fn); this.envFull.push(this.eFull / this.fn); this.fn = 0; this.eLow = 0; this.eFull = 0; }
       }
       this.n += L.length;
     }
-    this.acc += 128;
+    this.acc += inp && inp.length ? inp[0].length : 128;
     if (this.acc >= this.every) {
       this.acc -= this.every;
       const db = x => (x > 1e-7 ? 20 * Math.log10(x) : -120), n = this.n || 1;
-      const cl = this.cl.slice(0, this.cn), cr = this.cr.slice(0, this.cn); this.cn = 0;
+      this.flush();
       this.port.postMessage({ type: 'tick',
         rms: [db(Math.sqrt(this.sq[0] / n)), db(Math.sqrt(this.sq[1] / n))],
         peak: [db(this.pk[0]), db(this.pk[1])],
-        envLow: this.envLow, envFull: this.envFull, cl, cr }, [cl.buffer, cr.buffer]);
+        envLow: this.envLow, envFull: this.envFull });
       this.sq[0] = this.sq[1] = 0; this.pk[0] = this.pk[1] = 0; this.n = 0;
       this.envLow = []; this.envFull = [];
     }
     return true;
+  }
+  /** 모은 L/R 원음을 메인 스레드로 (seq = 이 조각 첫 샘플의 누적 번호 → 받는 쪽에서 누락/겹침 검사) */
+  flush() {
+    if (!this.cn) return;
+    const cl = this.cl.slice(0, this.cn), cr = this.cr.slice(0, this.cn);
+    this.port.postMessage({ type: 'clip', seq: this.total, cl, cr }, [cl.buffer, cr.buffer]);
+    this.total += this.cn; this.cn = 0;
   }
 }
 registerProcessor('lm-clock', LmClock);`;
@@ -200,8 +209,10 @@ export class AudioEngine {
   private tickCached = false;
   /** 🎧 최근 3초 원음(모노) — AI 첨부용 WAV 클립 */
   private clip = new ClipRing();
-  /** 최근 3초 스테레오 클립 (1초 미만이면 null) */
+  /** 최근 3.5초 스테레오 클립 (1초 미만이면 null) */
   clipSnapshot() { return this.clip.snapshot(1); }
+  /** 클립 연속성 (누락·겹침 횟수) */
+  clipHealth() { return { gaps: this.clip.gaps, overlaps: this.clip.overlaps, received: this.clip.received, sr: this.clip.sr }; }
 
   /** 템포 추정용 10ms 에너지 엔벨로프 (최근 20초) */
   private envLow: number[] = [];
@@ -315,7 +326,10 @@ export class AudioEngine {
       track.addEventListener('ended', () => { if (this.running) this.onEnded(); });
       const settings = track.getSettings();
       this.openInfo = { step, label: track.label || '', settings, usb: this.usbPicked };
-      ctx = new AudioContext({ latencyHint: 'interactive' });
+      // 입력 장치와 같은 샘플레이트로 컨텍스트를 연다 → 브라우저의 입력 리샘플러(클럭 보정 시 미세 단절 발생)를 거치지 않음
+      const devRate = typeof settings.sampleRate === 'number' && settings.sampleRate >= 8000 ? settings.sampleRate : 0;
+      try { ctx = new AudioContext(devRate ? { latencyHint: 'interactive', sampleRate: devRate } : { latencyHint: 'interactive' }); }
+      catch { ctx = new AudioContext({ latencyHint: 'interactive' }); }
       const src = ctx.createMediaStreamSource(this.stream!);
       this.src = src;
       const n = Math.max(1, settings.channelCount ?? src.channelCount ?? 2);
@@ -619,9 +633,9 @@ export class AudioEngine {
       const node = new AudioWorkletNode(ctx, 'lm-clock', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] });
       node.port.onmessage = ev => {
         const d = ev.data;
+        if (d?.type === 'clip') { if (d.cl instanceof Float32Array && d.cr instanceof Float32Array) this.clip.push(d.cl, d.cr, ctx.sampleRate, d.seq); return; }
         if (d?.type !== 'tick') return;
         if (Array.isArray(d.rms) && Array.isArray(d.peak)) this.wk = { rms: [d.rms[0], d.rms[1]], peak: [d.peak[0], d.peak[1]], at: performance.now() };
-        if (d.cl instanceof Float32Array && d.cr instanceof Float32Array && d.cl.length) this.clip.push(d.cl, d.cr, ctx.sampleRate);
         if (Array.isArray(d.envLow) && Array.isArray(d.envFull) && !this.idle) {
           for (let k = 0; k < d.envLow.length; k++) { this.envLow.push(d.envLow[k]); this.envFull.push(d.envFull[k] ?? 0); }
           if (this.envLow.length > ENV_MAX) { const cut = this.envLow.length - ENV_MAX; this.envLow.splice(0, cut); this.envFull.splice(0, cut); }
@@ -635,10 +649,12 @@ export class AudioEngine {
       try {
         const sp = ctx.createScriptProcessor(4096, 2, 1);
         src.connect(sp); sp.connect(sink);
+        let spSeq = 0;
         sp.onaudioprocess = e => {
-          try {
+          try {   // onaudioprocess 는 4096 프레임씩 끊김 없이 연속으로 들어온다
             const ib = e.inputBuffer, l = new Float32Array(ib.getChannelData(0));
-            this.clip.push(l, ib.numberOfChannels > 1 ? new Float32Array(ib.getChannelData(1)) : l, ctx.sampleRate);
+            this.clip.push(l, ib.numberOfChannels > 1 ? new Float32Array(ib.getChannelData(1)) : l, ctx.sampleRate, spSeq);
+            spSeq += l.length;
           } catch { /* ignore */ }
           try { this.onAudioBeat(); } catch { /* ignore */ }
         };

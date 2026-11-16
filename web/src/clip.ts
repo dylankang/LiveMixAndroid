@@ -1,11 +1,15 @@
-// 🎧 최근 3초 오디오 클립: AI 가 실제 소리를 듣고 판단하도록 Gemini 에 WAV 로 첨부한다.
-//  · ClipRing       : 원음 L/R 을 합치지 않고 각각 최근 3초만 유지하는 스테레오 링 버퍼
+// 🎧 최근 3.5초 오디오 클립: AI 가 실제 소리를 듣고 판단하도록 Gemini 에 WAV 로 첨부한다.
+//  · ClipRing       : 원음 L/R 을 합치지 않고 각각 최근 3.5초만 유지하는 스테레오 링 버퍼
+//                     오디오 스레드 콜백(AudioWorklet process / ScriptProcessor onaudioprocess)이 받은 모든 프레임을
+//                     순번(seq)과 함께 이어 붙이고, 누락·겹침이 생기면 그 앞 구간을 버려 항상 끊김 없는 파형만 보낸다
 //                     (L+R 합산은 고역이 잘리고 스테레오 악기가 위상 상쇄로 사라져 AI 가 악기를 잘못 알아듣는 원인)
-//  · encodeWavStereo: 44.1kHz · 2채널 · 16-bit PCM WAV (약 530KB, 인터리브 L,R,L,R…) + Base64 — 리샘플은 브라우저 내장(OfflineAudioContext)
+//  · encodeWavStereo: 44.1kHz · 2채널 · 16-bit PCM WAV (3.5초 약 617KB, 인터리브 L,R,L,R…) + Base64 — 리샘플은 브라우저 내장(OfflineAudioContext)
+//                     인코딩 직전 피크 정규화: 가장 큰 샘플이 0.89(-1dBFS)가 되게 전체 파형을 증폭 (게이트·DSP 수치는 원본 기준)
 //  · analyzeClip    : WAV 와 정확히 같은 3초 구간의 단기 지표 (6밴드 평균·피크, 크레스트, 스펙트럼 중심, 음성대역 비율, 어택 수, 스테레오)
 import { BANDS } from './config';
 
-export const CLIP_SEC = 3;
+export const CLIP_SEC = 3.5;
+export const PEAK_TARGET = 0.89;   // -1dBFS
 export const WAV_RATE = 44100;
 
 export interface StereoClip { l: Float32Array; r: Float32Array; sr: number }
@@ -15,19 +19,30 @@ export class ClipRing {
   private br = new Float32Array(0);
   private pos = 0;
   private filled = 0;
+  private next = -1;          // 다음에 와야 할 샘플 순번
   sr = 0;
+  /** 연속성 검사 결과 (누락·겹침 발생 횟수, 받은 총 샘플) */
+  gaps = 0; overlaps = 0; received = 0;
 
-  /** L/R 샘플 추가 (샘플레이트가 바뀌면 비우고 새로 시작) */
-  push(l: Float32Array, r: Float32Array, sr: number) {
+  /** L/R 샘플 추가 (seq = 첫 샘플의 누적 순번. 샘플레이트가 바뀌면 비우고 새로 시작) */
+  push(l: Float32Array, r: Float32Array, sr: number, seq?: number) {
     if (sr !== this.sr) {
       this.sr = sr; const n = Math.round(sr * CLIP_SEC);
-      this.bl = new Float32Array(n); this.br = new Float32Array(n); this.pos = 0; this.filled = 0;
+      this.bl = new Float32Array(n); this.br = new Float32Array(n); this.pos = 0; this.filled = 0; this.next = -1;
     }
+    if (seq !== undefined) {
+      if (this.next >= 0 && seq !== this.next) {          // 끊김: 이어 붙이면 파형이 단절되므로 앞 구간을 버리고 새로 시작
+        if (seq > this.next) this.gaps++; else this.overlaps++;
+        this.filled = 0;
+      }
+      this.next = seq + Math.min(l.length, r.length);
+    }
+    this.received += Math.min(l.length, r.length);
     const n = this.bl.length, m = Math.min(l.length, r.length);
     for (let i = 0; i < m; i++) { this.bl[this.pos] = l[i]; this.br[this.pos] = r[i]; this.pos = (this.pos + 1) % n; }
     this.filled = Math.min(n, this.filled + m);
   }
-  clear() { this.pos = 0; this.filled = 0; }
+  clear() { this.pos = 0; this.filled = 0; this.next = -1; this.gaps = 0; this.overlaps = 0; this.received = 0; }
 
   /** 시간 순서대로 정렬한 최근 L/R (minSec 미만이면 null) */
   snapshot(minSec = 1): StereoClip | null {
@@ -49,7 +64,8 @@ export function clipRmsDb(c: StereoClip): number {
 
 const dB = (p: number) => (p > 1e-12 ? Math.round(10 * Math.log10(p) * 10) / 10 : -120);
 
-/** 44.1kHz 스테레오 16-bit WAV (인터리브 L,R). 콘솔 입력이 작아도 AI 가 잘 들을 수 있게 L/R 공통 게인으로 피크 -3dBFS 정규화 (최대 +30dB, 좌우 밸런스 유지) */
+/** 44.1kHz 스테레오 16-bit WAV (인터리브 L,R). 콘솔 입력이 -20~-30dBFS 로 작아도 AI 가 배음을 읽을 수 있게
+ *  L/R 공통 게인으로 가장 큰 피크를 0.89(-1dBFS)에 맞춘다 (좌우 밸런스 유지 · 원본 데이터는 그대로) */
 export async function encodeWavStereo(c: StereoClip): Promise<{ base64: string; bytes: number; seconds: number; gainDb: number }> {
   let L = c.l, R = c.r;
   if (c.sr !== WAV_RATE) {
@@ -64,14 +80,14 @@ export async function encodeWavStereo(c: StereoClip): Promise<{ base64: string; 
   }
   let peak = 0;
   for (let i = 0; i < L.length; i++) { const a = Math.abs(L[i]), b = Math.abs(R[i]); if (a > peak) peak = a; if (b > peak) peak = b; }
-  const gain = peak > 1e-6 ? Math.min(Math.pow(10, 30 / 20), Math.pow(10, -3 / 20) / peak) : 1;
+  const gain = peak > 1e-6 ? PEAK_TARGET / peak : 1;
   const n = L.length, ch = 2, buf = new ArrayBuffer(44 + n * ch * 2), v = new DataView(buf);
   const str = (o: number, t: string) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
   str(0, 'RIFF'); v.setUint32(4, 36 + n * ch * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
   v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, ch, true);
   v.setUint32(24, WAV_RATE, true); v.setUint32(28, WAV_RATE * ch * 2, true); v.setUint16(32, ch * 2, true); v.setUint16(34, 16, true);
   str(36, 'data'); v.setUint32(40, n * ch * 2, true);
-  const q = (x: number) => Math.max(-32768, Math.min(32767, Math.round(x * gain * 32767)));
+  const q = (x: number) => Math.max(-32767, Math.min(32767, Math.round(x * gain * 32767)));
   for (let i = 0, o = 44; i < n; i++, o += 4) { v.setInt16(o, q(L[i]), true); v.setInt16(o + 2, q(R[i]), true); }
   const bytes = new Uint8Array(buf);
   let bin = '';

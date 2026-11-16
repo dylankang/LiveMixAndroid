@@ -20,25 +20,45 @@ features.longTerm 은 최근 약 1분 평균이다. 이번 구간(features)과 �
 
 /** 장르만 판별하는 짧은 프롬프트 — 로컬 필터를 통과해 조언이 필요 없는 주기에도 장르는 AI 조언 주기마다 갱신 */
 export function buildGenrePrompt(hasAudio = false): string {
-  return `너는 시니어 음향 엔지니어다. ${hasAudio ? '첨부된 최근 3초 WAV 오디오를 직접 듣고, 2트랙 분석 JSON 은 확인용으로 써서' : '2트랙(스테레오 믹스) 분석 JSON 을 보고'} 지금 연주 중인 음악의 장르/상태만 판별한다.
-${GENRE_GUIDE}${hasAudio ? '\n귀로 들은 악기 편성·리듬·보컬 스타일을 가장 중요하게 보고, 수치는 확인용으로 써라.' : ''}
+  return `너는 시니어 음향 엔지니어다. ${hasAudio ? '첨부된 최근 3.5초 WAV 오디오를 직접 듣고, 2트랙 분석 JSON 은 확인용으로 써서' : '2트랙(스테레오 믹스) 분석 JSON 을 보고'} 지금 연주 중인 음악의 장르/상태만 판별한다.
+${GENRE_GUIDE}${hasAudio ? '\n귀로 들은 악기 편성·리듬·보컬 스타일을 가장 중요하게 보고, 수치는 확인용으로 써라.\n\n' + TIMBRE_GUIDE : ''}
 
-출력 형식(엄수): 한 줄만 \`GENRE:<장르/세부 스타일>\` (Solo 는 \`GENRE:Solo|<악기이름>\`). 그 밖의 글, 조언, 설명은 출력하지 마라.`;
+${hasAudio ? jsonOutputSpec(true, false) : '출력 형식(엄수): 한 줄만 \`GENRE:<장르/세부 스타일>\` (Solo 는 \`GENRE:Solo|<악기이름>\`). 그 밖의 글, 조언, 설명은 출력하지 마라.'}`;
+}
+
+/** 악기 음색 구분 음향학 가이드 (브라스 vs 피아노/어쿠스틱기타) */
+const TIMBRE_GUIDE = `[악기 음색 구분 — 소리 형태(어택·서스테인·배음)로 판별]
+- 악기 종류 판별은 100% 첨부된 WAV 오디오 청취로만 결정하고, DSP 수치는 해당 악기의 주파수(Hz)와 레벨(dB) 처방값을 적을 때만 참고하라.
+- 브라스(트럼펫/색소폰/트롬본) vs 피아노/어쿠스틱기타 구분: 소리가 시작될 때 호흡/리드/립 슬러와 함께 음량이 부풀어 오르거나(Swell) 일정하게 지속(Sustain)되며 1kHz~5kHz 대역에 강한 금속성/리드 배음이 들리면 **[브라스]**다. 반대로 첫 순간 날카로운 타격/탄현(Pluck/Hammer) 어택 직후 소리가 급격히 줄어드는(Exponential Decay) 경우에만 [피아노]나 [어쿠스틱기타]로 판정하라. 중역대 멜로디나 솔로가 나온다고 해서 무조건 피아노나 기타로 단정 짓지 마라.`;
+
+/** Gemini JSON 응답 형식 설명 (responseSchema 와 같은 구조) */
+function jsonOutputSpec(genreOnly: boolean, eager: boolean): string {
+  return `출력 형식(엄수) — 아래 키를 이 순서대로 가진 JSON 객체 하나만 출력하라. 마크다운·설명 금지.
+{
+  "acoustic_analysis": "먼저 귀로 들은 주 악기의 어택/서스테인/배음/좌우 정위 특성을 한국어 한두 문장으로 요약 (예: 숨소리와 함께 뻗어 나오는 금관악기 지속음 및 강한 1~4kHz 배음 -> 브라스 솔로)",
+  "detected_active_sources": ["오디오에서 실제로 소리가 확인된 악기/보컬만, 짧은 한국어 이름 (예: 브라스, 드럼, 베이스, 남성보컬)"],
+  "genre": "장르/세부 스타일 (Solo 는 \"Solo|<악기이름>\", 스피치는 \"스피치/설교\") — GENRE: 접두어 없이",
+  "advice_lines": ${genreOnly ? '[] (이번 요청은 장르/청취만 — 반드시 빈 배열)' : `["[조절 대상] 분류:내용", ...] ${eager ? '2~4개 (중요한 순서대로 · 손댈 곳이 정말 없을 때만 빈 배열)' : '0~4개 (중요한 순서대로, 보통 1~2개 · 문제가 없으면 빈 배열)'}`}
+}
+- 반드시 acoustic_analysis → detected_active_sources 순서로 소리 형태를 먼저 판별한 뒤에 advice_lines 를 작성하라.
+- advice_lines 의 [조절 대상]은 detected_active_sources 에 들어 있는 소스(또는 그 소스의 세부 파트·그룹: 예) 드럼 → [킥]·[스네어]·[드럼버스])나 [마스터]만 쓸 수 있다. 목록에 없는 악기를 쓰면 화면에서 자동으로 버려진다.`;
 }
 
 /** tolDb = 슬라이더로 정한 허용 편차. 로컬 필터와 AI가 같은 기준(±tolDb)을 쓴다. 0 = '항상 AI' 적극 조언 모드 */
 /** 오디오 첨부(Gemini)일 때: 먼저 듣고 식별하는 규칙 */
 const LISTEN_RULES = `[1단계 — 실제 오디오 청취로 소스 식별 (가장 중요)]
-- 첨부된 3초 WAV 오디오를 직접 듣고, 지금 이 순간 실제로 연주되고 들리는 악기와 보컬만 식별하라.
+- 첨부된 3.5초 WAV 오디오를 직접 듣고, 지금 이 순간 실제로 연주되고 들리는 악기와 보컬만 식별하라.
 - 첨부된 44.1kHz 스테레오 WAV 오디오의 좌우 정위(Panning)와 고역 배음을 주의 깊게 듣고, 악기의 음색을 명확히 구분하라. 중역대 화음이 들린다고 해서 습관적으로 [피아노]로 단정 짓지 마라.
 - 믹스 전체에서 뒤로 빠져 작게 들리는 배경 악기 하나에만 계속 집착하지 말고, 현재 사운드에서 가장 에너지가 지배적인 주선율 악기(보컬, 브라스, 리드 기타 등)와 리듬 섹션(킥, 스네어, 베이스, 하이햇/오버헤드) 간의 마스킹 및 레벨 밸런스를 최우선으로 진단하라.
 - 오디오에서 사람의 노래나 말소리가 실제로 들리지 않으면(연주곡·간주 구간 등), DSP 중역대 수치가 아무리 높아도 절대 [남성보컬], [여성보컬], [메인보컬], [코러스]를 출력하지 마라.
 - 실제 오디오에서 들리지 않는 악기(어쿠스틱 기타, 첼로, 스트링, 브라스, 피아노 등)를 주파수 대역 수치만 보고 추측해서 지어내는 것을 엄격히 금지한다. 확신이 없으면 그 악기는 언급하지 마라.
 - 보컬이 들리면 실제 목소리의 음색과 피치(포먼트)를 듣고 [남성보컬]과 [여성보컬]을 정확히 구분하라. 여러 명이 같이 부르면 [코러스].
-- 첨부 오디오는 듣기 쉽게 음량이 정규화되어 있다(audio.gainDb). 레벨의 크고 작음은 소리 크기가 아니라 DSP 수치로 판단하라.`;
+- 첨부 오디오는 듣기 쉽게 피크 -1dBFS 로 정규화되어 있다(audio.gainDb). 레벨의 크고 작음은 소리 크기가 아니라 DSP 수치(원본 dB)로 판단하라.
+
+${TIMBRE_GUIDE}`;
 
 /** tolDb = 슬라이더로 정한 허용 편차. 로컬 필터와 AI가 같은 기준(±tolDb)을 쓴다. 0 = '항상 AI' 적극 조언 모드
- *  hasAudio = 최근 3초 WAV 를 함께 보낼 때(Gemini) → '선(先) 청취 · 후(後) 수치 처방' */
+ *  hasAudio = 최근 3.5초 WAV 를 함께 보낼 때(Gemini) → '선(先) 청취 · 후(後) 수치 처방' */
 export function buildSystemPrompt(tolDb: number, hasAudio = false): string {
   const th = tolDb;
   const eager = th <= 0;
@@ -75,7 +95,7 @@ ${hasAudio ? '' : '- 남/여 보컬 구분 참고: voiceBandSharePct 가 높게 
 입력 JSON:
 - inputMode: console-2track-raw(FOH 콘솔 2트랙 직결, 절대 레벨 의미 있음). levelReference 가 auto-trim 이면 레벨은 -18dBFS 기준 정규화값이므로 상대 비율로 판단. captureNote 가 있으면 고려.
 - bands / features / peaks: 전체 분석 구간(windowSec) 평균. 6개 대역(Sub 20-60, Low 60-250, Low-Mid 250-500, Mid 500-2k, High-Mid 2k-6k, High 6k-16k Hz)의 avgDb/peakDb/crestDb, deltaDb(일반 음악 타겟 대비 편차 · +과다 −부족), 스펙트럼 상대 에너지(relativeSpectralBalanceDb), bandCrestDb, transientDensityPerMin(low/mid/highMid 분당 어택), transientFluxDb, spectralCentroidHz, decayTail(ratioPct 잔향이 골짜기를 채우는 정도 · decayDbPerSec 감쇠 속도), fullCrestDb, subVsMidDb, voiceBandSharePct, tempo(BPM·신뢰도), longTerm(최근 약 1분 평균)
-${hasAudio ? '- last3s: 첨부 WAV 와 정확히 같은 최근 3초의 단기 지표. bands 의 avgDb(3초 평균)·peakDb(가장 센 순간)·relDb(전체 대비), crestDb, spectralCentroidHz, voiceBandSharePct, onsetsPerSec. 순간적인 스네어 타격·치찰음·베이스 어택은 여기서 확인하라.\n- last3s.stereo: correlation(L/R 상관, 1=모노·낮을수록 넓음·음수=역위상), sideToMidDb(스테레오 폭), balanceDb(+ = 왼쪽이 큼)\n- audio: 첨부 오디오 정보(seconds, sampleRate 44100, channels 2, gainDb 정규화 게인 — L/R 동일 게인이라 좌우 밸런스는 그대로)\n' : ''}- signal(활성 대역 등), peaks(협대역 피크 hz/levelDb/prominenceDb), toleranceDb, currentDisplay(현재 HUD 표시 중), cooldownList(쿨다운 중)
+${hasAudio ? '- lastClip: 첨부 WAV 와 정확히 같은 최근 3.5초의 단기 지표(정규화 전 원본). bands 의 avgDb(구간 평균)·peakDb(가장 센 순간)·relDb(전체 대비), crestDb, spectralCentroidHz, voiceBandSharePct, onsetsPerSec. 순간적인 스네어 타격·치찰음·베이스 어택은 여기서 확인하라.\n- lastClip.stereo: correlation(L/R 상관, 1=모노·낮을수록 넓음·음수=역위상), sideToMidDb(스테레오 폭), balanceDb(+ = 왼쪽이 큼)\n- audio: 첨부 오디오 정보(seconds, sampleRate 44100, channels 2, gainDb 피크 -1dBFS 정규화 게인 — L/R 동일 게인이라 좌우 밸런스는 그대로)\n' : ''}- signal(활성 대역 등), peaks(협대역 피크 hz/levelDb/prominenceDb), toleranceDb, currentDisplay(현재 HUD 표시 중), cooldownList(쿨다운 중)
 
 ${hasAudio ? LISTEN_RULES + '\n\n' : ''}[${hasAudio ? '2' : '1'}단계 — 장르/상태 판별]
 ${GENRE_GUIDE}${hasAudio ? '\n장르도 먼저 귀로 판단하고, 수치는 확인용으로 써라.' : ''}
@@ -90,12 +110,14 @@ ${eager
 영역 우선순위: Level · EQ · Comp 를 먼저, 그다음 필요하면 HPF/LPF, Reverb/Delay(잔향 과다·명료도 저하: decayTail 높고 Mid/High-Mid 낮을 때), De-Esser(치찰음), Gate(탐 잔진동·블리드), DynEQ(대역 간 마스킹), Pan/Width(중역 밀집).
 지속음 성격의 문제는 EQ·DynEQ, 순간 피크 성격은 Comp·Gate 를 우선 고려해라.
 
-출력 형식(엄수):
+${hasAudio ? jsonOutputSpec(false, eager) + `
+- 각 advice_lines 항목 형식: \`[조절 대상] 분류:내용\` (분류 = ${cats} 중 하나 · 대상에 대역명 금지) · 한글 기준 ${MAX_LINE_CHARS}자 이내
+- currentDisplay 나 cooldownList 와 같은 악기·같은 항목의 지적은 넣지 마라.` : `출력 형식(엄수):
 1줄: \`GENRE:<장르/세부 스타일>\` (Solo는 \`GENRE:Solo|<악기이름>\`)
 2줄부터: ${eager ? '조언 2~4줄 (중요한 순서대로 · NONE 은 예외적인 경우만)' : '\`NONE\` 또는 조언 최대 4줄 (중요한 순서대로, 보통 1~2줄)'}
 - 각 조언 줄 형식: \`[조절 대상] 분류:내용\` (분류 = ${cats} 중 하나 · 대상에 대역명 금지) · 한글 기준 ${MAX_LINE_CHARS}자 이내
 - currentDisplay 나 cooldownList 와 같은 악기·같은 항목의 지적은 출력하지 마라.
-- 그 밖의 설명, 번호, 마크다운은 출력하지 마라.`;
+- 그 밖의 설명, 번호, 마크다운은 출력하지 마라.`}`;
 }
 
 const TIMEOUT_MS = 7_000;     // 백그라운드/느린 망에서 분석 루프(inFlight)가 영구 잠기지 않도록 짧게
@@ -148,22 +170,52 @@ export const supportsAudio = (p: ProviderId) => p === 'gemini';
 /** 없는 악기를 지어내지 않도록 낮춘 생성 파라미터 */
 const GEN = { temperature: 0.25, topP: 0.8, topK: 20 } as const;   // 0.25: 한 악기(피아노 등)로 쏠리는 편향 완화
 
-export async function callAI(provider: ProviderId, model: string, apiKey: string, systemPrompt: string, userContent: string, audioWavBase64?: string): Promise<string> {
+/** Gemini 2단계 JSON 응답 스키마: 소리 형태 판별(acoustic_analysis·detected_active_sources) → 조언(advice_lines) */
+export const ADVICE_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    acoustic_analysis: { type: 'STRING' },
+    detected_active_sources: { type: 'ARRAY', items: { type: 'STRING' } },
+    genre: { type: 'STRING' },
+    advice_lines: { type: 'ARRAY', items: { type: 'STRING' } },
+  },
+  required: ['acoustic_analysis', 'detected_active_sources', 'genre', 'advice_lines'],
+  propertyOrdering: ['acoustic_analysis', 'detected_active_sources', 'genre', 'advice_lines'],
+} as const;
+
+/** 구조화 출력(responseSchema)을 지원하지 않는 모델이 돌려주는 400 오류인지 */
+const isSchemaUnsupported = (e: unknown) => e instanceof ApiError && e.status === 400
+  && /response_?schema|response_?mime|json mode|propertyOrdering|structured output|mime type/i.test(e.message);
+
+export async function callAI(provider: ProviderId, model: string, apiKey: string, systemPrompt: string, userContent: string, audioWavBase64?: string, json = false): Promise<string> {
   if (!apiKey) throw new Error('API Key가 없습니다');
   switch (provider) {
     case 'gemini': {
-      const j = await post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-        { 'x-goog-api-key': apiKey },
-        {
-          systemInstruction: { parts: [{ text: systemPrompt }] },
-          // 최근 3초 WAV(44.1kHz 스테레오 16-bit) + DSP 수치·지시문을 함께 보냄
-          contents: [{ role: 'user', parts: audioWavBase64
-            ? [{ inlineData: { mimeType: 'audio/wav', data: audioWavBase64 } }, { text: userContent }]
-            : [{ text: userContent }] }],
-          generationConfig: { ...GEN, maxOutputTokens: 768 },   // 생각(thinking) 토큰 여유 포함
-        });
-      return (j.candidates?.[0]?.content?.parts ?? []).map((p: any) => p.text ?? '').join('');
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+      const body = (mode: 'schema' | 'mime' | 'text') => ({
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        // 최근 3.5초 WAV(44.1kHz 스테레오 16-bit) + DSP 수치·지시문을 함께 보냄
+        contents: [{ role: 'user', parts: audioWavBase64
+          ? [{ inlineData: { mimeType: 'audio/wav', data: audioWavBase64 } }, { text: userContent }]
+          : [{ text: userContent }] }],
+        generationConfig: {
+          ...GEN, maxOutputTokens: json ? 1536 : 768,   // 생각(thinking) 토큰 + JSON 여유
+          ...(mode !== 'text' ? { responseMimeType: 'application/json' } : {}),
+          ...(mode === 'schema' ? { responseSchema: ADVICE_SCHEMA } : {}),
+        },
+      });
+      let j: any;
+      if (!json) j = await post(url, { 'x-goog-api-key': apiKey }, body('text'));
+      else {
+        // JSON 스키마 강제 → 지원 안 하는 모델이면 JSON 모드만 → 그래도 안 되면 일반 텍스트(프롬프트로 JSON 요구)
+        try { j = await post(url, { 'x-goog-api-key': apiKey }, body('schema')); }
+        catch (e) {
+          if (!isSchemaUnsupported(e)) throw e;
+          try { j = await post(url, { 'x-goog-api-key': apiKey }, body('mime')); }
+          catch (e2) { if (!isSchemaUnsupported(e2)) throw e2; j = await post(url, { 'x-goog-api-key': apiKey }, body('text')); }
+        }
+      }
+      return (j.candidates?.[0]?.content?.parts ?? []).filter((p: any) => !p.thought).map((p: any) => p.text ?? '').join('');
     }
     case 'openai': {
       const j = await post('https://api.openai.com/v1/chat/completions', { Authorization: `Bearer ${apiKey}` }, {
@@ -187,7 +239,14 @@ export async function callAI(provider: ProviderId, model: string, apiKey: string
 }
 
 export interface Genre { category: string; instrument?: string; kind: 'music' | 'speech' | 'solo' }
-export interface ParsedReply { genre: Genre | null; advice: Candidate[]; none: boolean }
+export interface Heard { analysis: string; sources: string[] }
+export interface ParsedReply {
+  genre: Genre | null; advice: Candidate[]; none: boolean;
+  /** JSON 응답일 때: AI 가 들은 소리 (디버그 배지용) */
+  heard?: Heard;
+  /** 교차 검증에서 버린 조언 (detected_active_sources 에 없는 대상) */
+  rejected: string[];
+}
 
 /** 장르 텍스트 정리: 선택지 제한 없음. Solo·스피치만 특수 상태로 구분 */
 function parseGenre(cat: string, inst?: string): Genre {
@@ -202,6 +261,8 @@ function parseGenre(cat: string, inst?: string): Genre {
  * 조언 형식: `[대상악기] 항목:조치` — 항목은 Level/EQ/Comp 뿐 아니라 HPF/LPF/Reverb/Delay/De-Esser/Gate/DynEQ/Pan… 모두 허용
  */
 export function parseReply(raw: string): ParsedReply {
+  const js = parseJsonReply(raw);
+  if (js) return js;
   let genre: Genre | null = null;
   const advice: Candidate[] = [];
   let sawNone = false;
@@ -217,7 +278,100 @@ export function parseReply(raw: string): ParsedReply {
       if (!advice.some(x => x.tag === text)) advice.push({ tag: text, text });
     }
   }
-  return { genre, advice, none: advice.length === 0 && (sawNone || genre !== null) };
+  return { genre, advice, none: advice.length === 0 && (sawNone || genre !== null), rejected: [] };
+}
+
+// ───────── JSON 응답 + 악기 교차 검증 ─────────
+/** 같은 소스로 볼 수 있는 이름 묶음 (교차 검증 전용 — 출력 이름을 바꾸지는 않는다) */
+const SOURCE_FAMILIES: string[][] = [
+  ['보컬', '메인보컬', '리드보컬', '남성보컬', '여성보컬', '남자보컬', '여자보컬', '코러스', '백보컬', '백킹보컬', '보컬그룹', '합창', '성가대', '찬양대', '목소리', '음성', '랩', '래퍼', '스피치', '설교', '내레이션', 'vocal', 'vocals', 'vox', 'voice', 'choir'],
+  ['드럼', '드럼세트', '드럼킷', '킥', '킥드럼', '베이스드럼', '스네어', '하이햇', '햇', '탐', '탐탐', '플로어탐', '오버헤드', '심벌', '심벌즈', '라이드', '크래시', 'drum', 'drums', 'kick', 'snare', 'hihat', 'hat', 'tom', 'toms', 'overhead', 'overheads', 'cymbal', 'cymbals'],
+  ['퍼커션', '타악기', '콩가', '봉고', '카혼', '셰이커', '쉐이커', '탬버린', '젬베', '팀발레스', 'percussion'],
+  ['베이스', '베이스기타', '일렉베이스', '전기베이스', '신스베이스', '콘트라베이스', '더블베이스', '업라이트베이스', '808', 'bass'],
+  ['기타', '일렉기타', '전기기타', '일렉트릭기타', '어쿠스틱기타', '통기타', '리드기타', '리듬기타', '클래식기타', 'guitar', 'guitars'],
+  ['건반', '피아노', '그랜드피아노', '전자피아노', '일렉피아노', '키보드', '신스', '신디', '신디사이저', '오르간', '로즈', '패드', 'keys', 'piano', 'synth', 'organ', 'pad', 'keyboard'],
+  ['브라스', '금관', '관악', '혼섹션', '혼', '트럼펫', '트롬본', '색소폰', '색소폰솔로', '알토색소폰', '테너색소폰', '호른', '튜바', '플루겔혼', 'brass', 'horn', 'horns', 'trumpet', 'trombone', 'sax', 'saxophone'],
+  ['목관', '플루트', '클라리넷', '오보에', '바순', 'flute', 'clarinet', 'woodwind'],
+  ['스트링', '현악', '현악기', '바이올린', '비올라', '첼로', 'strings', 'string', 'violin', 'viola', 'cello'],
+];
+const MASTER_RE = /^(마스터|전체|전체믹스|믹스|메인|메인아웃|메인믹스|lr|master|mix|main)$/;
+const compact = (x: string) => x.toLowerCase().replace(/[\s_\-·/().]/g, '').replace(/(그룹|버스|bus|group|채널|ch|섹션|파트|솔로)$/, '');
+const ALL_MEMBERS = SOURCE_FAMILIES.flatMap((f, i) => f.map(m => ({ m: compact(m), i }))).sort((a, b) => b.m.length - a.m.length);
+function familyOf(x: string): number {
+  const c = compact(x);
+  const exact = ALL_MEMBERS.find(e => e.m === c);
+  if (exact) return exact.i;
+  const part = ALL_MEMBERS.find(e => e.m.length >= 2 && c.includes(e.m));
+  return part ? part.i : -1;
+}
+/** [대상]이 AI 가 실제로 들었다고 한 소스(또는 그 세부 파트·그룹·마스터)인지 */
+export function sourceAllowed(target: string, sources: string[]): boolean {
+  const t = compact(target);
+  if (!t) return false;
+  if (MASTER_RE.test(t)) return true;
+  const ft = familyOf(target);
+  return sources.some(s => {
+    const c = compact(s);
+    if (!c) return false;
+    if (c === t || (c.length >= 2 && t.includes(c)) || (t.length >= 2 && c.includes(t))) return true;
+    return ft >= 0 && ft === familyOf(s);
+  });
+}
+
+function parseJsonReply(raw: string): ParsedReply | null {
+  const txt = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+  const a = txt.indexOf('{'), b = txt.lastIndexOf('}');
+  if (a < 0 || b <= a) return null;
+  let o: any;
+  try { o = JSON.parse(txt.slice(a, b + 1)); } catch { return null; }
+  if (!o || typeof o !== 'object' || !('advice_lines' in o || 'detected_active_sources' in o)) return null;
+  const sources: string[] = (Array.isArray(o.detected_active_sources) ? o.detected_active_sources : [])
+    .map((x: unknown) => String(x).replace(/^\[|\]$/g, '').trim()).filter(Boolean).slice(0, 12);
+  const analysis = typeof o.acoustic_analysis === 'string' ? o.acoustic_analysis.trim() : '';
+  let genre: Genre | null = null;
+  if (typeof o.genre === 'string' && o.genre.trim()) {
+    const [g, inst] = o.genre.replace(/^GENRE\s*[:：]\s*/i, '').split('|');
+    if (g.trim()) genre = parseGenre(g, inst);
+  }
+  const advice: Candidate[] = [], rejected: string[] = [];
+  for (const line of Array.isArray(o.advice_lines) ? o.advice_lines : []) {
+    const s = String(line).trim();
+    if (!s || /^NONE$/i.test(s)) continue;
+    const n = normalizeAdvice(s);
+    if (!n) continue;
+    const text = clampText(`[${n.inst}] ${n.item}:${n.action}`);
+    if (!sourceAllowed(n.inst, sources)) { rejected.push(text); continue; }   // 들리지 않은 악기 → 버림
+    if (advice.length < 4 && !advice.some(x => x.tag === text)) advice.push({ tag: text, text });
+  }
+  return { genre, advice, none: advice.length === 0 && rejected.length === 0, heard: { analysis, sources }, rejected };
+}
+
+// ───────── Google AI Studio 모델 목록 (models.list) ─────────
+export interface RemoteModel { id: string; displayName: string }
+/** 텍스트 출력이 아닌 모델(임베딩·이미지·비디오·음성합성·AQA 등) */
+const NON_TEXT = /embed|imagen|veo|tts|aqa|image-generation|-image(-|$)|native-audio|-live-|^gemini-live/i;
+export async function listGeminiModels(apiKey: string): Promise<RemoteModel[]> {
+  const out: RemoteModel[] = [];
+  let token = '';
+  for (let page = 0; page < 10; page++) {
+    const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 10_000);
+    try {
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000${token ? `&pageToken=${encodeURIComponent(token)}` : ''}`,
+        { headers: { 'x-goog-api-key': apiKey }, signal: ctl.signal });
+      const text = await res.text();
+      if (!res.ok) throw new ApiError(res.status, `HTTP ${res.status}: ${text.slice(0, 160)}`);
+      const j = JSON.parse(text);
+      for (const m of j.models ?? []) {
+        const id = String(m.name ?? '').replace(/^models\//, '');
+        const methods: string[] = m.supportedGenerationMethods ?? [];
+        if (!id || !methods.includes('generateContent') || NON_TEXT.test(id)) continue;
+        if (!out.some(x => x.id === id)) out.push({ id, displayName: String(m.displayName ?? '').trim() });
+      }
+      token = j.nextPageToken ?? '';
+      if (!token) break;
+    } finally { clearTimeout(timer); }
+  }
+  return out;
 }
 
 export function modelsFor(p: ProviderId) { return PROVIDERS[p].models; }

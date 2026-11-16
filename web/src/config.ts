@@ -1,8 +1,18 @@
 export type ProviderId = 'gemini' | 'openai' | 'claude';
 
 // 모델 목록은 여기서만 수정하면 UI에 반영됩니다. (UI에는 "직접 입력"도 추가됨)
+/** Google AI Studio 텍스트 출력(generateContent) Gemini 모델 — 설정 드롭다운의 <optgroup> 묶음 (API Key 가 있으면 models.list 로 실시간 병합) */
+export const GEMINI_GROUPS: { label: string; models: string[] }[] = [
+  { label: 'Gemini 3.5 / 3.1 / 3.0', models: [
+    'gemini-3.5-pro', 'gemini-3.5-flash', 'gemini-3.5-flash-lite',
+    'gemini-3.1-pro', 'gemini-3.1-pro-preview', 'gemini-3.1-flash', 'gemini-3.1-flash-lite', 'gemini-3.1-flash-lite-preview',
+    'gemini-3.0-pro', 'gemini-3.0-flash', 'gemini-3.0-flash-lite'] },
+  { label: 'Gemini 2.5', models: ['gemini-2.5-pro', 'gemini-2.5-pro-preview', 'gemini-2.5-flash', 'gemini-2.5-flash-preview', 'gemini-2.5-flash-lite', 'gemini-2.5-flash-lite-preview'] },
+  { label: 'Gemini 2.0 · 기타 텍스트 출력', models: ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-2.0-pro-exp', 'gemini-exp-1206', 'learnlm-2.0-flash-experimental'] },
+];
+
 export const PROVIDERS: Record<ProviderId, { label: string; models: string[] }> = {
-  gemini: { label: 'Google Gemini', models: ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite', 'gemini-2.5-flash'] },
+  gemini: { label: 'Google Gemini', models: GEMINI_GROUPS.flatMap(g => g.models) },
   openai: { label: 'OpenAI', models: ['gpt-4o-mini', 'gpt-4o'] },
   claude: { label: 'Anthropic Claude', models: ['claude-3-5-sonnet-latest', 'claude-3-5-haiku-latest'] },
 };
