@@ -187,6 +187,11 @@
       <h3>AI 로 보내는 WAV 길이 <small id="clipInfo"></small></h3>
       <input id="clipSlider" type="range" />
       <div class="scale"><span id="clipLo"></span><span id="clipHi"></span></div>
+      <div class="row">
+        <label>샘플레이트 <select id="wavRate"><option value="44100">44.1kHz (고음질)</option><option value="38000">38kHz (용량 14% ↓)</option></select></label>
+        <label>채널 <select id="wavCh"><option value="2">스테레오 (L/R 독립 · 팬 판별)</option><option value="1">모노 (L+R 합산 · 용량 ½)</option></select></label>
+      </div>
+      <div id="wavNet" class="hint"></div>
 
       <h3>AI 조언 주기 <small id="intInfo"></small></h3>
       <input id="intSlider" type="range" />

@@ -2,7 +2,7 @@ import { PipMonitor, pipSupported } from './pip';
 import { AudioEngine, type BandStat, listInputs, listOutputs, realDevices, outputSelectSupported, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE } from './audio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
 import { callAI, parseReply, buildSystemPrompt, SENS_LABEL, SENS_MAX, type Sensitivity, isQuotaError, supportsAudio, listGeminiModels, type Genre, type RemoteModel, type ParsedReply } from './ai';
-import { analyzeClip, encodeWavStereo, clipRmsDb, WAV_RATE, CLIP_LEN } from './clip';
+import { analyzeClip, encodeWav, clipRmsDb, CLIP_LEN, WAV_RATES, wavLabel, wavWireBytes, type WavFormat } from './clip';
 import { evaluateBalance } from './balance';
 import { qrSvg } from './qrcode';
 import { fbParamsFor } from './config';
@@ -268,6 +268,10 @@ let sens: Sensitivity = (() => { const v = parseInt(ls.get('lm.sens', '2'), 10);
 const SENS_TOL: Record<Sensitivity, number> = { 1: 8, 2: 5, 3: 2 };
 let tolDb = SENS_TOL[sens];
 let fbSens = clamp(parseFloat(ls.get('lm.fb', '50')), 0, 100);
+const wavFmt: WavFormat = {
+  rate: (WAV_RATES as readonly number[]).includes(parseInt(ls.get('lm.wavRate', '44100'), 10)) ? parseInt(ls.get('lm.wavRate', '44100'), 10) : 44100,
+  channels: ls.get('lm.wavCh', '2') === '1' ? 1 : 2,
+};
 let clipSec = clamp(Math.round(parseFloat(ls.get('lm.clipSec', String(CLIP_LEN.default)))), CLIP_LEN.min, CLIP_LEN.max);
 let intervalSec = clamp(Math.round(parseFloat(ls.get('lm.interval', String(INTERVAL_RANGE.default))) / INTERVAL_RANGE.step) * INTERVAL_RANGE.step, INTERVAL_RANGE.min, INTERVAL_RANGE.max);
 {
@@ -302,8 +306,18 @@ let intervalSec = clamp(Math.round(parseFloat(ls.get('lm.interval', String(INTER
   const cs = $<HTMLInputElement>('clipSlider');
   cs.min = String(CLIP_LEN.min); cs.max = String(CLIP_LEN.max); cs.step = String(CLIP_LEN.step); cs.value = String(clipSec);
   $('clipLo').textContent = `${CLIP_LEN.min}초`; $('clipHi').textContent = `${CLIP_LEN.max}초`;
-  const paintClip = () => { $('clipInfo').textContent = `최근 ${clipSec}초 · 약 ${(clipSec * WAV_RATE * 4 / 1024 / 1024).toFixed(2)}MB`; };
+  const wr = $<HTMLSelectElement>('wavRate'), wc = $<HTMLSelectElement>('wavCh');
+  wr.value = String(wavFmt.rate); wc.value = String(wavFmt.channels);
+  const paintClip = () => {
+    const b = wavWireBytes(clipSec, wavFmt), mbit = b * 8 / 1e6;
+    $('clipInfo').textContent = `최근 ${clipSec}초 · ${wavLabel(wavFmt)} · 약 ${(b / 1e6).toFixed(2)}MB`;
+    // 응답 대기 한도(7초 + 500KB당 1초) 안에 업로드 + 응답(약 4초)이 끝나려면 필요한 최소 업로드 속도
+    const limit = 7 + Math.ceil(b / 500_000), need = mbit / Math.max(1, limit - 4);
+    $('wavNet').textContent = `전송량 ${mbit.toFixed(1)}Mbit (Base64 포함) · 안정적으로 보내려면 업로드 약 ${(need * 1.3).toFixed(1)}Mbps 이상 권장 (응답 대기 한도 ${limit}초)`;
+  };
   cs.oninput = () => { clipSec = parseInt(cs.value, 10); ls.set('lm.clipSec', String(clipSec)); paintClip(); };
+  wr.onchange = () => { wavFmt.rate = parseInt(wr.value, 10); ls.set('lm.wavRate', String(wavFmt.rate)); paintClip(); };
+  wc.onchange = () => { wavFmt.channels = wc.value === '1' ? 1 : 2; ls.set('lm.wavCh', String(wavFmt.channels)); paintClip(); };
   paintTol(); paintFb(); paintInt(); paintClip();
 }
 
@@ -973,15 +987,15 @@ async function analyze() {
       setAiLast(`${gateInfo}\n🔇 무음 차단: 최근 WAV 평균 RMS ${clipDb <= -120 ? '무음' : clipDb + ' dBFS'} (기준 ${floorDb} dBFS) → API 호출 취소`);
       return;
     }
-    let wav: Awaited<ReturnType<typeof encodeWavStereo>> | null = null;
+    let wav: Awaited<ReturnType<typeof encodeWav>> | null = null;
     const extra: Record<string, unknown> = { lastClip: { ...analyzeClip(clip), rmsDbStereo: clipDb } };   // 정규화 전 원본 수치
     if (supportsAudio(provider())) {
-      try { wav = await encodeWavStereo(clip); extra.audio = { seconds: wav.seconds, sampleRate: WAV_RATE, channels: 2, bitDepth: 16, gainDb: wav.gainDb }; }
+      try { wav = await encodeWav(clip, wavFmt); extra.audio = { seconds: wav.seconds, sampleRate: wavFmt.rate, channels: wavFmt.channels, bitDepth: 16, gainDb: wav.gainDb }; }
       catch (e) { console.warn('WAV 인코딩 실패 (수치만 전송)', e); }
     }
     const hasAudio = !!wav;
-    const sys = buildSystemPrompt(level, hasAudio);
-    const user = `${hasAudio ? `첨부 오디오: 최근 ${wav!.seconds}초 실제 소리 (44.1kHz 스테레오 16-bit WAV · L/R 독립 · 피크 -1dBFS 정규화 ${wav!.gainDb >= 0 ? '+' : ''}${wav!.gainDb}dB · 텍스트 dB 수치는 원본).\n` : ''}최근 ${windowSec}초 분석 데이터(JSON):\n${JSON.stringify({ ...payload, ...extra })}`;
+    const sys = buildSystemPrompt(level, hasAudio, { label: wavLabel(wavFmt), stereo: wavFmt.channels === 2 });
+    const user = `${hasAudio ? `첨부 오디오: 최근 ${wav!.seconds}초 실제 소리 (${wavLabel(wavFmt)} 16-bit WAV · ${wavFmt.channels === 2 ? 'L/R 독립' : 'L+R 합산'} · 피크 -1dBFS 정규화 ${wav!.gainDb >= 0 ? '+' : ''}${wav!.gainDb}dB · 텍스트 dB 수치는 원본).\n` : ''}최근 ${windowSec}초 분석 데이터(JSON):\n${JSON.stringify({ ...payload, ...extra })}`;
     // 1·2·3순위 자동 폴백: 한도 소진이면 다음 순위로 바꿔 같은 데이터로 즉시 재요청
     let raw = '';
     for (;;) {
@@ -1011,7 +1025,7 @@ async function analyze() {
     paintDetails(res, [...added.map(a => a.text), ...advice.displayList().map(i => i.text)], hasAudio);   // 지금 HUD 에 떠 있는 것은 표시 중
     const text = raw.trim().replace(/\s+/g, ' ');
     const audioInfo = `🤖 ${modelChain()[activeIdx]?.rank ?? '-'}순위: ${currentModel()}\n`
-      + (hasAudio ? `🎧 최근 ${wav!.seconds}초 오디오 첨부 (44.1kHz 스테레오 16-bit WAV · ${Math.round(wav!.bytes / 1024)}KB · 원본 평균 ${clipDb} dBFS · 피크 -1dBFS 정규화 ${wav!.gainDb >= 0 ? '+' : ''}${wav!.gainDb}dB · ${clipHealthText()})` : '🎧 오디오 첨부 없음 (이 AI 공급자는 수치만 전송)')
+      + (hasAudio ? `🎧 최근 ${wav!.seconds}초 오디오 첨부 (${wavLabel(wavFmt)} 16-bit WAV · ${Math.round(wav!.bytes / 1024)}KB · 원본 평균 ${clipDb} dBFS · 피크 -1dBFS 정규화 ${wav!.gainDb >= 0 ? '+' : ''}${wav!.gainDb}dB · ${clipHealthText()})` : '🎧 오디오 첨부 없음 (이 AI 공급자는 수치만 전송)')
       + (res.heard ? `\n👂 AI 청취: [${res.heard.sources.join(', ')}] · 장르 근거: ${res.heard.reasoning}` : '')
       + (res.mixStatus ? `\n🎚️ 믹스 상태: ${res.mixStatus}` : '')
       + (res.rejected.length ? `\n🚫 교차 검증 제외(들리지 않은 대상): ${res.rejected.join(' / ')}` : '');

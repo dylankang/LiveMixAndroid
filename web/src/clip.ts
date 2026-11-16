@@ -12,6 +12,14 @@ export const CLIP_SEC = 10;                                   // 링 버퍼 용�
 export const CLIP_LEN = { min: 5, max: 10, step: 1, default: 5 } as const;   // API 로 보내는 WAV 길이 (설정)
 export const PEAK_TARGET = 0.89;   // -1dBFS
 export const WAV_RATE = 44100;
+/** API 로 보내는 WAV 형식 (⚙️ 설정): 샘플레이트 44.1kHz / 38kHz · 스테레오 / 모노 — 전송량이 달라진다 */
+export const WAV_RATES = [44100, 38000] as const;
+export interface WavFormat { rate: number; channels: 1 | 2 }
+export const DEFAULT_WAV_FORMAT: WavFormat = { rate: 44100, channels: 2 };
+export const rateLabel = (r: number) => `${Math.round(r / 100) / 10}kHz`.replace('.0kHz', 'kHz');
+export const wavLabel = (f: WavFormat) => `${rateLabel(f.rate)} ${f.channels === 2 ? '스테레오' : '모노'}`;
+/** WAV 길이(초)별 실제로 네트워크에 실리는 크기: 16-bit PCM → Base64(×4/3) + 요청 본문(프롬프트·수치) 약 15KB */
+export const wavWireBytes = (sec: number, f: WavFormat) => Math.ceil((44 + sec * f.rate * f.channels * 2) * 4 / 3) + 15_000;
 
 export interface StereoClip { l: Float32Array; r: Float32Array; sr: number }
 
@@ -66,35 +74,42 @@ export function clipRmsDb(c: StereoClip): number {
 
 const dB = (p: number) => (p > 1e-12 ? Math.round(10 * Math.log10(p) * 10) / 10 : -120);
 
-/** 44.1kHz 스테레오 16-bit WAV (인터리브 L,R). 콘솔 입력이 -20~-30dBFS 로 작아도 AI 가 배음을 읽을 수 있게
- *  L/R 공통 게인으로 가장 큰 피크를 0.89(-1dBFS)에 맞춘다 (좌우 밸런스 유지 · 원본 데이터는 그대로) */
-export async function encodeWavStereo(c: StereoClip): Promise<{ base64: string; bytes: number; seconds: number; gainDb: number }> {
+/** 16-bit PCM WAV (스테레오는 인터리브 L,R · 모노는 (L+R)/2). 샘플레이트는 설정(44.1kHz / 38kHz).
+ *  콘솔 입력이 -20~-30dBFS 로 작아도 AI 가 배음을 읽을 수 있게 공통 게인으로 가장 큰 피크를 0.89(-1dBFS)에 맞춘다 (좌우 밸런스 유지 · 원본 데이터는 그대로) */
+export async function encodeWav(c: StereoClip, fmt: WavFormat = DEFAULT_WAV_FORMAT): Promise<{ base64: string; bytes: number; seconds: number; gainDb: number }> {
+  const RATE = fmt.rate, ch = fmt.channels;
   let L = c.l, R = c.r;
-  if (c.sr !== WAV_RATE) {
-    const len = Math.max(1, Math.ceil(c.l.length * WAV_RATE / c.sr));
-    const off = new OfflineAudioContext(2, len, WAV_RATE);
-    const b = off.createBuffer(2, c.l.length, c.sr);
-    b.getChannelData(0).set(c.l); b.getChannelData(1).set(c.r);
+  if (ch === 1) {                       // 모노: 합산(L+R)/2 — 팬/스테레오 정보는 사라짐
+    const m = new Float32Array(c.l.length);
+    for (let i = 0; i < m.length; i++) m[i] = (c.l[i] + c.r[i]) * 0.5;
+    L = R = m;
+  }
+  if (c.sr !== RATE) {
+    const len = Math.max(1, Math.ceil(c.l.length * RATE / c.sr));
+    const off = new OfflineAudioContext(ch, len, RATE);
+    const b = off.createBuffer(ch, c.l.length, c.sr);
+    b.getChannelData(0).set(L); if (ch === 2) b.getChannelData(1).set(R);
     const s = off.createBufferSource();
     s.buffer = b; s.connect(off.destination); s.start();
     const out = await off.startRendering();
-    L = out.getChannelData(0); R = out.getChannelData(1);
+    L = out.getChannelData(0); R = ch === 2 ? out.getChannelData(1) : L;
   }
   let peak = 0;
   for (let i = 0; i < L.length; i++) { const a = Math.abs(L[i]), b = Math.abs(R[i]); if (a > peak) peak = a; if (b > peak) peak = b; }
   const gain = peak > 1e-6 ? PEAK_TARGET / peak : 1;
-  const n = L.length, ch = 2, buf = new ArrayBuffer(44 + n * ch * 2), v = new DataView(buf);
+  const n = L.length, buf = new ArrayBuffer(44 + n * ch * 2), v = new DataView(buf);
   const str = (o: number, t: string) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
   str(0, 'RIFF'); v.setUint32(4, 36 + n * ch * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
   v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, ch, true);
-  v.setUint32(24, WAV_RATE, true); v.setUint32(28, WAV_RATE * ch * 2, true); v.setUint16(32, ch * 2, true); v.setUint16(34, 16, true);
+  v.setUint32(24, RATE, true); v.setUint32(28, RATE * ch * 2, true); v.setUint16(32, ch * 2, true); v.setUint16(34, 16, true);
   str(36, 'data'); v.setUint32(40, n * ch * 2, true);
   const q = (x: number) => Math.max(-32767, Math.min(32767, Math.round(x * gain * 32767)));
-  for (let i = 0, o = 44; i < n; i++, o += 4) { v.setInt16(o, q(L[i]), true); v.setInt16(o + 2, q(R[i]), true); }
+  if (ch === 2) for (let i = 0, o = 44; i < n; i++, o += 4) { v.setInt16(o, q(L[i]), true); v.setInt16(o + 2, q(R[i]), true); }
+  else for (let i = 0, o = 44; i < n; i++, o += 2) v.setInt16(o, q(L[i]), true);
   const bytes = new Uint8Array(buf);
   let bin = '';
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  return { base64: btoa(bin), bytes: bytes.length, seconds: Math.round(n / WAV_RATE * 10) / 10, gainDb: Math.round(20 * Math.log10(gain) * 10) / 10 };
+  return { base64: btoa(bin), bytes: bytes.length, seconds: Math.round(n / RATE * 10) / 10, gainDb: Math.round(20 * Math.log10(gain) * 10) / 10 };
 }
 
 // ───────── 단기(3초) 지표 ─────────
