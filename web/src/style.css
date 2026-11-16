@@ -62,6 +62,13 @@ input[type=range] { padding:0; height:28px; accent-color:var(--accent); backgrou
 .sync-row[hidden] { display:none; }
 .ai-heard { font-size:12px; color:#9fc9ff; background:#0d1a2b; border:1px solid #23406a; border-radius:8px; padding:4px 8px; margin:0 0 6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .ai-heard .rej { color:#ffb37a; }
+.details { display:grid; gap:8px; max-height:420px; overflow-y:auto; }
+.detail { border:1px solid #2a3b2f; border-left:3px solid #4cd07d; border-radius:8px; padding:8px 10px; background:#0d1610; }
+.detail .line { font-weight:700; color:#bff5cf; font-size:14px; }
+.detail .why { margin-top:4px; font-size:13px; line-height:1.55; color:#d8e2db; white-space:pre-wrap; }
+.detail.dup { opacity:.6; border-left-color:#8a8f5a; }
+.detail.rej { opacity:.55; border-left-color:#c0392b; }
+.detail .tag { font-size:11px; font-weight:400; color:#ffcf8a; margin-left:6px; }
 .banner.info .banner-row { color:#ffe9a6; font-weight:400; font-size:13px; }
 .banner.info .banner-row button { background:#ffd23d; color:#221a00; }
 #inputInfo { white-space:pre-line; }

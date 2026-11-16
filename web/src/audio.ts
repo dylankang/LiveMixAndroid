@@ -209,8 +209,8 @@ export class AudioEngine {
   private tickCached = false;
   /** 🎧 최근 3초 원음(모노) — AI 첨부용 WAV 클립 */
   private clip = new ClipRing();
-  /** 최근 3.5초 스테레오 클립 (1초 미만이면 null) */
-  clipSnapshot() { return this.clip.snapshot(1); }
+  /** 최근 sec 초 스테레오 클립 (1초 미만이면 null) */
+  clipSnapshot(sec: number) { return this.clip.snapshot(1, sec); }
   /** 클립 연속성 (누락·겹침 횟수) */
   clipHealth() { return { gaps: this.clip.gaps, overlaps: this.clip.overlaps, received: this.clip.received, sr: this.clip.sr }; }
 

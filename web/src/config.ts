@@ -27,7 +27,7 @@ export const BANDS = [
 ] as const;
 
 /** AI 조언 주기 슬라이더 (초) */
-export const INTERVAL_RANGE = { min: 5, max: 60, step: 5, default: 20 } as const;
+export const INTERVAL_RANGE = { min: 10, max: 60, step: 5, default: 20 } as const;   // 최소 10초
 
 export const TIMING = {
   fbScanMs: 100,          // 피드백 FFT 스캔 주기

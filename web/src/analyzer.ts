@@ -2,7 +2,7 @@ import { PipMonitor, pipSupported } from './pip';
 import { AudioEngine, type BandStat, listInputs, listOutputs, realDevices, outputSelectSupported, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE } from './audio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
 import { callAI, parseReply, buildSystemPrompt, buildGenrePrompt, isQuotaError, supportsAudio, listGeminiModels, type Genre, type RemoteModel, type ParsedReply } from './ai';
-import { analyzeClip, encodeWavStereo, clipRmsDb, WAV_RATE } from './clip';
+import { analyzeClip, encodeWavStereo, clipRmsDb, WAV_RATE, CLIP_LEN } from './clip';
 import { evaluateBalance, TOL_RANGE, ALWAYS_AI_TOL } from './balance';
 import { fbParamsFor } from './config';
 import { Glasses } from './glasses';
@@ -76,7 +76,7 @@ function longTermFeatures(cur: FeatSnap) {
 }
 const QUOTA_MSG = '❌ 1~3순위 모델 API 한도 소진 · AI 정지';
 const ALL_EXHAUSTED_MSG = '❌ 설정된 1~3순위 모델의 API 한도가 모두 소진되어 AI 호출을 일시 중지합니다.';
-const SILENCE_FLOOR_DB = -55;   // 게이트 OFF 일 때 3.5초 WAV 평균 RMS 차단 기준
+const SILENCE_FLOOR_DB = -55;   // 게이트 OFF 일 때 WAV 평균 RMS 차단 기준
 const FB_HOLD_MS = 2000;
 
 // ───────── 배너 (할당량 / 안내) ─────────
@@ -253,6 +253,7 @@ loadProviderUI();
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Number.isFinite(x) ? x : lo));
 let tolDb = clamp(parseFloat(ls.get('lm.tol', String(TOL_RANGE.default))), TOL_RANGE.min, TOL_RANGE.max);
 let fbSens = clamp(parseFloat(ls.get('lm.fb', '50')), 0, 100);
+let clipSec = clamp(Math.round(parseFloat(ls.get('lm.clipSec', String(CLIP_LEN.default)))), CLIP_LEN.min, CLIP_LEN.max);
 let intervalSec = clamp(Math.round(parseFloat(ls.get('lm.interval', String(INTERVAL_RANGE.default))) / INTERVAL_RANGE.step) * INTERVAL_RANGE.step, INTERVAL_RANGE.min, INTERVAL_RANGE.max);
 {
   const tol = $<HTMLInputElement>('tolSlider'), fb = $<HTMLInputElement>('fbSlider'), it = $<HTMLInputElement>('intSlider');
@@ -278,7 +279,13 @@ let intervalSec = clamp(Math.round(parseFloat(ls.get('lm.interval', String(INTER
   it.oninput = () => { intervalSec = parseFloat(it.value); ls.set('lm.interval', String(intervalSec)); advice.setIntervalMs(intervalSec * 1000); paintInt(); };
   engine.setFbSensitivity(fbSens / 100);
   advice.setIntervalMs(intervalSec * 1000);
-  paintTol(); paintFb(); paintInt();
+  // 🎧 API 로 보내는 WAV 길이 (5~10초 · 1초 단위)
+  const cs = $<HTMLInputElement>('clipSlider');
+  cs.min = String(CLIP_LEN.min); cs.max = String(CLIP_LEN.max); cs.step = String(CLIP_LEN.step); cs.value = String(clipSec);
+  $('clipLo').textContent = `${CLIP_LEN.min}초`; $('clipHi').textContent = `${CLIP_LEN.max}초`;
+  const paintClip = () => { $('clipInfo').textContent = `최근 ${clipSec}초 · 약 ${(clipSec * WAV_RATE * 4 / 1024 / 1024).toFixed(2)}MB`; };
+  cs.oninput = () => { clipSec = parseInt(cs.value, 10); ls.set('lm.clipSec', String(clipSec)); paintClip(); };
+  paintTol(); paintFb(); paintInt(); paintClip();
 }
 
 // ───────── ⚙️ 설정: 쿨다운 상세 설정 ─────────
@@ -942,14 +949,14 @@ async function analyze() {
     cooldownList: advice.cooldownTags(nowMs),
   };
   try {
-    // 🎧 최근 3.5초 실제 오디오 (L/R 독립 스테레오)
-    const clip = engine.clipSnapshot();
-    // 🔇 2차 차단: 보낼 3.5초 WAV 전체의 평균 RMS 가 기준 미만이면 API 호출 취소 (게이트를 껐거나 순간 노이즈로 열렸을 때 한도 보호)
+    // 🎧 최근 N초(설정) 실제 오디오 (L/R 독립 스테레오)
+    const clip = engine.clipSnapshot(clipSec);
+    // 🔇 2차 차단: 보낼 WAV 전체의 평균 RMS 가 기준 미만이면 API 호출 취소 (게이트를 껐거나 순간 노이즈로 열렸을 때 한도 보호)
     const floorDb = gateOn ? gateDb : SILENCE_FLOOR_DB;
     const clipDb = clip ? clipRmsDb(clip) : -120;
     if (!clip || clipDb < floorDb) {
-      setStatus(`⏸️ 신호 대기 · 최근 3.5초 평균 ${clipDb <= -120 ? '무음' : clipDb + ' dBFS'} < ${floorDb} dBFS → AI 호출 안 함`);
-      setAiLast(`${gateInfo}\n🔇 무음 차단: 최근 3.5초 WAV 평균 RMS ${clipDb <= -120 ? '무음' : clipDb + ' dBFS'} (기준 ${floorDb} dBFS) → API 호출 취소`);
+      setStatus(`⏸️ 신호 대기 · 최근 ${clip ? Math.round(clip.l.length / clip.sr * 10) / 10 : clipSec}초 평균 ${clipDb <= -120 ? '무음' : clipDb + ' dBFS'} < ${floorDb} dBFS → AI 호출 안 함`);
+      setAiLast(`${gateInfo}\n🔇 무음 차단: 최근 WAV 평균 RMS ${clipDb <= -120 ? '무음' : clipDb + ' dBFS'} (기준 ${floorDb} dBFS) → API 호출 취소`);
       return;
     }
     let wav: Awaited<ReturnType<typeof encodeWavStereo>> | null = null;
@@ -982,6 +989,7 @@ async function analyze() {
     if (res.genre) { acceptGenre(res.genre); genreAt = Date.now(); paintGenre(); sender.update({ genre: badgeForSend(), genreAt }); }
     const added = genreOnly ? [] : advice.ingest(res.advice, Date.now());
     addHistory(added.map(a => a.text));
+    if (!genreOnly) paintDetails(res, [...added.map(a => a.text), ...advice.displayList().map(i => i.text)], hasAudio);   // 지금 HUD 에 떠 있는 것은 표시 중
     const text = raw.trim().replace(/\s+/g, ' ');
     const audioInfo = `🤖 ${modelChain()[activeIdx]?.rank ?? '-'}순위: ${currentModel()}\n`
       + (hasAudio ? `🎧 최근 ${wav!.seconds}초 오디오 첨부 (44.1kHz 스테레오 16-bit WAV · ${Math.round(wav!.bytes / 1024)}KB · 원본 평균 ${clipDb} dBFS · 피크 -1dBFS 정규화 ${wav!.gainDb >= 0 ? '+' : ''}${wav!.gainDb}dB · ${clipHealthText()})` : '🎧 오디오 첨부 없음 (이 AI 공급자는 수치만 전송)')
@@ -997,6 +1005,29 @@ async function analyze() {
   } catch (e) {
     setStatus('AI 오류: ' + (e as Error).message.slice(0, 80));
   } finally { inFlight = false; }
+}
+
+/** 📝 상세 조언 (웹 화면 전용): HUD 한 줄 + 근거·조작 방법·확인할 점 */
+function paintDetails(res: ParsedReply, shown: string[], hasAudio: boolean) {
+  const box = $('details'), info = $('detailInfo');
+  const t = new Date().toLocaleTimeString();
+  if (!res.details.length) {
+    info.textContent = `${t} · ${res.none ? '지적 없음' : hasAudio ? '상세 설명 없음' : '이 AI 공급자는 한 줄 조언만 제공'}`;
+    if (res.none) box.replaceChildren(Object.assign(document.createElement('div'), { className: 'hint', textContent: '✅ 지금은 손댈 곳이 없다는 판단입니다.' }));
+    return;
+  }
+  info.textContent = `${t} · ${res.details.filter(d => !d.rejected).length}건`;
+  box.replaceChildren(...res.details.map(d => {
+    const el = document.createElement('div');
+    const dup = !d.rejected && !shown.includes(d.text);
+    el.className = 'detail' + (d.rejected ? ' rej' : dup ? ' dup' : '');
+    const line = document.createElement('div'); line.className = 'line'; line.textContent = d.text;
+    if (d.rejected || dup) { const tg = document.createElement('span'); tg.className = 'tag'; tg.textContent = d.rejected ? '🚫 들린 소스 아님 → HUD 제외' : '⏳ 쿨다운 중 → HUD 미표시'; line.appendChild(tg); }
+    const why = document.createElement('div'); why.className = 'why'; why.textContent = d.detail || '(상세 설명 없음)';
+    el.append(line, why);
+    return el;
+  }));
+  box.scrollTop = 0;
 }
 
 /** 🎧 AI 청취 배지: AI 가 오디오를 듣고 판단한 소스 + 음향 특성 한 줄 */

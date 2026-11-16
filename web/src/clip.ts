@@ -1,14 +1,15 @@
-// 🎧 최근 3.5초 오디오 클립: AI 가 실제 소리를 듣고 판단하도록 Gemini 에 WAV 로 첨부한다.
-//  · ClipRing       : 원음 L/R 을 합치지 않고 각각 최근 3.5초만 유지하는 스테레오 링 버퍼
+// 🎧 최근 N초(설정 5~10초) 오디오 클립: AI 가 실제 소리를 듣고 판단하도록 Gemini 에 WAV 로 첨부한다.
+//  · ClipRing       : 원음 L/R 을 합치지 않고 각각 최근 10초(최대)를 유지하는 스테레오 링 버퍼
 //                     오디오 스레드 콜백(AudioWorklet process / ScriptProcessor onaudioprocess)이 받은 모든 프레임을
 //                     순번(seq)과 함께 이어 붙이고, 누락·겹침이 생기면 그 앞 구간을 버려 항상 끊김 없는 파형만 보낸다
 //                     (L+R 합산은 고역이 잘리고 스테레오 악기가 위상 상쇄로 사라져 AI 가 악기를 잘못 알아듣는 원인)
-//  · encodeWavStereo: 44.1kHz · 2채널 · 16-bit PCM WAV (3.5초 약 617KB, 인터리브 L,R,L,R…) + Base64 — 리샘플은 브라우저 내장(OfflineAudioContext)
+//  · encodeWavStereo: 44.1kHz · 2채널 · 16-bit PCM WAV (5초 약 882KB · 10초 약 1.76MB, 인터리브 L,R,L,R…) + Base64 — 리샘플은 브라우저 내장(OfflineAudioContext)
 //                     인코딩 직전 피크 정규화: 가장 큰 샘플이 0.89(-1dBFS)가 되게 전체 파형을 증폭 (게이트·DSP 수치는 원본 기준)
 //  · analyzeClip    : WAV 와 정확히 같은 3초 구간의 단기 지표 (6밴드 평균·피크, 크레스트, 스펙트럼 중심, 음성대역 비율, 어택 수, 스테레오)
 import { BANDS } from './config';
 
-export const CLIP_SEC = 3.5;
+export const CLIP_SEC = 10;                                   // 링 버퍼 용량 (최대 전송 길이)
+export const CLIP_LEN = { min: 5, max: 10, step: 1, default: 5 } as const;   // API 로 보내는 WAV 길이 (설정)
 export const PEAK_TARGET = 0.89;   // -1dBFS
 export const WAV_RATE = 44100;
 
@@ -44,12 +45,13 @@ export class ClipRing {
   }
   clear() { this.pos = 0; this.filled = 0; this.next = -1; this.gaps = 0; this.overlaps = 0; this.received = 0; }
 
-  /** 시간 순서대로 정렬한 최근 L/R (minSec 미만이면 null) */
-  snapshot(minSec = 1): StereoClip | null {
+  /** 시간 순서대로 정렬한 최근 L/R 최대 maxSec 초 (minSec 미만이면 null) */
+  snapshot(minSec = 1, maxSec = CLIP_SEC): StereoClip | null {
     if (!this.sr || this.filled < this.sr * minSec) return null;
-    const n = this.bl.length, l = new Float32Array(this.filled), r = new Float32Array(this.filled);
-    const start = (this.pos - this.filled + n) % n;
-    for (let i = 0; i < this.filled; i++) { const k = (start + i) % n; l[i] = this.bl[k]; r[i] = this.br[k]; }
+    const len = Math.min(this.filled, Math.round(this.sr * maxSec));
+    const n = this.bl.length, l = new Float32Array(len), r = new Float32Array(len);
+    const start = (this.pos - len + n) % n;
+    for (let i = 0; i < len; i++) { const k = (start + i) % n; l[i] = this.bl[k]; r[i] = this.br[k]; }
     return { l, r, sr: this.sr };
   }
 }
