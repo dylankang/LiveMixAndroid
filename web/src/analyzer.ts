@@ -2,7 +2,7 @@ import { PipMonitor, pipSupported } from './pip';
 import { AudioEngine, type BandStat, listInputs, listOutputs, realDevices, outputSelectSupported, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE } from './audio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
 import { callAI, parseReply, buildSystemPrompt, buildGenrePrompt, isQuotaError, supportsAudio, type Genre } from './ai';
-import { analyzeClip, encodeWav16k } from './clip';
+import { analyzeClip, encodeWavStereo, clipRmsDb, WAV_RATE } from './clip';
 import { evaluateBalance, TOL_RANGE, ALWAYS_AI_TOL } from './balance';
 import { fbParamsFor } from './config';
 import { Glasses } from './glasses';
@@ -74,14 +74,16 @@ function longTermFeatures(cur: FeatSnap) {
     decayTailRatioPct: avg(x => x.decay),
   };
 }
-const QUOTA_MSG = '⚠️ API 할당량 소진: AI 조언 정지됨';
+const QUOTA_MSG = '❌ 1~3순위 모델 API 한도 소진 · AI 정지';
+const ALL_EXHAUSTED_MSG = '❌ 설정된 1~3순위 모델의 API 한도가 모두 소진되어 AI 호출을 일시 중지합니다.';
+const SILENCE_FLOOR_DB = -55;   // 게이트 OFF 일 때 3초 WAV 평균 RMS 차단 기준
 const FB_HOLD_MS = 2000;
 
 // ───────── 배너 (할당량 / 안내) ─────────
 const banner = document.createElement('div');
 banner.id = 'quotaBanner'; banner.className = 'banner'; banner.hidden = true;
-banner.innerHTML = `<div class="banner-row"><span>${QUOTA_MSG}</span><button id="resumeBtn" type="button">AI 분석 재개</button></div>
-  <div class="hint">⚙️ 설정에서 API 키나 모델을 바꾼 뒤 재개하세요. 레벨 미터와 피드백 감지는 계속 작동 중입니다.</div>`;
+banner.innerHTML = `<div class="banner-row"><span>${ALL_EXHAUSTED_MSG}</span><button id="resumeBtn" type="button">모델 순위 초기화</button></div>
+  <div class="hint">⚙️ 설정에서 모델을 바꾸거나 [모델 순위 초기화]를 누르면 1순위부터 다시 시작합니다. 레벨 미터와 피드백 감지는 계속 작동 중입니다.</div>`;
 document.getElementById('app')!.prepend(banner);
 
 const notice = document.createElement('div');
@@ -142,28 +144,66 @@ dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });   //
 
 // ───────── ⚙️ 설정: AI 서비스 / 모델 / API Key ─────────
 const providerSel = $<HTMLSelectElement>('provider');
-const modelSel = $<HTMLSelectElement>('model');
-const customModel = $<HTMLInputElement>('customModel');
 const apiKeyInp = $<HTMLInputElement>('apiKey');
-const CUSTOM = '__custom__';
+const CUSTOM = '__custom__', NONE = '__none__';
+const RANKS = [1, 2, 3] as const;
+const rankSel = RANKS.map(i => $<HTMLSelectElement>(`model${i}`));
+const rankCustom = RANKS.map(i => $<HTMLInputElement>(`custom${i}`));
 providerSel.innerHTML = (Object.keys(PROVIDERS) as ProviderId[]).map(p => `<option value="${p}">${PROVIDERS[p].label}</option>`).join('');
 providerSel.value = ls.get('lm.provider', 'gemini');
 const provider = () => providerSel.value as ProviderId;
-function loadProviderUI() {
-  const p = provider();
-  const models = PROVIDERS[p].models;
-  modelSel.innerHTML = models.map(m => `<option>${m}</option>`).join('') + `<option value="${CUSTOM}">직접 입력…</option>`;
-  const saved = ls.get(`lm.model2.${p}`, models[0]);
-  if (models.includes(saved)) { modelSel.value = saved; customModel.hidden = true; }
-  else { modelSel.value = CUSTOM; customModel.hidden = false; customModel.value = saved; }
-  apiKeyInp.value = ls.get(`lm.key.${p}`);
+/** 공급자별 1·2·3순위 기본값 (Gemini: 3.5-flash-lite → 3.1-flash-lite → 2.5-flash-lite) */
+function defaultRanks(p: ProviderId): string[] {
+  const m = PROVIDERS[p].models;
+  const first = ls.get(`lm.model2.${p}`, m[0]) || m[0];          // 예전 단일 모델 설정이 있으면 1순위로 이어받음
+  const second = first === m[1] ? m[0] : m[1] ?? NONE;
+  return [first, second, p === 'gemini' ? 'gemini-2.5-flash-lite' : NONE];
 }
-const currentModel = () => (modelSel.value === CUSTOM ? customModel.value.trim() : modelSel.value);
-function onAiConfigChanged() { if (aiPaused) $('resumeBtn').textContent = 'AI 분석 재개 (설정 변경됨)'; }
-providerSel.onchange = () => { ls.set('lm.provider', provider()); loadProviderUI(); onAiConfigChanged(); };
-modelSel.onchange = () => { customModel.hidden = modelSel.value !== CUSTOM; ls.set(`lm.model2.${provider()}`, currentModel()); onAiConfigChanged(); };
-customModel.oninput = () => { ls.set(`lm.model2.${provider()}`, currentModel()); onAiConfigChanged(); };
-apiKeyInp.oninput = () => { ls.set(`lm.key.${provider()}`, apiKeyInp.value.trim()); onAiConfigChanged(); };
+const rankValue = (i: number) => (rankSel[i].value === CUSTOM ? rankCustom[i].value.trim() : rankSel[i].value === NONE ? '' : rankSel[i].value);
+/** 실제 호출 순서 (사용 안 함·빈 칸·중복 제외) */
+function modelChain(): { rank: number; model: string }[] {
+  const out: { rank: number; model: string }[] = [];
+  RANKS.forEach((r, i) => { const m = rankValue(i); if (m && !out.some(x => x.model === m)) out.push({ rank: r, model: m }); });
+  return out;
+}
+let activeIdx = 0;                        // modelChain() 안에서 지금 쓰는 위치
+function loadProviderUI() {
+  const p = provider(), models = PROVIDERS[p].models, defs = defaultRanks(p);
+  rankSel.forEach((sel, i) => {
+    sel.innerHTML = models.map(m => `<option>${m}</option>`).join('') + `<option value="${CUSTOM}">직접 입력…</option>`
+      + (i > 0 ? `<option value="${NONE}">사용 안 함 (None)</option>` : '');
+    const saved = ls.get(`lm.rank${i + 1}.${p}`, defs[i]);
+    const c = rankCustom[i];
+    if (saved === NONE && i > 0) { sel.value = NONE; c.hidden = true; }
+    else if (models.includes(saved)) { sel.value = saved; c.hidden = true; }
+    else { sel.value = CUSTOM; c.hidden = false; c.value = saved === NONE ? '' : saved; }
+  });
+  apiKeyInp.value = ls.get(`lm.key.${p}`);
+  activeIdx = 0; paintModelState();
+}
+const saveRank = (i: number) => ls.set(`lm.rank${i + 1}.${provider()}`, rankSel[i].value === CUSTOM ? rankCustom[i].value.trim() : rankSel[i].value);
+const currentModel = () => modelChain()[activeIdx]?.model ?? '';
+/** 메인 화면 상단: 지금 쓰는 모델 */
+function paintModelState() {
+  const el = $('modelState'), chain = modelChain(), cur = chain[activeIdx];
+  el.classList.toggle('fallback', !aiPaused && activeIdx > 0);
+  el.classList.toggle('dead', aiPaused || !cur);
+  el.textContent = aiPaused ? '❌ 1~3순위 한도 소진 · AI 정지' : cur ? `${activeIdx === 0 ? '🟢' : '🟡'} ${cur.rank}순위: ${cur.model}` : '⚠️ 모델 미설정';
+  el.title = chain.map(c => `${c.rank}순위: ${c.model}`).join(' → ');
+}
+/** 모델 설정 변경·[모델 순위 초기화] → 1순위부터 다시 */
+function resetModelRank(msg?: string) {
+  activeIdx = 0;
+  if (aiPaused) resumeAi(); else paintModelState();
+  if (msg) setStatus(msg);
+}
+providerSel.onchange = () => { ls.set('lm.provider', provider()); loadProviderUI(); resetModelRank(); };
+rankSel.forEach((sel, i) => {
+  sel.onchange = () => { rankCustom[i].hidden = sel.value !== CUSTOM; saveRank(i); resetModelRank('모델 순위 변경 → 1순위부터 사용'); };
+  rankCustom[i].oninput = () => { saveRank(i); resetModelRank(); };
+});
+$('prioReset').onclick = () => { resetModelRank(`🔄 모델 순위 초기화 → 1순위(${modelChain()[0]?.model ?? '-'})부터 사용`); };
+apiKeyInp.oninput = () => { ls.set(`lm.key.${provider()}`, apiKeyInp.value.trim()); if (aiPaused) resetModelRank(); };
 loadProviderUI();
 
 // ───────── ⚙️ 설정: 슬라이더 (왼쪽 = 둔감 · 오른쪽 = 예민) ─────────
@@ -215,8 +255,8 @@ let intervalSec = clamp(Math.round(parseFloat(ls.get('lm.interval', String(INTER
 }
 
 // ───────── ⚙️ 설정: 노이즈 게이트 (무음 대기) ─────────
-let gateDb = clamp(parseFloat(ls.get('lm.gate4', String(GATE.defaultDb))), GATE.minDb, GATE.maxDb);
-let gateOn = ls.get('lm.gateOn2', '0') === '1';   // 기본 OFF: 낮은 레벨에서도 계속 분석·AI 호출
+let gateDb = clamp(parseFloat(ls.get('lm.gate5', String(GATE.defaultDb))), GATE.minDb, GATE.maxDb);
+let gateOn = ls.get('lm.gateOn3', '1') === '1';   // 기본 ON(-50dBFS): 무음일 때는 API 를 절대 호출하지 않음 (한도 보호)
 {
   const g = $<HTMLInputElement>('gateSlider');
   g.min = String(GATE.minDb); g.max = String(GATE.maxDb);
@@ -228,8 +268,8 @@ let gateOn = ls.get('lm.gateOn2', '0') === '1';   // 기본 OFF: 낮은 레벨�
     b.classList.toggle('active', gateOn);
     g.disabled = !gateOn;
   };
-  g.oninput = () => { gateDb = +g.value; ls.set('lm.gate4', String(gateDb)); applyGate(); paint(); };
-  $('gateBtn').onclick = () => { gateOn = !gateOn; ls.set('lm.gateOn2', gateOn ? '1' : '0'); applyGate(); paint(); };
+  g.oninput = () => { gateDb = +g.value; ls.set('lm.gate5', String(gateDb)); applyGate(); paint(); };
+  $('gateBtn').onclick = () => { gateOn = !gateOn; ls.set('lm.gateOn3', gateOn ? '1' : '0'); applyGate(); paint(); };
   paint();
 }
 function applyGate() { engine.setGate(gateOn, gateDb); }
@@ -770,19 +810,21 @@ function updateLiveBands() {
 function pauseForQuota() {
   aiPaused = true;
   banner.hidden = false;
-  $('resumeBtn').textContent = 'AI 분석 재개';
-  setStatus('API 할당량 소진 · AI 정지 (미터/피드백은 계속)');
+  setStatus(ALL_EXHAUSTED_MSG);
+  paintModelState();
   lastRendered = ''; render();
 }
 function resumeAi() {
   aiPaused = false;
+  activeIdx = 0;
   banner.hidden = true;
+  paintModelState();
   engine.collectBands(); engine.collectSpectrum(); engine.collectDynamics();
   lastCollectAt = Date.now(); lastAnalyzeAt = Date.now();
   setStatus('AI 분석 재개');
   lastRendered = ''; render();
 }
-$('resumeBtn').onclick = resumeAi;
+$('resumeBtn').onclick = () => resetModelRank(`🔄 모델 순위 초기화 → 1순위(${modelChain()[0]?.model ?? '-'})부터 사용`);
 
 async function analyze() {
   const bands = engine.collectBands();
@@ -857,35 +899,55 @@ async function analyze() {
     cooldownList: advice.cooldownTags(nowMs),
   };
   try {
-    // 🎧 최근 3초 실제 오디오: 같은 구간의 단기 지표(last3s)는 항상, WAV 는 오디오를 받는 공급자(Gemini)일 때 첨부
+    // 🎧 최근 3초 실제 오디오 (L/R 독립 스테레오)
     const clip = engine.clipSnapshot();
-    let wav: Awaited<ReturnType<typeof encodeWav16k>> | null = null;
-    const extra: Record<string, unknown> = {};
-    if (clip) {
-      extra.last3s = analyzeClip(clip.data, clip.sr);
-      if (supportsAudio(provider())) {
-        try { wav = await encodeWav16k(clip.data, clip.sr); extra.audio = { seconds: wav.seconds, sampleRate: 16000, channels: 1, gainDb: wav.gainDb }; }
-        catch (e) { console.warn('WAV 인코딩 실패 (수치만 전송)', e); }
-      }
+    // 🔇 2차 차단: 보낼 3초 WAV 전체의 평균 RMS 가 기준 미만이면 API 호출 취소 (게이트를 껐거나 순간 노이즈로 열렸을 때 한도 보호)
+    const floorDb = gateOn ? gateDb : SILENCE_FLOOR_DB;
+    const clipDb = clip ? clipRmsDb(clip) : -120;
+    if (!clip || clipDb < floorDb) {
+      setStatus(`⏸️ 신호 대기 · 최근 3초 평균 ${clipDb <= -120 ? '무음' : clipDb + ' dBFS'} < ${floorDb} dBFS → AI 호출 안 함`);
+      setAiLast(`${gateInfo}\n🔇 무음 차단: 최근 3초 WAV 평균 RMS ${clipDb <= -120 ? '무음' : clipDb + ' dBFS'} (기준 ${floorDb} dBFS) → API 호출 취소`);
+      return;
+    }
+    let wav: Awaited<ReturnType<typeof encodeWavStereo>> | null = null;
+    const extra: Record<string, unknown> = { last3s: { ...analyzeClip(clip), rmsDbStereo: clipDb } };
+    if (supportsAudio(provider())) {
+      try { wav = await encodeWavStereo(clip); extra.audio = { seconds: wav.seconds, sampleRate: WAV_RATE, channels: 2, bitDepth: 16, gainDb: wav.gainDb }; }
+      catch (e) { console.warn('WAV 인코딩 실패 (수치만 전송)', e); }
     }
     const hasAudio = !!wav;
-    const raw = await callAI(provider(), currentModel(), key, genreOnly ? buildGenrePrompt(hasAudio) : buildSystemPrompt(tol, hasAudio),
-      `${hasAudio ? `첨부 오디오: 최근 ${wav!.seconds}초 실제 소리 (16kHz 모노 WAV · 듣기 쉽게 ${wav!.gainDb >= 0 ? '+' : ''}${wav!.gainDb}dB 정규화).\n` : ''}최근 ${windowSec}초 분석 데이터(JSON):\n${JSON.stringify({ ...payload, ...extra })}`,
-      wav?.base64);
+    const sys = genreOnly ? buildGenrePrompt(hasAudio) : buildSystemPrompt(tol, hasAudio);
+    const user = `${hasAudio ? `첨부 오디오: 최근 ${wav!.seconds}초 실제 소리 (44.1kHz 스테레오 16-bit WAV · L/R 독립 · 듣기 쉽게 ${wav!.gainDb >= 0 ? '+' : ''}${wav!.gainDb}dB 정규화).\n` : ''}최근 ${windowSec}초 분석 데이터(JSON):\n${JSON.stringify({ ...payload, ...extra })}`;
+    // 1·2·3순위 자동 폴백: 한도 소진이면 다음 순위로 바꿔 같은 데이터로 즉시 재요청
+    let raw = '';
+    for (;;) {
+      const chain = modelChain(), cur = chain[activeIdx];
+      if (!cur) throw new Error('설정에서 1순위 모델을 입력하세요');
+      try { raw = await callAI(provider(), cur.model, key, sys, user, wav?.base64); break; }
+      catch (e) {
+        if (!isQuotaError(e)) throw e;
+        const next = chain[activeIdx + 1];
+        if (!next) { pauseForQuota(); return; }
+        showNotice(`⚠️ ${cur.model} API 한도가 소진되어 ${next.rank}순위 모델(${next.model})로 자동 전환합니다.`);
+        activeIdx++; paintModelState();
+        setStatus(`${next.rank}순위 모델(${next.model})로 재요청 중…`);
+        if (!running) return;
+      }
+    }
     const res = parseReply(raw);
     if (res.genre) { acceptGenre(res.genre); genreAt = Date.now(); paintGenre(); sender.update({ genre: badgeForSend(), genreAt }); }
     const added = genreOnly ? [] : advice.ingest(res.advice, Date.now());
     addHistory(added.map(a => a.text));
     const text = raw.trim().replace(/\s+/g, ' ');
-    const audioInfo = hasAudio ? `🎧 최근 ${wav!.seconds}초 오디오 첨부 (16kHz 모노 WAV · ${Math.round(wav!.bytes / 1024)}KB)` : clip ? '🎧 오디오 첨부 없음 (이 AI 공급자는 수치만 전송)' : '🎧 오디오 첨부 없음 (수집된 소리 1초 미만)';
+    const audioInfo = `🤖 ${modelChain()[activeIdx]?.rank ?? '-'}순위: ${currentModel()}\n`
+      + (hasAudio ? `🎧 최근 ${wav!.seconds}초 오디오 첨부 (44.1kHz 스테레오 16-bit WAV · ${Math.round(wav!.bytes / 1024)}KB · 평균 ${clipDb} dBFS)` : '🎧 오디오 첨부 없음 (이 AI 공급자는 수치만 전송)');
     setAiLast(`${gateInfo}\n${audioInfo}\nAI 응답(${new Date().toLocaleTimeString()}): ${text || '(빈 응답)'}`);
     setStatus(genreOnly ? `${solo ? 'Solo' : '밸런스'} 양호 · 조언 생략 (장르만 갱신)`
       : !text ? 'AI 빈 응답' : res.none ? 'AI: NONE (지적 없음)' : !res.advice.length ? 'AI 응답 형식 불일치'
       : `AI: ${added.length}건 표시` + (res.advice.length > added.length ? ` · ${res.advice.length - added.length}건 제외(중복/쿨다운)` : ''));
     render(); renderCooldown();
   } catch (e) {
-    if (isQuotaError(e)) pauseForQuota();
-    else setStatus('AI 오류: ' + (e as Error).message.slice(0, 80));
+    setStatus('AI 오류: ' + (e as Error).message.slice(0, 80));
   } finally { inFlight = false; }
 }
 

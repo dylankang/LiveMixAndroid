@@ -2,7 +2,7 @@ export type ProviderId = 'gemini' | 'openai' | 'claude';
 
 // 모델 목록은 여기서만 수정하면 UI에 반영됩니다. (UI에는 "직접 입력"도 추가됨)
 export const PROVIDERS: Record<ProviderId, { label: string; models: string[] }> = {
-  gemini: { label: 'Google Gemini', models: ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'] },
+  gemini: { label: 'Google Gemini', models: ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite', 'gemini-2.5-flash'] },
   openai: { label: 'OpenAI', models: ['gpt-4o-mini', 'gpt-4o'] },
   claude: { label: 'Anthropic Claude', models: ['claude-3-5-sonnet-latest', 'claude-3-5-haiku-latest'] },
 };

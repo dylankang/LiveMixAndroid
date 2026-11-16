@@ -31,8 +31,9 @@
         </div>
         <div class="hint">Even G2 수신기(?mode=hud)에서 이 4자리 코드를 입력하면 네트워크가 달라도(PC 유선 LAN ↔ 폰 LTE) 연결됩니다.</div>
       </div>
-      <div class="top-row">
+      <div class="top-row pills">
         <span id="linkState" class="pill off">🔴 수신기 대기</span>
+        <span id="modelState" class="pill model">🟢 1순위: -</span>
       </div>
       <div id="status" class="status">대기 중</div>
     </header>
@@ -129,11 +130,17 @@
       </div>
 
       <h3>AI</h3>
-      <div class="row">
-        <label>AI 서비스 <select id="provider"></select></label>
-        <label>모델 <select id="model"></select></label>
+      <label>AI 서비스 <select id="provider"></select></label>
+      <div class="prio">
+        <label>1순위 모델 <select id="model1"></select></label>
+        <input id="custom1" type="text" placeholder="1순위 모델 ID 직접 입력" hidden />
+        <label>2순위 모델 <select id="model2"></select></label>
+        <input id="custom2" type="text" placeholder="2순위 모델 ID 직접 입력" hidden />
+        <label>3순위 모델 <select id="model3"></select></label>
+        <input id="custom3" type="text" placeholder="3순위 모델 ID 직접 입력" hidden />
       </div>
-      <input id="customModel" type="text" placeholder="모델 ID 직접 입력" hidden />
+      <button id="prioReset" class="small" type="button">🔄 모델 순위 초기화 (1순위부터 다시)</button>
+      <div class="hint">API 한도(429 · RESOURCE_EXHAUSTED · quota · rate limit)가 소진되면 다음 순위 모델로 자동 전환해 같은 데이터로 즉시 다시 요청합니다.</div>
       <label>API Key
         <input id="apiKey" type="password" autocomplete="off" placeholder="선택한 AI의 API Key (입력 즉시 저장)" />
       </label>

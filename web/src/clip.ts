@@ -1,62 +1,78 @@
 // 🎧 최근 3초 오디오 클립: AI 가 실제 소리를 듣고 판단하도록 Gemini 에 WAV 로 첨부한다.
-//  · ClipRing     : 원음(L+R 모노 합산)을 항상 최근 3초만 유지하는 링 버퍼
-//  · encodeWav16k : 16kHz · 모노 · 16-bit PCM WAV (약 96KB) + Base64 — 리샘플은 브라우저 내장(OfflineAudioContext, 안티에일리어싱 포함)
-//  · analyzeClip  : WAV 와 정확히 같은 3초 구간의 단기 지표 (6밴드 평균·피크, 크레스트, 스펙트럼 중심, 음성대역 비율, 어택 수)
+//  · ClipRing       : 원음 L/R 을 합치지 않고 각각 최근 3초만 유지하는 스테레오 링 버퍼
+//                     (L+R 합산은 고역이 잘리고 스테레오 악기가 위상 상쇄로 사라져 AI 가 악기를 잘못 알아듣는 원인)
+//  · encodeWavStereo: 44.1kHz · 2채널 · 16-bit PCM WAV (약 530KB, 인터리브 L,R,L,R…) + Base64 — 리샘플은 브라우저 내장(OfflineAudioContext)
+//  · analyzeClip    : WAV 와 정확히 같은 3초 구간의 단기 지표 (6밴드 평균·피크, 크레스트, 스펙트럼 중심, 음성대역 비율, 어택 수, 스테레오)
 import { BANDS } from './config';
 
 export const CLIP_SEC = 3;
-export const WAV_RATE = 16000;
+export const WAV_RATE = 44100;
+
+export interface StereoClip { l: Float32Array; r: Float32Array; sr: number }
 
 export class ClipRing {
-  private buf = new Float32Array(0);
+  private bl = new Float32Array(0);
+  private br = new Float32Array(0);
   private pos = 0;
   private filled = 0;
   sr = 0;
 
-  /** 모노 샘플 추가 (샘플레이트가 바뀌면 비우고 새로 시작) */
-  push(x: Float32Array, sr: number) {
-    if (sr !== this.sr) { this.sr = sr; this.buf = new Float32Array(Math.round(sr * CLIP_SEC)); this.pos = 0; this.filled = 0; }
-    const n = this.buf.length;
-    for (let i = 0; i < x.length; i++) { this.buf[this.pos] = x[i]; this.pos = (this.pos + 1) % n; }
-    this.filled = Math.min(n, this.filled + x.length);
+  /** L/R 샘플 추가 (샘플레이트가 바뀌면 비우고 새로 시작) */
+  push(l: Float32Array, r: Float32Array, sr: number) {
+    if (sr !== this.sr) {
+      this.sr = sr; const n = Math.round(sr * CLIP_SEC);
+      this.bl = new Float32Array(n); this.br = new Float32Array(n); this.pos = 0; this.filled = 0;
+    }
+    const n = this.bl.length, m = Math.min(l.length, r.length);
+    for (let i = 0; i < m; i++) { this.bl[this.pos] = l[i]; this.br[this.pos] = r[i]; this.pos = (this.pos + 1) % n; }
+    this.filled = Math.min(n, this.filled + m);
   }
   clear() { this.pos = 0; this.filled = 0; }
 
-  /** 시간 순서대로 정렬한 최근 샘플 (minSec 미만이면 null) */
-  snapshot(minSec = 1): { data: Float32Array; sr: number } | null {
+  /** 시간 순서대로 정렬한 최근 L/R (minSec 미만이면 null) */
+  snapshot(minSec = 1): StereoClip | null {
     if (!this.sr || this.filled < this.sr * minSec) return null;
-    const n = this.buf.length, out = new Float32Array(this.filled);
+    const n = this.bl.length, l = new Float32Array(this.filled), r = new Float32Array(this.filled);
     const start = (this.pos - this.filled + n) % n;
-    for (let i = 0; i < this.filled; i++) out[i] = this.buf[(start + i) % n];
-    return { data: out, sr: this.sr };
+    for (let i = 0; i < this.filled; i++) { const k = (start + i) % n; l[i] = this.bl[k]; r[i] = this.br[k]; }
+    return { l, r, sr: this.sr };
   }
+}
+
+/** 클립 전체의 평균 RMS (L/R 평균 파워, dBFS) — API 호출 직전 무음 검사용 */
+export function clipRmsDb(c: StereoClip): number {
+  let s = 0;
+  for (let i = 0; i < c.l.length; i++) s += c.l[i] * c.l[i] + c.r[i] * c.r[i];
+  const p = s / Math.max(1, 2 * c.l.length);
+  return p > 1e-12 ? Math.round(10 * Math.log10(p) * 10) / 10 : -120;
 }
 
 const dB = (p: number) => (p > 1e-12 ? Math.round(10 * Math.log10(p) * 10) / 10 : -120);
 
-/** 16kHz 모노 16-bit WAV. 콘솔 입력이 작아도 AI 가 잘 들을 수 있게 피크 -3dBFS 로 정규화 (최대 +30dB) */
-export async function encodeWav16k(data: Float32Array, sr: number): Promise<{ base64: string; bytes: number; seconds: number; gainDb: number }> {
-  let pcm: Float32Array;
-  if (sr === WAV_RATE) pcm = data;
-  else {
-    const len = Math.max(1, Math.ceil(data.length * WAV_RATE / sr));
-    const off = new OfflineAudioContext(1, len, WAV_RATE);
-    const b = off.createBuffer(1, data.length, sr);
-    b.getChannelData(0).set(data);
+/** 44.1kHz 스테레오 16-bit WAV (인터리브 L,R). 콘솔 입력이 작아도 AI 가 잘 들을 수 있게 L/R 공통 게인으로 피크 -3dBFS 정규화 (최대 +30dB, 좌우 밸런스 유지) */
+export async function encodeWavStereo(c: StereoClip): Promise<{ base64: string; bytes: number; seconds: number; gainDb: number }> {
+  let L = c.l, R = c.r;
+  if (c.sr !== WAV_RATE) {
+    const len = Math.max(1, Math.ceil(c.l.length * WAV_RATE / c.sr));
+    const off = new OfflineAudioContext(2, len, WAV_RATE);
+    const b = off.createBuffer(2, c.l.length, c.sr);
+    b.getChannelData(0).set(c.l); b.getChannelData(1).set(c.r);
     const s = off.createBufferSource();
     s.buffer = b; s.connect(off.destination); s.start();
-    pcm = (await off.startRendering()).getChannelData(0);
+    const out = await off.startRendering();
+    L = out.getChannelData(0); R = out.getChannelData(1);
   }
   let peak = 0;
-  for (let i = 0; i < pcm.length; i++) { const a = Math.abs(pcm[i]); if (a > peak) peak = a; }
+  for (let i = 0; i < L.length; i++) { const a = Math.abs(L[i]), b = Math.abs(R[i]); if (a > peak) peak = a; if (b > peak) peak = b; }
   const gain = peak > 1e-6 ? Math.min(Math.pow(10, 30 / 20), Math.pow(10, -3 / 20) / peak) : 1;
-  const n = pcm.length, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const n = L.length, ch = 2, buf = new ArrayBuffer(44 + n * ch * 2), v = new DataView(buf);
   const str = (o: number, t: string) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
-  str(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
-  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-  v.setUint32(24, WAV_RATE, true); v.setUint32(28, WAV_RATE * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
-  str(36, 'data'); v.setUint32(40, n * 2, true);
-  for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, Math.max(-32768, Math.min(32767, Math.round(pcm[i] * gain * 32767))), true);
+  str(0, 'RIFF'); v.setUint32(4, 36 + n * ch * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, ch, true);
+  v.setUint32(24, WAV_RATE, true); v.setUint32(28, WAV_RATE * ch * 2, true); v.setUint16(32, ch * 2, true); v.setUint16(34, 16, true);
+  str(36, 'data'); v.setUint32(40, n * ch * 2, true);
+  const q = (x: number) => Math.max(-32768, Math.min(32767, Math.round(x * gain * 32767)));
+  for (let i = 0, o = 44; i < n; i++, o += 4) { v.setInt16(o, q(L[i]), true); v.setInt16(o + 2, q(R[i]), true); }
   const bytes = new Uint8Array(buf);
   let bin = '';
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
@@ -94,10 +110,25 @@ export interface ClipStats {
   voiceBandSharePct: number;
   /** 초당 어택 수 (스펙트럼 플럭스 기준) */
   onsetsPerSec: number;
+  /** 스테레오: L/R 상관(1 = 모노, 0 = 무관, 음수 = 역위상) · 사이드/미드 비율 · 좌우 밸런스(+ = L 이 큼) */
+  stereo: { correlation: number; sideToMidDb: number; balanceDb: number };
 }
 
-/** WAV 와 같은 3초 구간의 단기 지표 */
-export function analyzeClip(data: Float32Array, sr: number): ClipStats {
+/** WAV 와 같은 3초 구간의 단기 지표 (스펙트럼은 (L+R)/2, 스테레오 지표는 L/R 그대로) */
+export function analyzeClip(c: StereoClip): ClipStats {
+  const sr = c.sr, n0 = c.l.length, data = new Float32Array(n0);
+  let ll = 0, rr = 0, lr = 0, side = 0, mid = 0;
+  for (let i = 0; i < n0; i++) {
+    const l = c.l[i], r = c.r[i];
+    data[i] = (l + r) * 0.5;
+    ll += l * l; rr += r * r; lr += l * r;
+    const sd = l - r, md = l + r; side += sd * sd; mid += md * md;
+  }
+  const stereo = {
+    correlation: ll > 0 && rr > 0 ? Math.round(lr / Math.sqrt(ll * rr) * 100) / 100 : 1,
+    sideToMidDb: mid > 0 ? Math.round(10 * Math.log10((side + 1e-12) / mid) * 10) / 10 : -120,
+    balanceDb: ll > 0 && rr > 0 ? Math.round(10 * Math.log10(ll / rr) * 10) / 10 : 0,
+  };
   let sq = 0, pk = 0;
   for (let i = 0; i < data.length; i++) { const a = data[i]; sq += a * a; const b = a < 0 ? -a : a; if (b > pk) pk = b; }
   const rms = Math.sqrt(sq / Math.max(1, data.length));
@@ -147,5 +178,6 @@ export function analyzeClip(data: Float32Array, sr: number): ClipStats {
     spectralCentroidHz: all > 0 ? Math.round(cNum / all) : 0,
     voiceBandSharePct: all > 0 ? Math.round(voice / all * 1000) / 10 : 0,
     onsetsPerSec: Math.round(onsets / Math.max(0.1, sec) * 10) / 10,
+    stereo,
   };
 }

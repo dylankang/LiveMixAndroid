@@ -52,6 +52,12 @@ input[type=range] { padding:0; height:28px; accent-color:var(--accent); backgrou
 .errbox { background:#4a1410; border:1px solid var(--warn); color:#ffd7d2; border-radius:8px; padding:10px; font-size:13px; white-space:pre-line; word-break:break-word; }
 .errbox[hidden] { display:none; }
 .banner.info { background:#3a2f0b; border-color:#ffd23d; }
+.top-row.pills { flex-wrap:wrap; gap:6px; justify-content:center; }
+.pill.model { background:#0f2a1a; color:#9be7b4; border:1px solid #2e7d4f; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pill.model.fallback { background:#33290a; color:#ffe08a; border-color:#b8962e; }
+.pill.model.dead { background:#3a1210; color:#ffb4a8; border-color:#c0392b; }
+.prio { display:grid; gap:6px; margin:6px 0; }
+#prioReset { margin:4px 0; }
 .banner.info .banner-row { color:#ffe9a6; font-weight:400; font-size:13px; }
 .banner.info .banner-row button { background:#ffd23d; color:#221a00; }
 #inputInfo { white-space:pre-line; }
