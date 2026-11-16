@@ -1,9 +1,9 @@
 import { PipMonitor, pipSupported } from './pip';
 import { AudioEngine, type BandStat, listInputs, listOutputs, realDevices, outputSelectSupported, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE } from './audio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
-import { callAI, parseReply, buildSystemPrompt, buildGenrePrompt, isQuotaError, supportsAudio, listGeminiModels, type Genre, type RemoteModel, type ParsedReply } from './ai';
+import { callAI, parseReply, buildSystemPrompt, SENS_LABEL, SENS_MAX, type Sensitivity, isQuotaError, supportsAudio, listGeminiModels, type Genre, type RemoteModel, type ParsedReply } from './ai';
 import { analyzeClip, encodeWavStereo, clipRmsDb, WAV_RATE, CLIP_LEN } from './clip';
-import { evaluateBalance, TOL_RANGE, ALWAYS_AI_TOL } from './balance';
+import { evaluateBalance } from './balance';
 import { fbParamsFor } from './config';
 import { Glasses } from './glasses';
 import { HudSender, HudReceiver, linkWatchdog, linesToShow, genCode, isCode, setLinkCode, linkCode, type BandRow, type LevelPkt, type MixState, type ReceiverInfo } from './link';
@@ -74,6 +74,8 @@ function longTermFeatures(cur: FeatSnap) {
     decayTailRatioPct: avg(x => x.decay),
   };
 }
+const GOOD_MIX_LINE = '[믹스양호] 현재 밸런스 유지';
+let goodMix = false;     // 마지막 AI 판정이 '믹스 양호(조언 없음)' 인지
 const QUOTA_MSG = '❌ 1~3순위 모델 API 한도 소진 · AI 정지';
 const ALL_EXHAUSTED_MSG = '❌ 설정된 1~3순위 모델의 API 한도가 모두 소진되어 AI 호출을 일시 중지합니다.';
 const SILENCE_FLOOR_DB = -55;   // 게이트 OFF 일 때 WAV 평균 RMS 차단 기준
@@ -251,30 +253,38 @@ loadProviderUI();
 
 // ───────── ⚙️ 설정: 슬라이더 (왼쪽 = 둔감 · 오른쪽 = 예민) ─────────
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Number.isFinite(x) ? x : lo));
-let tolDb = clamp(parseFloat(ls.get('lm.tol', String(TOL_RANGE.default))), TOL_RANGE.min, TOL_RANGE.max);
+// 조언 민감도 3단계 (1 필수만 · 2 중간 · 3 세밀함). 로컬 dB 필터는 없고 AI 프롬프트에만 전달한다
+let sens: Sensitivity = (() => { const v = parseInt(ls.get('lm.sens', '2'), 10); return (v === 1 || v === 3 ? v : 2) as Sensitivity; })();
+/** 밴드 표의 편차 강조 기준(표시 전용 · API 호출 여부와 무관) */
+const SENS_TOL: Record<Sensitivity, number> = { 1: 8, 2: 5, 3: 2 };
+let tolDb = SENS_TOL[sens];
 let fbSens = clamp(parseFloat(ls.get('lm.fb', '50')), 0, 100);
 let clipSec = clamp(Math.round(parseFloat(ls.get('lm.clipSec', String(CLIP_LEN.default)))), CLIP_LEN.min, CLIP_LEN.max);
 let intervalSec = clamp(Math.round(parseFloat(ls.get('lm.interval', String(INTERVAL_RANGE.default))) / INTERVAL_RANGE.step) * INTERVAL_RANGE.step, INTERVAL_RANGE.min, INTERVAL_RANGE.max);
 {
-  const tol = $<HTMLInputElement>('tolSlider'), fb = $<HTMLInputElement>('fbSlider'), it = $<HTMLInputElement>('intSlider');
-  tol.min = '0'; tol.max = String(Math.round((TOL_RANGE.max - TOL_RANGE.min) / TOL_RANGE.step));
-  $('tolLo').textContent = `둔감 ±${TOL_RANGE.max}dB`; $('tolMid').textContent = `보통 ±${(TOL_RANGE.max + TOL_RANGE.min) / 2}dB`; $('tolHi').textContent = `±${TOL_RANGE.min}dB 항상 AI`;
+  const fb = $<HTMLInputElement>('fbSlider'), it = $<HTMLInputElement>('intSlider');
   it.min = String(INTERVAL_RANGE.min); it.max = String(INTERVAL_RANGE.max); it.step = String(INTERVAL_RANGE.step);
   $('intLo').textContent = `${INTERVAL_RANGE.min}초`; $('intHi').textContent = `${INTERVAL_RANGE.max}초`;
+  const SENS_HINT: Record<Sensitivity, string> = {
+    1: '명백한 문제나 큰 밸런스 붕괴만 조언 (0~2줄)',
+    2: '라이브 믹스에서 개선이 필요한 주요 마스킹/톤/레벨 조언 (0~3줄)',
+    3: '사소한 디테일과 미세한 톤/공간감 보정까지 조언 (0~4줄)',
+  };
   const paintTol = () => {
-    const always = tolDb <= ALWAYS_AI_TOL;
-    $('tolInfo').textContent = always ? '±0dB · 항상 AI 전송 (로컬 필터 없음)' : `허용 편차 ±${tolDb}dB`;
-    $('tolInfo').classList.toggle('always', always);
+    $('tolInfo').textContent = `${sens}단계 · ${SENS_LABEL[sens]}`;
+    document.querySelectorAll<HTMLButtonElement>('.sens3 .sens').forEach(b => { const on = b.dataset.lv === String(sens); b.classList.toggle('active', on); b.setAttribute('aria-checked', String(on)); });
+    $('sensHint').textContent = `${SENS_HINT[sens]} · 소리가 나는 동안 매 주기 AI 로 보내고, 믹스가 이미 좋으면 AI 가 조언 없이 '믹스 양호'로 답합니다.`;
   };
   const paintFb = () => {
     const p = fbParamsFor(fbSens / 100);
     $('fbInfo').textContent = `돌출 ${p.prominenceDb.toFixed(0)}dB · ${(p.confirmScans / 10).toFixed(1)}초 · ${p.minLevelDb.toFixed(0)}dBFS`;
   };
   const paintInt = () => { $('intInfo').textContent = `${intervalSec}초마다`; };
-  tol.value = String(Math.round((TOL_RANGE.max - tolDb) / TOL_RANGE.step));
   fb.value = String(fbSens);
   it.value = String(intervalSec);
-  tol.oninput = () => { tolDb = TOL_RANGE.max - parseFloat(tol.value) * TOL_RANGE.step; ls.set('lm.tol', String(tolDb)); paintTol(); };
+  document.querySelectorAll<HTMLButtonElement>('.sens3 .sens').forEach(b => {
+    b.onclick = () => { sens = parseInt(b.dataset.lv!, 10) as Sensitivity; tolDb = SENS_TOL[sens]; ls.set('lm.sens', String(sens)); paintTol(); };
+  });
   fb.oninput = () => { fbSens = parseFloat(fb.value); ls.set('lm.fb', String(fbSens)); engine.setFbSensitivity(fbSens / 100); paintFb(); };
   it.oninput = () => { intervalSec = parseFloat(it.value); ls.set('lm.interval', String(intervalSec)); advice.setIntervalMs(intervalSec * 1000); paintInt(); };
   engine.setFbSensitivity(fbSens / 100);
@@ -576,8 +586,9 @@ function updateSysLine() {
 }
 function hudLines(): string[] {
   const lines = [fbText, ...advice.lines()];
+  if (running && goodMix && !engine.idle && !fbText && !advice.items.length) lines[0] = GOOD_MIX_LINE;   // ✅ AI 가 믹스 양호로 판단
   if (running && engine.idle && sysLine && !fbText) lines[0] = sysLine;          // 신호 대기: 맨 윗줄에 항상 표시 (조언은 그대로 시간에 맞춰 사라짐)
-  else if (running && !advice.items.length && sysLine) lines[1] = sysLine;       // 빈 화면 방지: 조언이 생기면 자동으로 사라짐
+  else if (running && !advice.items.length && sysLine && !goodMix) lines[1] = sysLine;       // 빈 화면 방지: 조언이 생기면 자동으로 사라짐
   if (aiPaused) lines[4] = QUOTA_MSG;
   return lines;
 }
@@ -759,7 +770,7 @@ startBtn.onclick = async () => {
 };
 
 async function stop() {
-  running = false;
+  running = false; goodMix = false;
   try { sender.setRunning(false); } catch { /* ignore */ }
   clearTicker(ticker); ticker = 0;
   tellNative(false);
@@ -831,7 +842,7 @@ function masterTick() {
   render();
   if (tickN % 2 === 0 && localLevels) sender.sendLevels(localLevels[0], localLevels[1]);   // 0.2초: 레벨
   if (now - lastSecondAt >= 1000) { lastSecondAt = now; secondTick(); }
-  if (engine.idle) lastAnalyzeAt = now;           // 무음 대기: AI 호출 일시 중지
+  if (engine.idle) { lastAnalyzeAt = now; goodMix = false; }   // 무음 대기: AI 호출 일시 중지
   else if (!aiPaused && now - lastAnalyzeAt >= intervalSec * 1000) { lastAnalyzeAt = now; void analyze(); }
 }
 
@@ -895,20 +906,14 @@ async function analyze() {
   showBands(bandRows(bands, solo ? null : ev.deltas));
   const modeInfo = `입력: ${modeName()}${engine.autoTrim ? ` (Auto-Trim ${engine.trimDb >= 0 ? '+' : ''}${engine.trimDb}dB)` : ' (Raw)'}`
     + ` · 신호: ${solo ? 'Solo(PFL) 추정' : 'Full Mix'} · 활성 ${ev.signal.activeBands.length}/6 (${ev.signal.activeBands.join(', ') || '없음'})`;
-  const alwaysAi = tol <= ALWAYS_AI_TOL;            // ±0dB: 로컬 필터를 건너뛰고 매 주기 AI 로 보냄
-  // 로컬 필터를 통과한 주기: 조언은 생략하되 장르는 AI 조언 주기마다 판별 (장르 전용 짧은 요청)
-  const genreOnly = ev.pass && !alwaysAi;
+  // 로컬 dB 변화량/편차 필터 없음: 무음(게이트)이 아니면 매 주기 WAV + DSP 를 AI 로 보내고, 조언 기준은 민감도 단계로 AI 가 판단
+  const level = sens;
   if (inFlight) return;
   const key = apiKeyInp.value.trim();
   if (!key) { setStatus('⚙️ 설정에서 API Key를 입력하면 AI 조언이 시작됩니다'); setAiLast(`${modeInfo}\nAPI Key 없음 → AI 호출 안 함`); return; }
-  const over = solo
-    ? [ev.crestOk ? '협대역 피크' : 'Crest 범위 밖']
-    : Object.entries(ev.deltas).filter(([, d]) => Math.abs(d) > tol).map(([n, d]) => `${n} ${d > 0 ? '+' : ''}${d}`);
   const tempoTxt = dyn.tempo.bpm ? `템포 약 ${dyn.tempo.bpm} BPM (신뢰도 ${dyn.tempo.confidence})` : '템포 불분명';
   const gateInfo = `${modeInfo}\n측정: ${srcStat.analyser}틱${srcStat.cached ? ` (무음 캐시 대체 ${srcStat.cached}틱)` : ''} · ${tempoTxt}\n`
-    + (alwaysAi ? '항상 AI 전송 모드 (조언 민감도 ±0dB · 로컬 필터 생략)'
-      : genreOnly ? `로컬 필터 통과 → 조언 생략 · 장르만 판별`
-      : '필터 초과: ' + (over.length ? over.join(', ') : 'Crest 범위 밖'));
+    + `조언 민감도 ${level}단계 · ${SENS_LABEL[level]} (최대 ${SENS_MAX[level]}줄) · 매 주기 AI 전송`;
 
   inFlight = true;
   const bandData = Object.fromEntries(Object.entries(bands).map(([n, b]) => [n, {
@@ -921,8 +926,8 @@ async function analyze() {
   const longTerm = longTermFeatures({ at: nowMs, rel, centroid: spec.spectralCentroidHz, density: dyn.transientDensityPerMin, bpm: dyn.tempo.bpm, voice: spec.voiceBandSharePct, decay: dyn.decayTail.ratioPct });
   const payload = {
     windowSec,
-    toleranceDb: tol,
-    alwaysSend: alwaysAi,
+    sensitivityLevel: level,
+    sensitivityName: SENS_LABEL[level],
     inputMode: 'console-2track-raw',
     levelReference: engine.autoTrim ? `auto-trim normalized to ${TRIM.targetDb} dBFS (absolute level not meaningful)` : 'raw dBFS from console',
     captureNote: captureNote(),
@@ -966,7 +971,7 @@ async function analyze() {
       catch (e) { console.warn('WAV 인코딩 실패 (수치만 전송)', e); }
     }
     const hasAudio = !!wav;
-    const sys = genreOnly ? buildGenrePrompt(hasAudio) : buildSystemPrompt(tol, hasAudio);
+    const sys = buildSystemPrompt(level, hasAudio);
     const user = `${hasAudio ? `첨부 오디오: 최근 ${wav!.seconds}초 실제 소리 (44.1kHz 스테레오 16-bit WAV · L/R 독립 · 피크 -1dBFS 정규화 ${wav!.gainDb >= 0 ? '+' : ''}${wav!.gainDb}dB · 텍스트 dB 수치는 원본).\n` : ''}최근 ${windowSec}초 분석 데이터(JSON):\n${JSON.stringify({ ...payload, ...extra })}`;
     // 1·2·3순위 자동 폴백: 한도 소진이면 다음 순위로 바꿔 같은 데이터로 즉시 재요청
     let raw = '';
@@ -987,17 +992,22 @@ async function analyze() {
     const res = parseReply(raw);
     paintHeard(res, hasAudio);
     if (res.genre) { acceptGenre(res.genre); genreAt = Date.now(); paintGenre(); sender.update({ genre: badgeForSend(), genreAt }); }
-    const added = genreOnly ? [] : advice.ingest(res.advice, Date.now());
-    addHistory(added.map(a => a.text));
-    if (!genreOnly) paintDetails(res, [...added.map(a => a.text), ...advice.displayList().map(i => i.text)], hasAudio);   // 지금 HUD 에 떠 있는 것은 표시 중
+    // ✅ 믹스 양호(조언 없음): 남아 있던 조언을 지우고 HUD 첫 줄에 [믹스양호] 표시
+    const good = res.mixStatus === 'GOOD_BALANCE' && !res.advice.length && !res.rejected.length;
+    const wasGood = goodMix;
+    if (good) { advice.clearDisplay(); goodMix = true; }
+    const added = advice.ingest(res.advice, Date.now());
+    if (added.length || res.advice.length) goodMix = false;
+    addHistory(good ? (wasGood ? [] : [GOOD_MIX_LINE]) : added.map(a => a.text));   // 믹스 양호는 바뀔 때 한 번만 기록
+    paintDetails(res, [...added.map(a => a.text), ...advice.displayList().map(i => i.text)], hasAudio);   // 지금 HUD 에 떠 있는 것은 표시 중
     const text = raw.trim().replace(/\s+/g, ' ');
     const audioInfo = `🤖 ${modelChain()[activeIdx]?.rank ?? '-'}순위: ${currentModel()}\n`
       + (hasAudio ? `🎧 최근 ${wav!.seconds}초 오디오 첨부 (44.1kHz 스테레오 16-bit WAV · ${Math.round(wav!.bytes / 1024)}KB · 원본 평균 ${clipDb} dBFS · 피크 -1dBFS 정규화 ${wav!.gainDb >= 0 ? '+' : ''}${wav!.gainDb}dB · ${clipHealthText()})` : '🎧 오디오 첨부 없음 (이 AI 공급자는 수치만 전송)')
-      + (res.heard ? `\n👂 AI 청취: [${res.heard.sources.join(', ')}] ${res.heard.analysis}` : '')
+      + (res.heard ? `\n👂 AI 청취: [${res.heard.sources.join(', ')}] · 장르 근거: ${res.heard.reasoning}` : '')
+      + (res.mixStatus ? `\n🎚️ 믹스 상태: ${res.mixStatus}` : '')
       + (res.rejected.length ? `\n🚫 교차 검증 제외(들리지 않은 대상): ${res.rejected.join(' / ')}` : '');
     setAiLast(`${gateInfo}\n${audioInfo}\nAI 응답(${new Date().toLocaleTimeString()}): ${text || '(빈 응답)'}`);
-    setStatus(genreOnly ? `${solo ? 'Solo' : '밸런스'} 양호 · 조언 생략 (장르만 갱신)`
-      : !text ? 'AI 빈 응답' : res.none ? 'AI: NONE (지적 없음)'
+    setStatus(!text ? 'AI 빈 응답' : good || res.none ? '✅ AI: 믹스 밸런스 양호 (조언 없음)'
       : !res.advice.length ? (res.rejected.length ? `AI 조언 ${res.rejected.length}건 모두 제외 (들린 소스 목록에 없는 대상)` : 'AI 응답 형식 불일치')
       : `AI: ${added.length}건 표시` + (res.advice.length > added.length ? ` · ${res.advice.length - added.length}건 제외(중복/쿨다운)` : '')
         + (res.rejected.length ? ` · ${res.rejected.length}건 제외(들리지 않은 대상)` : ''));
@@ -1011,17 +1021,21 @@ async function analyze() {
 function paintDetails(res: ParsedReply, shown: string[], hasAudio: boolean) {
   const box = $('details'), info = $('detailInfo');
   const t = new Date().toLocaleTimeString();
+  const pill = (st?: string) => { if (!st) return; const p = document.createElement('span'); p.className = `mixpill ${st}`; p.textContent = st; info.appendChild(p); };
   if (!res.details.length) {
-    info.textContent = `${t} · ${res.none ? '지적 없음' : hasAudio ? '상세 설명 없음' : '이 AI 공급자는 한 줄 조언만 제공'}`;
-    if (res.none) box.replaceChildren(Object.assign(document.createElement('div'), { className: 'hint', textContent: '✅ 지금은 손댈 곳이 없다는 판단입니다.' }));
+    const good = res.none || res.mixStatus === 'GOOD_BALANCE';
+    info.textContent = `${t} · ${good ? '조언 없음' : hasAudio ? '상세 설명 없음' : '이 AI 공급자는 한 줄 조언만 제공'}`;
+    pill(res.mixStatus);
+    if (good) box.replaceChildren(Object.assign(document.createElement('div'), { className: 'mixgood', textContent: '✅ 현재 믹스 밸런스가 양호합니다 (추가 조정 불필요)' }));
     return;
   }
-  info.textContent = `${t} · ${res.details.filter(d => !d.rejected).length}건`;
+  info.textContent = `${t} · ${res.details.filter(d => !d.rejected && d.text).length}건`;
+  pill(res.mixStatus);
   box.replaceChildren(...res.details.map(d => {
     const el = document.createElement('div');
-    const dup = !d.rejected && !shown.includes(d.text);
+    const dup = !d.rejected && !!d.text && !shown.includes(d.text);
     el.className = 'detail' + (d.rejected ? ' rej' : dup ? ' dup' : '');
-    const line = document.createElement('div'); line.className = 'line'; line.textContent = d.text;
+    const line = document.createElement('div'); line.className = 'line'; line.textContent = d.text || '📝 상세 설명';
     if (d.rejected || dup) { const tg = document.createElement('span'); tg.className = 'tag'; tg.textContent = d.rejected ? '🚫 들린 소스 아님 → HUD 제외' : '⏳ 쿨다운 중 → HUD 미표시'; line.appendChild(tg); }
     const why = document.createElement('div'); why.className = 'why'; why.textContent = d.detail || '(상세 설명 없음)';
     el.append(line, why);
@@ -1035,7 +1049,10 @@ function paintHeard(res: ParsedReply, hasAudio: boolean) {
   const el = $('aiHeard');
   if (!res.heard) { el.textContent = hasAudio ? '🎧 AI 청취: (JSON 응답 아님)' : '🎧 AI 청취: 오디오 미첨부 공급자 (수치만 전송)'; el.title = ''; return; }
   const src = res.heard.sources.length ? res.heard.sources.join(', ') : '들리는 소스 없음';
-  el.textContent = `🎧 AI 청취: [${src}]${res.heard.analysis ? ` - ${res.heard.analysis}` : ''}`;
+  el.textContent = `🎧 AI 청취: [${src}]${res.heard.reasoning ? ` - ${res.heard.reasoning}` : ''}`;
+  const why = $('genreWhy');
+  why.hidden = !res.heard.reasoning;
+  why.textContent = res.heard.reasoning ? `🎼 장르 근거: ${res.heard.reasoning}` : '';
   if (res.rejected.length) {
     const r = document.createElement('span'); r.className = 'rej';
     r.textContent = ` · 🚫 ${res.rejected.length}건 제외`; el.appendChild(r);

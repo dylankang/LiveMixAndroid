@@ -66,6 +66,7 @@
 
     <!-- 3) 장르/모드 배지 -->
     <div id="genreBadge" class="badge genre">🎵 장르 판별 대기 중</div>
+    <div id="genreWhy" class="genre-why" hidden></div>
 
     <!-- 4) 스테레오 레벨 미터 -->
     <section class="card">
@@ -158,8 +159,12 @@
       <div class="hint">키는 이 브라우저(localStorage)에만 저장되며 AI 제조사 API로 직접 전송됩니다.</div>
 
       <h3>조언 민감도 <small id="tolInfo"></small></h3>
-      <input id="tolSlider" type="range" step="1" />
-      <div class="scale"><span id="tolLo"></span><span id="tolMid"></span><span id="tolHi"></span></div>
+      <div class="sens3" role="radiogroup" aria-label="조언 민감도">
+        <button type="button" class="sens" data-lv="1">1단계<br><small>필수만 (보수적)</small></button>
+        <button type="button" class="sens" data-lv="2">2단계<br><small>중간 (표준)</small></button>
+        <button type="button" class="sens" data-lv="3">3단계<br><small>세밀함 (적극적)</small></button>
+      </div>
+      <div id="sensHint" class="hint"></div>
 
       <h3>피드백 감지 민감도 <small id="fbInfo"></small></h3>
       <input id="fbSlider" type="range" min="0" max="100" step="5" />

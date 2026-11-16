@@ -193,6 +193,9 @@ export class AdviceManager {
     for (const e of this.cool.values()) if (e.until > cap) e.until = cap;
   }
 
+  /** 화면(HUD)에 떠 있는 조언만 비움 (쿨다운 기록은 유지) — 믹스 양호 판정 시 */
+  clearDisplay() { this.items = []; }
+
   displayList(): Candidate[] { return this.items.map(i => ({ tag: i.tag, text: i.text })); }
 
   /** 현재 쿨다운 목록 (남은 시간 짧은 순) */
