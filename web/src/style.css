@@ -55,6 +55,8 @@ input[type=range] { padding:0; height:28px; accent-color:var(--accent); backgrou
 .top-row.pills { flex-wrap:wrap; gap:6px; justify-content:center; }
 .pill.model { background:#0f2a1a; color:#9be7b4; border:1px solid #2e7d4f; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .pill.model.fallback { background:#33290a; color:#ffe08a; border-color:#b8962e; }
+.pill.lowdata { background:#14233a; color:#9fc9ff; border:1px solid #3a6aa8; }
+.pill[hidden] { display:none; }
 .pill.model.dead { background:#3a1210; color:#ffb4a8; border-color:#c0392b; }
 .prio { display:grid; gap:6px; margin:6px 0; }
 #prioReset { margin:4px 0; }

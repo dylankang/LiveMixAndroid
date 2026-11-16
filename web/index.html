@@ -37,6 +37,7 @@
       <div class="top-row pills">
         <span id="linkState" class="pill off">🔴 수신기 대기</span>
         <span id="modelState" class="pill model">🟢 1순위: -</span>
+        <span id="lowDataPill" class="pill lowdata" hidden>📉 저데이터 1Mbps</span>
       </div>
       <div id="status" class="status">대기 중</div>
     </header>
@@ -183,6 +184,10 @@
       <h3>피드백 감지 민감도 <small id="fbInfo"></small></h3>
       <input id="fbSlider" type="range" min="0" max="100" step="5" />
       <div class="scale"><span>둔감</span><span>보통</span><span>예민</span></div>
+
+      <h3>📉 저데이터 모드 <small>업로드 1Mbps 가정</small></h3>
+      <button id="lowDataBtn" class="toggle" type="button"></button>
+      <div id="lowDataInfo" class="hint"></div>
 
       <h3>AI 로 보내는 WAV 길이 <small id="clipInfo"></small></h3>
       <input id="clipSlider" type="range" />

@@ -160,7 +160,13 @@ ${areas}
 
 const TIMEOUT_MS = 7_000;     // 백그라운드/느린 망에서 분석 루프(inFlight)가 영구 잠기지 않도록 짧게
 /** 본문이 클수록(긴 WAV) 업로드 시간만큼 타임아웃을 늘림: 기본 7초 + 500KB 당 1초 */
-const timeoutFor = (bytes: number) => TIMEOUT_MS + Math.ceil(bytes / 500_000) * 1000;
+let assumedMbps: number | null = null;
+/** 📉 저데이터 모드: 업로드 속도(Mbps)를 가정해 타임아웃을 계산 (null = 기본 방식) */
+export function setUploadMbps(m: number | null) { assumedMbps = m; }
+/** 응답 대기 한도(ms). 저데이터 모드: 가정 속도의 75%로 업로드하는 시간 + 응답 여유 8초 */
+export const timeoutFor = (bytes: number) => assumedMbps
+  ? (Math.ceil(bytes * 8 / (assumedMbps * 1e6 * 0.75)) + 8) * 1000
+  : TIMEOUT_MS + Math.ceil(bytes / 500_000) * 1000;
 
 export class ApiError extends Error {
   status: number;
