@@ -5,6 +5,7 @@ import { callAI, parseReply, buildSystemPrompt, setUploadMbps, timeoutFor, SENS_
 import { analyzeClip, encodeWav, clipRmsDb, CLIP_LEN, WAV_RATES, wavLabel, wavWireBytes, type WavFormat } from './clip';
 import { evaluateBalance } from './balance';
 import { qrSvg } from './qrcode';
+import { NATIVE_MEDIA_ID, NATIVE_MEDIA_LABEL, nativeMediaSupported, isApp } from './native';
 import { fbParamsFor } from './config';
 import { Glasses } from './glasses';
 import { HudSender, HudReceiver, linkWatchdog, linesToShow, genCode, isCode, setLinkCode, linkCode, type BandRow, type LevelPkt, type MixState, type ReceiverInfo } from './link';
@@ -109,7 +110,13 @@ const tellNative = (b: boolean) => { try { (window as any).LiveMixNative?.setRun
 const setStatus = (s: string) => { $('status').textContent = s; sender.update({ status: s }); };
 
 // ───────── 1) 헤더: 연결 코드 · 새 코드 발급 · 수신기 URL 복사 · 수신기 연결 상태 · 설정 ─────────
-const hudUrl = () => `${location.origin}${location.pathname}?mode=hud&code=${linkCode()}`;
+// 📱 앱 안에서는 수신기 주소를 GitHub Pages 로 (Even 앱이 여는 주소). 같은 폰이면 수신기가 앱을 자동으로 찾아 코드 없이 연결
+const RX_PAGES = 'https://dylankang.github.io/LiveMixAndroid/';
+const hudUrl = () => `${isApp() ? RX_PAGES : `${location.origin}${location.pathname}`}?mode=hud&code=${linkCode()}`;
+if (isApp()) {
+  const h = document.querySelector('.pairbox .hint');
+  if (h) h.textContent = '📱 같은 폰의 Even 앱: 이 QR(주소)을 Even 앱에 한 번만 등록하면 이후로는 코드 입력 없이 자동 연결됩니다 (인터넷 없이 폰 안에서 연결). 다른 폰·PC 수신기는 4자리 코드로 연결됩니다.';
+}
 function paintCode() {
   $('pairCode').textContent = linkCode();
   // 📱 수신기 접속 QR (코드가 바뀌면 다시 그림)
@@ -499,6 +506,7 @@ function fillInputs(devs: MediaDeviceInfo[]) {
   const real = realDevices(devs);
   const granted = haveLabels || devs.some(d => d.deviceId === 'default' && !!d.label);
   deviceSel.innerHTML = '';
+  if (nativeMediaSupported()) addOpt(deviceSel, NATIVE_MEDIA_ID, NATIVE_MEDIA_LABEL);   // 📱 앱: 다른 앱에서 재생 중인 소리
   if (isMobile && (granted || real.length)) addOpt(deviceSel, DEFAULT_INPUT_ID, SYSTEM_IN_LABEL);
   real.forEach((d, i) => addOpt(deviceSel, d.deviceId, d.label || `입력 ${i + 1}`, d.label || ''));
   if (!deviceSel.options.length && devs.some(d => d.deviceId === 'default')) addOpt(deviceSel, DEFAULT_INPUT_ID, isMobile ? SYSTEM_IN_LABEL : '🎙️ 시스템 기본 입력');
@@ -695,7 +703,7 @@ async function startAudio() {
   engine.setAutoTrim(trimSaved());
   applyGate();
   // 목록이 아직 없으면(권한 전) 권한을 받아 Windows 장치 목록을 먼저 불러온다
-  if (!deviceSel.value || !haveLabels) await refreshDevices(true);
+  if (!deviceSel.value || (!haveLabels && deviceSel.value !== NATIVE_MEDIA_ID)) await refreshDevices(true);
   if (!deviceSel.value) throw Object.assign(new Error('Windows 에 인식된 오디오 입력 장치가 없습니다'), { name: 'NotFoundError' });
   savedIn = saveSel(deviceSel, 'lm.input');
   if (outputSel.value) savedOut = saveSel(outputSel, 'lm.output');
@@ -706,6 +714,7 @@ async function startAudio() {
   const info = engine.openInfo, st = info?.settings;
   const parts: string[] = [];
   parts.push(`입력: ${info?.label || deviceSel.selectedOptions[0]?.textContent || '?'} · ${engine.deviceChannels >= 2 ? 'Ch 1-2 스테레오' : '모노'} · ${st?.sampleRate ?? '?'}Hz${info?.step && info.step > 1 ? ` · ${info.step}차 방식으로 열림` : ''}`);
+  if (engine.nativeMedia) parts.push('📱 다른 앱에서 재생 중인 소리를 휴대폰 볼륨과 무관하게(볼륨 전단) 받습니다 · 앱 자체 볼륨 슬라이더는 반영됨 · 캡처를 막은 앱(일부 OTT 등)은 무음');
   parts.push(outputNone() ? '출력: 없음 (소리 내보내지 않음)' : `출력: ${outputSel.selectedOptions[0]?.textContent ?? ''} · 🎧 모니터링 ${monitorOn ? `ON (${monitorPct}%)` : 'OFF'}`
     + (engine.outputInfo.ok || engine.outputInfo.via === 'none' ? '' : ` · ⚠ 출력 전환 실패: ${engine.outputInfo.error ?? ''}`));
   parts.push(gateOn ? `🚪 노이즈 게이트 ${gateDb} dBFS · ${GATE.enterMs / 1000}초 이상 무음이면 대기` : '🚪 노이즈 게이트 OFF (무음에도 계속 분석)');

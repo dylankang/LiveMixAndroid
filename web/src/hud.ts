@@ -2,7 +2,9 @@
 // PC 분석기와 같은 4자리 '연결 코드'로 클라우드 MQTT 에 접속해 전체 상태(HUD 5줄 · 장르 · L/R 레벨 · 6밴드 표 · AI 로그)를 받아 보여 주고,
 // HUD 5줄은 받는 즉시 Even Hub 브리지로 G2 렌즈에 보낸다. PC 와 폰이 서로 다른 네트워크(유선 LAN ↔ 5G/LTE)여도 된다.
 import { Glasses } from './glasses';
-import { HudReceiver, linesToShow, isCode, setLinkCode, linkCode, HB_LOST_MS, type MixState, type ReceiverInfo } from './link';
+import { HudReceiver, linesToShow, isCode, setLinkCode, linkCode, localLinked, HB_LOST_MS, type MixState, type ReceiverInfo } from './link';
+/** 연결 수단이 있는지: 4자리 코드(MQTT) 또는 📱 같은 폰 앱 자동 연결 */
+const linked = () => isCode(linkCode()) || localLinked();
 declare const __BUILD_TIME__: string;
 import { renderBandTable, paintMeters, paintHud, paintCdCount, meterMarkup, genreText, clock } from './views';
 
@@ -138,7 +140,7 @@ function paintCount(st: MixState, i: ReceiverInfo) {
 
 // 👓 안경 다리 한 번 터치 → PC 분석기에 '쿨다운 전체 초기화' 명령 (길게 누르기 = 종료 확인)
 glasses.onTap = () => {
-  if (!isCode(linkCode())) return;
+  if (!linked()) return;
   rx.sendCommand('resetCooldown');
   const s = $('status');
   s.textContent = '👓 터치: 쿨다운 초기화 요청을 보냈습니다';
@@ -148,10 +150,11 @@ glasses.onTap = () => {
 /** PC 하트비트가 10초 넘게 없으면 상단에 '⚠️ PC 신호 대기중' */
 function paintPcWarn(i: ReceiverInfo) {
   const w = $('pcWarn');
-  const code = isCode(linkCode());
+  const code = linked();
   const lost = code && !i.pcAlive && (i.lastHb !== null || Date.now() - codeSetAt > HB_LOST_MS);
   w.hidden = !lost;
-  if (lost) w.textContent = i.lastHb ? `⚠️ PC 신호 대기중 · 마지막 신호 ${clock(i.lastHb)}` : `⚠️ PC 신호 대기중 · 코드 ${linkCode()} 의 PC 분석기가 아직 응답하지 않습니다`;
+  if (lost) w.textContent = i.lastHb ? `⚠️ PC 신호 대기중 · 마지막 신호 ${clock(i.lastHb)}`
+    : i.local ? '⚠️ 분석기 신호 대기중 · 같은 폰의 Live Mix 앱에서 [시작]을 눌러 주세요' : `⚠️ PC 신호 대기중 · 코드 ${linkCode()} 의 PC 분석기가 아직 응답하지 않습니다`;
 }
 
 function paintConn(i: ReceiverInfo) {
@@ -163,12 +166,15 @@ function paintConn(i: ReceiverInfo) {
     live: ['live', `🟢 실시간 수신 중 (마지막 업데이트: ${t})${lv}`],
     stale: ['stale', `🟡 신호 지연 — PC 분석기 응답 없음 (마지막 업데이트: ${t})`],
     stopped: ['off', `⏸ PC 분석기 정지됨 (마지막 업데이트: ${t})`],
-    waiting: ['off', isCode(linkCode()) ? `🔴 대기 중 — 코드 ${linkCode()} 의 PC 분석기 데이터를 기다리는 중` : '🔴 연결 코드를 입력하세요'],
+    waiting: ['off', i.local ? '🔴 대기 중 — 같은 폰 Live Mix 앱의 분석 시작을 기다리는 중'
+      : isCode(linkCode()) ? `🔴 대기 중 — 코드 ${linkCode()} 의 PC 분석기 데이터를 기다리는 중` : '🔴 연결 코드를 입력하세요 (같은 폰의 Live Mix 앱을 찾는 중…)'],
   } as const;
   const [cls, text] = map[i.phase];
   c.className = `badge ${cls}`;
   c.textContent = text;
-  $('status').textContent = `${mq}${isCode(linkCode()) ? ` · 코드 ${linkCode()}` : ''}`;
+  $('status').textContent = `${i.local ? '📱 같은 폰 앱과 자동 연결됨 (코드 불필요) · ' : ''}${mq}${isCode(linkCode()) ? ` · 코드 ${linkCode()}` : ''}`;
+  if (i.local) document.getElementById('keypad')?.remove();   // 같은 폰 앱을 찾으면 코드 입력 창은 닫음
+  if (i.local && !isCode(linkCode())) $('rxCode').textContent = '📱자동';
   paintPcWarn(i);
 }
 
@@ -184,7 +190,8 @@ rx.onInfo = i => { paintConn(i); refresh(); };
   if (isCode(start)) { lsSet(CODE_KEY, start); codeSetAt = Date.now(); setLinkCode(start); $('rxCode').textContent = start; }
 }
 rx.start();
-if (!isCode(linkCode())) openKeypad();
+// 코드가 없으면: 같은 폰의 Live Mix 앱을 잠깐 찾아보고, 없을 때만 코드 키패드를 연다
+if (!isCode(linkCode())) setTimeout(() => { if (!linked()) openKeypad(); }, 2500);
 
 // 1초마다 다시 판단: PC 신호가 끊긴 채 오래되면 멈춘 조언을 지우고 '⚠️ PC 신호 대기중' 표시, 다시 들어오면 즉시 복구
 function refresh() {

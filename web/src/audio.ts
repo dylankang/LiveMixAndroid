@@ -1,5 +1,6 @@
 import { BANDS, FB, fbParamsFor } from './config';
 import { ClipRing } from './clip';
+import { NATIVE_MEDIA_ID, NATIVE_MEDIA_LABEL, startNativeMedia, stopNativeMedia, createNativePcmNode, detachNativePcm, onNativeEvent } from './native';
 
 /** 드롭다운 기본값: deviceId 지정 없이 OS 기본 입력(연결된 USB 인터페이스 우선)을 연다 */
 export const DEFAULT_INPUT_ID = 'default';
@@ -284,6 +285,9 @@ export class AudioEngine {
   private aboveCount = 0;
   onIdleChange: (idle: boolean) => void = () => {};
   onEnded: () => void = () => {};     // 입력 장치가 분리되는 등 트랙이 끝났을 때
+  /** 📱 앱의 휴대폰 미디어 출력 캡처를 쓰는 중인지 */
+  nativeMedia = false;
+  private nativeOff?: () => void;
   channels = 0;
   running = false;
   openInfo: OpenInfo | null = null;
@@ -312,7 +316,18 @@ export class AudioEngine {
     if (typeof opt.monitorGain === 'number') this.monitorGain = opt.monitorGain;
     let ctx: AudioContext;
     let input: AudioNode;
-    {
+    if (opt.deviceId === NATIVE_MEDIA_ID) {
+      // 📱 앱 전용: 휴대폰에서 재생 중인 미디어를 볼륨 전단(단위 이득)에서 캡처한 PCM 을 그대로 분석
+      const fmt = await startNativeMedia();
+      this.nativeMedia = true;
+      this.nativeOff = onNativeEvent(e => { if (e.type === 'media' && e.state === 'stopped' && this.running) this.onEnded(); });
+      try { ctx = new AudioContext({ latencyHint: 'interactive', sampleRate: fmt.rate }); }
+      catch { ctx = new AudioContext({ latencyHint: 'interactive' }); }
+      input = await createNativePcmNode(ctx);
+      this.deviceChannels = 2;
+      this.usbPicked = false;
+      this.openInfo = { step: 1, label: NATIVE_MEDIA_LABEL, settings: { sampleRate: fmt.rate, channelCount: 2 } as MediaTrackSettings, usb: false };
+    } else {
       let id = opt.deviceId, usb = false;
       if (!id || id === DEFAULT_INPUT_ID) {
         const u = await findUsbInput().catch(() => null);
@@ -435,6 +450,7 @@ export class AudioEngine {
     if (this.monEl) { try { this.monEl.pause(); this.monEl.srcObject = null; this.monEl.remove(); } catch { /* ignore */ } }
     this.monEl = undefined; this.monDest = undefined; this.mon = undefined;
     this.stream?.getTracks().forEach(t => t.stop());
+    if (this.nativeMedia) { stopNativeMedia(); detachNativePcm(); this.nativeOff?.(); this.nativeOff = undefined; this.nativeMedia = false; }
     await this.ctx?.close().catch(() => {});
     this.ctx = undefined; this.stream = undefined; this.src = undefined; this.bandAn = [];
     this.trim = undefined; this.anRaw = []; this.sp = undefined;

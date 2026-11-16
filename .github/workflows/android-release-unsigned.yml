@@ -1,0 +1,70 @@
+# Live Mix Assistant — Release APK (서명 전) 빌드 → apk-build 브랜치
+#  · GitHub Secrets 에 서명 키가 없어도 Release(최적화) APK 를 만들 수 있도록, 서명하지 않은 Release APK 와
+#    공식 서명 도구(apksigner.jar)를 apk-build 브랜치에 올린다. 서명은 키를 가진 쪽에서 apksigner 로 한다.
+#  · 키를 GitHub Secrets 에 등록하면 android-build.yml 의 태그 빌드가 서명까지 자동으로 한다 (README 참고).
+name: Android Release APK (unsigned)
+
+on:
+  push:
+    branches: [main]
+    paths: ['app/**', 'web/**', 'tools/**', 'version.properties', 'build.gradle', 'settings.gradle', '.github/workflows/android-release-unsigned.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-unsigned
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build web app and bundle into the APK
+        run: bash tools/build-web.sh
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build Release APK (unsigned)
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --stacktrace --no-daemon
+
+      - name: Publish to apk-build branch
+        run: |
+          set -e
+          NAME=$(grep -E '^VERSION_NAME=' version.properties | cut -d= -f2 | tr -d '[:space:]')
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -n1)
+          mkdir -p out
+          cp "$APK" out/LiveMixAssistant-v${NAME}-unsigned.apk
+          cp "$ANDROID_HOME/build-tools/35.0.0/lib/apksigner.jar" out/apksigner.jar
+          cp "$ANDROID_HOME/build-tools/35.0.0/zipalign" out/zipalign || true
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -P 16 -v 4 "$APK" > /dev/null && echo "zipalign OK" > out/ALIGN.txt || echo "zipalign check failed" > out/ALIGN.txt
+          echo "version=${NAME}" > out/BUILD.txt
+          echo "commit=${GITHUB_SHA}" >> out/BUILD.txt
+          echo "built=$(date -u +%FT%TZ)" >> out/BUILD.txt
+          cd out
+          git init -q
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git checkout -q -b apk-build
+          git add -A
+          git commit -q -m "unsigned release v${NAME} (${GITHUB_SHA::7})"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" apk-build

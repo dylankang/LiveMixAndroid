@@ -16,6 +16,12 @@ export const HB_LOST_MS = 10000;      // 이 시간 넘게 하트비트가 없�
 export const NO_SIGNAL_LINES = ['⚠️ PC 신호 대기중', '', '', '', ''];
 const MAX_AGE_MS = 6 * 3600_000; // 이보다 오래된 retained 상태는 버림 (지난 공연 데이터)
 
+// ───────── 📱 같은 폰 자동 연결 (LOCAL) ─────────
+// 안드로이드 앱(분석기)은 폰 안(127.0.0.1)에 작은 서버를 연다. 같은 폰의 Even 앱에서 열린 수신기는
+// 이 서버를 찾으면 코드 없이 바로 연결된다 (인터넷·MQTT 불필요). 못 찾으면 기존 코드 + MQTT 방식 그대로.
+export const LOCAL_PORTS = [8765, 8766, 8767];
+const nativeBridge = (): any => (window as any).LiveMixNative;
+
 // ───────── 4자리 연결 코드 ─────────
 export const isCode = (s: unknown): s is string => typeof s === 'string' && /^\d{4}$/.test(s);
 export function genCode(): string {
@@ -48,7 +54,7 @@ export interface MixState {
   frozen?: boolean;                      // 분석기가 백그라운드로 가며 멈추기 직전에 보낸 마지막 패킷
   cooldownCount?: number;                // 현재 쿨다운 중인 조언 개수 (HUD 오른쪽 위 표시)
 }
-export type Via = 'MQTT';
+export type Via = 'MQTT' | 'LOCAL';
 export type MqttState = 'off' | 'connecting' | 'on';
 
 const rand = () => Math.random().toString(36).slice(2, 10);
@@ -70,8 +76,16 @@ class Bus {
   private stateFns: (() => void)[] = [];
   private codeFns: (() => void)[] = [];
   private subCode = '';
+  /** 📱 수신기: 찾은 폰 내부 서버 주소 (예: http://127.0.0.1:8765) · '' = 없음 */
+  private localBase = '';
+  private localAfter = 0;
+  private localFails = 0;
+  private localClient = false;
+  private localFns: (() => void)[] = [];
 
   constructor() {
+    // 앱 안의 분석기: 앱이 폰 내부 서버로 받은 수신기 메시지(hello·ack·cmd)를 여기로 넣어 준다
+    if (nativeBridge()?.localPost) (window as any).__lmLocalRx = (j: string) => { try { this.recv(JSON.parse(j), 'LOCAL'); } catch { /* ignore */ } };
     this.connectMqtt();
     // 절전·네트워크 전환에서 돌아오면 끊겼을 수 있는 연결을 바로 새로 연결
     const wake = (why: string) => {
@@ -109,6 +123,57 @@ class Bus {
     if (old) { try { old.end(true); } catch { /* ignore */ } }
     this.connecting = false;
     this.connectMqtt();
+  }
+
+  /** 수신기 전용: 같은 폰의 앱 서버를 찾아 자동 연결 (찾을 때까지 3초마다 다시 시도) */
+  enableLocalClient() {
+    if (this.localClient || nativeBridge()?.localPost) return;
+    this.localClient = true;
+    void this.probeLocal();
+  }
+  localLinked() { return !!this.localBase || !!nativeBridge()?.localPost; }
+  onLocal(f: () => void) { this.localFns.push(f); }
+  private setLocal(base: string) {
+    if (base === this.localBase) return;
+    this.localBase = base; this.localAfter = 0; this.localFails = 0;
+    this.localFns.forEach(f => f());
+    if (base) this.upFns.forEach(f => f());   // 연결되자마자 hello
+  }
+  private async probeLocal() {
+    const cands = location.hostname === '127.0.0.1' || location.hostname === 'localhost'
+      ? [location.origin, ...LOCAL_PORTS.map(p => `http://127.0.0.1:${p}`)] : LOCAL_PORTS.map(p => `http://127.0.0.1:${p}`);
+    for (const base of cands) {
+      try {
+        const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 1200);
+        const r = await fetch(`${base}/lm/poll?after=0`, { signal: ctl.signal, cache: 'no-store' }).finally(() => clearTimeout(t));
+        if (!r.ok) continue;
+        const j = await r.json();
+        if (typeof j?.last !== 'number') continue;
+        this.setLocal(base);
+        this.handleLocal(j);
+        later(() => this.pollLocal(), 250);
+        return;
+      } catch { /* 다음 후보 */ }
+    }
+    later(() => { if (!this.localBase) void this.probeLocal(); }, 3000);
+  }
+  private handleLocal(j: any) {
+    if (typeof j.last === 'number') this.localAfter = j.last;
+    for (const m of Array.isArray(j.msgs) ? j.msgs : []) this.recv(m, 'LOCAL');
+  }
+  private async pollLocal() {
+    const base = this.localBase;
+    if (!base) return;
+    try {
+      const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 3000);
+      const r = await fetch(`${base}/lm/poll?after=${this.localAfter}`, { signal: ctl.signal, cache: 'no-store' }).finally(() => clearTimeout(t));
+      if (!r.ok) throw new Error(String(r.status));
+      this.handleLocal(await r.json());
+      this.localFails = 0;
+    } catch {
+      if (++this.localFails >= 8) { this.setLocal(''); void this.probeLocal(); return; }   // 앱이 꺼짐 → 다시 찾기
+    }
+    later(() => this.pollLocal(), 250);
   }
 
   on(h: Handler) { this.handlers.push(h); }
@@ -171,10 +236,17 @@ class Bus {
   }
 
   post(m: any, o: PostOpts = {}) {
+    const json = JSON.stringify({ ...m, page: PAGE_ID });
+    const topic = o.topic === 'status' ? 'status' : 'hud';
+    // 📱 같은 폰: 앱 분석기 → 앱의 폰 내부 서버 / 수신기 → 찾은 폰 내부 서버 (코드와 무관)
+    const nb = nativeBridge();
+    if (nb?.localPost) { try { nb.localPost(topic, json, !!o.retain); } catch { /* ignore */ } }
+    else if (this.localBase) {
+      fetch(`${this.localBase}/lm/post?topic=${topic}`, { method: 'POST', body: json, headers: { 'Content-Type': 'text/plain' }, cache: 'no-store' }).catch(() => {});
+    }
     if (!isCode(curCode) || !this.client?.connected) return;
     const t = topicsFor(curCode);
-    const json = JSON.stringify({ ...m, page: PAGE_ID });
-    try { this.client.publish(o.topic === 'status' ? t.status : t.hud, json, { qos: 0, retain: !!o.retain }); } catch { /* ignore */ }
+    try { this.client.publish(topic === 'status' ? t.status : t.hud, json, { qos: 0, retain: !!o.retain }); } catch { /* ignore */ }
   }
 
   private recv(m: any, via: Via) {
@@ -185,6 +257,8 @@ class Bus {
 
 /** 오디오 틱 워치독용: MQTT 가 끊겨 있으면 바로 재연결 (재연결되면 마지막 분석 상태를 자동 재발행) */
 export const linkWatchdog = () => bus().watchdog();
+/** 📱 같은 폰의 앱과 자동 연결됐는지 (수신기) / 앱 안에서 실행 중인지 (분석기) */
+export const localLinked = () => bus().localLinked();
 
 let busSingleton: Bus | null = null;
 const bus = () => (busSingleton ??= new Bus());
@@ -284,6 +358,8 @@ export interface ReceiverInfo {
   code: string;
   /** PC 하트비트: 마지막 수신 시각 · 그때 보고된 입력 레벨 · 10초 안에 받았는지 */
   lastHb: number | null; hbLevelDb: number | null; pcAlive: boolean;
+  /** 📱 같은 폰의 앱과 자동 연결됨 (코드 불필요) */
+  local: boolean;
 }
 
 /** 지금 HUD·G2 렌즈에 내보낼 5줄: PC 하트비트가 10초 넘게 없거나 신호가 오래 끊기면 '⚠️ PC 신호 대기중' */
@@ -316,6 +392,8 @@ export class HudReceiver {
 
   start() {
     const b = bus();
+    b.enableLocalClient();
+    b.onLocal(() => this.onInfo(this.info()));
     b.on((m, via) => this.recv(m, via));
     b.onUp(() => this.hello());
     b.onMqttState(() => this.onInfo(this.info()));
@@ -342,7 +420,7 @@ export class HudReceiver {
     if (c) phase = !c.st.running ? 'stopped' : c.st.frozen ? 'stale' : Date.now() - c.ts <= LIVE_MS ? 'live' : 'stale';
     const pcAlive = this.lastHb !== null && Date.now() - this.lastHb <= HB_LOST_MS;
     return { phase, lastUpdate: c?.ts ?? null, via: this.via, mqtt: bus().mqttState(), frozen: !!c?.st.frozen,
-      code: curCode, lastHb: this.lastHb, hbLevelDb: this.hbLevelDb, pcAlive };
+      code: curCode, lastHb: this.lastHb, hbLevelDb: this.hbLevelDb, pcAlive, local: bus().localLinked() };
   }
 
   private hello() { bus().post({ t: 'hello', ts: Date.now() }, { topic: 'status' }); }

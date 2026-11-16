@@ -10,6 +10,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -30,6 +31,8 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
 
+import org.json.JSONObject;
+
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -38,6 +41,9 @@ import java.util.Map;
 
 /**
  * Live Mix Assistant 안드로이드 앱.
+ * - 📱 휴대폰 미디어 출력 캡처: 입력 목록의 '휴대폰 미디어 출력' → 화면 녹화(미디어 캡처) 동의 → KeepAliveService 가
+ *   다른 앱에서 재생 중인 소리를 볼륨 전단에서 받아 window.__lmPcm(base64) 로 계속 넘김
+ * - 📱 같은 폰 자동 연결: 분석기가 보낸 메시지를 LocalServer(127.0.0.1)에 보관 → 같은 폰 Even 앱의 수신기가 코드 없이 가져감
  * - 웹앱(분석기)이 APK 안(assets/www)에 포함되어 인터넷 서버(Netlify) 없이 단독으로 동작
  * - 웹이 [시작]을 누르면 LiveMixNative.setRunning(true) 를 호출 → 포그라운드 서비스로 화면이 꺼져도/다른 앱을 열어도 분석 유지
  * - 크롬과 달리 앱은 WebView 를 일시정지시키지 않는다 (onPause 에서 webView.onPause()/pauseTimers() 를 호출하지 않음)
@@ -45,10 +51,11 @@ import java.util.Map;
 public class MainActivity extends Activity {
     private static final String PREFS = "livemix";
         private static final String KEY_BATTERY_ASKED = "batteryAsked";
-    private static final String KEY_RECEIVER_ON = "receiverOn";
     private static final int REQ_AUDIO = 1;
     private static final int REQ_NOTIFY = 2;
     private static final int REQ_FILE = 3;
+    private static final int REQ_PROJECTION = 4;
+    private static final int REQ_AUDIO_MEDIA = 5;
     private static final int MENU_RECEIVER = 1, MENU_RELOAD = 2, MENU_BATTERY = 3, MENU_EXIT = 4;
 
     private WebView webView;
@@ -129,16 +136,81 @@ public class MainActivity extends Activity {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIFY);
         }
 
-        // 수신기용 폰 내부 서버는 사용자가 [G2 수신기 주소] 메뉴를 한 번 연 뒤부터만 켠다 (기본은 꺼짐)
-        if (getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_RECEIVER_ON, false)) LocalServer.ensureStarted(this);
+        // 📱 같은 폰 자동 연결: 폰 내부 서버(127.0.0.1)를 항상 켜 둔다 → 같은 폰 Even 앱의 수신기가 코드 없이 찾아옴
+        LocalServer.ensureStarted(this);
+        LocalServer.setInbound(json -> ui.post(() -> js("window.__lmLocalRx&&window.__lmLocalRx(" + JSONObject.quote(json) + ")")));
+        // 📱 미디어 출력 캡처 PCM·상태 → WebView
+        KeepAliveService.sink = new KeepAliveService.Sink() {
+            @Override public void onPcm(String b64) { ui.post(() -> js("window.__lmPcm&&window.__lmPcm('" + b64 + "')")); }
+            @Override public void onMediaState(String state, String msg) {
+                ui.post(() -> {
+                    try {
+                        JSONObject o = new JSONObject().put("type", "media").put("state", state);
+                        if ("started".equals(state)) o.put("rate", KeepAliveService.RATE).put("channels", 2);
+                        if (msg != null) o.put("msg", msg);
+                        emitEvent(o);
+                    } catch (Exception ignored) { }
+                });
+            }
+        };
         if (savedInstanceState != null) webView.restoreState(savedInstanceState);
         else webView.loadUrl(WebAssets.BASE);
+    }
+
+    private void js(String code) {
+        if (webView != null) webView.evaluateJavascript(code, null);
+    }
+
+    private void emitEvent(JSONObject o) {
+        js("window.__lmNativeEvent&&window.__lmNativeEvent(" + JSONObject.quote(o.toString()) + ")");
+    }
+
+    private void emitMedia(String state, String msg) {
+        try {
+            JSONObject o = new JSONObject().put("type", "media").put("state", state);
+            if (msg != null) o.put("msg", msg);
+            emitEvent(o);
+        } catch (Exception ignored) { }
+    }
+
+    // ───────── 📱 미디어 출력 캡처 시작: 녹음 권한 → 화면 녹화(미디어 캡처) 동의 → 서비스 ─────────
+    private void beginMediaCapture() {
+        if (Build.VERSION.SDK_INT < 29) { emitMedia("error", "안드로이드 10 이상에서만 지원됩니다"); return; }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO_MEDIA);
+            return;
+        }
+        try {
+            MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+            startActivityForResult(mpm.createScreenCaptureIntent(), REQ_PROJECTION);
+        } catch (Exception e) {
+            emitMedia("error", String.valueOf(e.getMessage()));
+        }
     }
 
     // ───────── 웹 ↔ 앱 연결 ─────────
     private class NativeBridge {
         @JavascriptInterface
         public boolean isNative() { return true; }
+
+        @JavascriptInterface
+        public String appVersion() {
+            try { return getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception e) { return ""; }
+        }
+
+        /** 📱 휴대폰 미디어 출력 캡처 가능 여부 (안드로이드 10+) */
+        @JavascriptInterface
+        public boolean mediaCaptureSupported() { return Build.VERSION.SDK_INT >= 29; }
+
+        @JavascriptInterface
+        public void startMediaCapture() { ui.post(MainActivity.this::beginMediaCapture); }
+
+        @JavascriptInterface
+        public void stopMediaCapture() { ui.post(() -> KeepAliveService.stopMedia(MainActivity.this)); }
+
+        /** 📱 같은 폰 자동 연결: 분석기 메시지를 폰 내부 서버에 보관 (수신기가 가져감) */
+        @JavascriptInterface
+        public void localPost(String topic, String json, boolean retain) { LocalServer.publish(topic, json, retain); }
 
         /** 웹 분석기의 [시작]/[정지]에서 호출 */
         @JavascriptInterface
@@ -175,6 +247,12 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode == REQ_AUDIO_MEDIA) {
+            boolean ok = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
+            if (ok) beginMediaCapture();
+            else emitMedia("denied", "오디오 녹음 권한이 필요합니다");
+            return;
+        }
         if (requestCode != REQ_AUDIO || pendingPermission == null) return;
         boolean ok = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
         if (ok) pendingPermission.grant(new String[]{PermissionRequest.RESOURCE_AUDIO_CAPTURE});
@@ -188,6 +266,14 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_PROJECTION) {
+            if (resultCode == RESULT_OK && data != null) {
+                analyzing = true;
+                KeepAliveService.startMedia(this, resultCode, data);
+                askBatteryOnce();
+            } else emitMedia("denied", null);
+            return;
+        }
         if (requestCode == REQ_FILE && fileCallback != null) {
             fileCallback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data));
             fileCallback = null;
@@ -206,13 +292,22 @@ public class MainActivity extends Activity {
         p.edit().putBoolean(KEY_BATTERY_ASKED, true).apply();
         new AlertDialog.Builder(this)
                 .setTitle("화면이 꺼져도 분석 유지")
-                .setMessage("화면이 꺼진 동안에도 분석을 계속하려면 배터리 설정 목록에서 'Live Mix Assistant'를 찾아 '최적화 안 함'으로 바꿔 주세요. (선택 사항)")
-                .setPositiveButton("설정 열기", (d, w) -> openBatterySettings())
+                .setMessage("화면이 꺼진 동안·다른 앱을 쓰는 동안에도 분석과 AI 호출을 멈추지 않으려면 배터리 최적화에서 이 앱을 제외해야 합니다. 다음 창에서 '허용'을 눌러 주세요.")
+                .setPositiveButton("계속", (d, w) -> requestBatteryExemption())
                 .setNegativeButton("나중에", null)
                 .show();
     }
 
-    // 특수 권한(REQUEST_IGNORE_BATTERY_OPTIMIZATIONS) 없이 시스템 배터리 최적화 목록만 연다
+    /** 이 앱만 배터리 최적화에서 제외하는 시스템 확인 창 (한 번 '허용'이면 끝) */
+    @SuppressLint("BatteryLife")
+    private void requestBatteryExemption() {
+        try {
+            startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName())));
+        } catch (Exception e) {
+            openBatterySettings();
+        }
+    }
+
     private void openBatterySettings() {
         try { startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)); }
         catch (Exception e) {
@@ -221,15 +316,16 @@ public class MainActivity extends Activity {
     }
 
     // ───────── Even 앱(수신기)에 입력할 주소 ─────────
+    private static final String PAGES_RX = "https://dylankang.github.io/LiveMixAndroid/?mode=hud";
+
     private void showReceiverUrl() {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_RECEIVER_ON, true).apply();
         LocalServer.ensureStarted(this);
-        final String url = LocalServer.receiverUrl();
-        if (url == null) { Toast.makeText(this, "수신기 서버를 시작하지 못했습니다", Toast.LENGTH_LONG).show(); return; }
+        final String url = PAGES_RX;
+        final String local = LocalServer.receiverUrl();
         new AlertDialog.Builder(this)
-                .setTitle("G2 수신기 주소")
-                .setMessage(url + "\n\nEven 앱(Even Hub)에서 이 주소를 열면 이 앱에 포함된 HUD 수신기가 실행됩니다. "
-                        + "인터넷 서버(Netlify)는 필요 없지만, 이 앱이 실행(분석 중) 상태여야 합니다.")
+                .setTitle("G2 수신기 주소 (같은 폰 자동 연결)")
+                .setMessage(url + "\n\nEven 앱(Even Hub)에 이 주소를 한 번 등록하면, 같은 폰에서 이 앱이 켜져 있을 때 코드 입력 없이 자동으로 연결됩니다 (폰 안에서 직접 연결 · 인터넷 불필요). "
+                        + (local != null ? "\n\n인터넷이 전혀 없을 때는 앱 내장 수신기 주소를 쓸 수 있습니다:\n" + local : ""))
                 .setPositiveButton("주소 복사", (d, w) -> {
                     ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
                     if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("receiver", url));
@@ -291,6 +387,8 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         KeepAliveService.stop(this);
+        KeepAliveService.sink = null;
+        LocalServer.setInbound(null);
         if (pendingPermission != null) { pendingPermission.deny(); pendingPermission = null; }
         webView.destroy();
         super.onDestroy();
