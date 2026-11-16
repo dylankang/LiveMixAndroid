@@ -87,7 +87,7 @@ public class KeepAliveService extends Service {
         } catch (Exception e) {
             Log.w(TAG, "미디어 캡처 서비스 시작 실패", e);
             Sink s = sink;
-            if (s != null) s.onMediaState("error", String.valueOf(e.getMessage()));
+            if (s != null) s.onMediaState("error", String.valueOf(e.getMessage()), 0, 0, null);
         }
     }
 
