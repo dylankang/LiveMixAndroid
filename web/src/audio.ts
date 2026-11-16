@@ -1,4 +1,5 @@
 import { BANDS, FB, fbParamsFor } from './config';
+import { ClipRing } from './clip';
 
 /** 드롭다운 기본값: deviceId 지정 없이 OS 기본 입력(연결된 USB 인터페이스 우선)을 연다 */
 export const DEFAULT_INPUT_ID = 'default';
@@ -29,6 +30,7 @@ class LmClock extends AudioWorkletProcessor {
     super(); this.acc = 0; this.every = Math.round(sampleRate / 10); this.sq = [0, 0]; this.pk = [0, 0]; this.n = 0;
     this.frame = Math.round(sampleRate / 100); this.fn = 0; this.eLow = 0; this.eFull = 0; this.lp = 0;
     this.a = 1 - Math.exp(-2 * Math.PI * 150 / sampleRate); this.envLow = []; this.envFull = [];
+    this.mono = new Float32Array(this.every + 512); this.mn = 0;   // 최근 3초 오디오 클립용 원음 모노(L+R)/2
   }
   process(inputs) {
     const inp = inputs[0];
@@ -41,6 +43,7 @@ class LmClock extends AudioWorkletProcessor {
         if (pa > this.pk[0]) this.pk[0] = pa;
         if (pb > this.pk[1]) this.pk[1] = pb;
         const m = (a + b) * 0.5;
+        if (this.mn < this.mono.length) this.mono[this.mn++] = m;
         this.lp += this.a * (m - this.lp);
         this.eLow += this.lp * this.lp; this.eFull += m * m;
         if (++this.fn >= this.frame) { this.envLow.push(this.eLow / this.fn); this.envFull.push(this.eFull / this.fn); this.fn = 0; this.eLow = 0; this.eFull = 0; }
@@ -51,10 +54,11 @@ class LmClock extends AudioWorkletProcessor {
     if (this.acc >= this.every) {
       this.acc -= this.every;
       const db = x => (x > 1e-7 ? 20 * Math.log10(x) : -120), n = this.n || 1;
+      const mono = this.mono.slice(0, this.mn); this.mn = 0;
       this.port.postMessage({ type: 'tick',
         rms: [db(Math.sqrt(this.sq[0] / n)), db(Math.sqrt(this.sq[1] / n))],
         peak: [db(this.pk[0]), db(this.pk[1])],
-        envLow: this.envLow, envFull: this.envFull });
+        envLow: this.envLow, envFull: this.envFull, mono }, [mono.buffer]);
       this.sq[0] = this.sq[1] = 0; this.pk[0] = this.pk[1] = 0; this.n = 0;
       this.envLow = []; this.envFull = [];
     }
@@ -194,6 +198,11 @@ export class AudioEngine {
   private specCache: Float64Array | null = null;
   private tickQuiet = false;
   private tickCached = false;
+  /** 🎧 최근 3초 원음(모노) — AI 첨부용 WAV 클립 */
+  private clip = new ClipRing();
+  /** 최근 3초 클립 (1초 미만이면 null) */
+  clipSnapshot() { return this.clip.snapshot(1); }
+
   /** 템포 추정용 10ms 에너지 엔벨로프 (최근 20초) */
   private envLow: number[] = [];
   private envFull: number[] = [];
@@ -340,7 +349,7 @@ export class AudioEngine {
     const sink = ctx.createGain();
     sink.gain.value = 0;
     sink.connect(ctx.destination);
-    this.cache = []; this.specCache = null; this.srcCount = { analyser: 0, cached: 0 }; this.envLow = []; this.envFull = [];
+    this.cache = []; this.specCache = null; this.srcCount = { analyser: 0, cached: 0 }; this.envLow = []; this.envFull = []; this.clip.clear();
     // 🎧 모니터링 경로: L/R 원음(보정 전) → 모니터 게인 → 출력 장치. OFF 면 게인 0
     const mon = ctx.createGain();
     mon.gain.value = this.monitorOn ? this.monitorGain : 0;
@@ -612,6 +621,7 @@ export class AudioEngine {
         const d = ev.data;
         if (d?.type !== 'tick') return;
         if (Array.isArray(d.rms) && Array.isArray(d.peak)) this.wk = { rms: [d.rms[0], d.rms[1]], peak: [d.peak[0], d.peak[1]], at: performance.now() };
+        if (d.mono instanceof Float32Array && d.mono.length) this.clip.push(d.mono, ctx.sampleRate);
         if (Array.isArray(d.envLow) && Array.isArray(d.envFull) && !this.idle) {
           for (let k = 0; k < d.envLow.length; k++) { this.envLow.push(d.envLow[k]); this.envFull.push(d.envFull[k] ?? 0); }
           if (this.envLow.length > ENV_MAX) { const cut = this.envLow.length - ENV_MAX; this.envLow.splice(0, cut); this.envFull.splice(0, cut); }
@@ -625,7 +635,10 @@ export class AudioEngine {
       try {
         const sp = ctx.createScriptProcessor(4096, 1, 1);
         src.connect(sp); sp.connect(sink);
-        sp.onaudioprocess = () => { try { this.onAudioBeat(); } catch { /* ignore */ } };
+        sp.onaudioprocess = e => {
+          try { this.clip.push(new Float32Array(e.inputBuffer.getChannelData(0)), ctx.sampleRate); } catch { /* ignore */ }
+          try { this.onAudioBeat(); } catch { /* ignore */ }
+        };
         this.sp = sp; this.clockKind = 'scriptprocessor';
       } catch (e2) { console.warn('오디오 스레드 박동 없음 (Worker 틱만 사용)', e2); this.clockKind = 'none'; }
     }

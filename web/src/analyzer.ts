@@ -1,7 +1,8 @@
 import { PipMonitor, pipSupported } from './pip';
 import { AudioEngine, type BandStat, listInputs, listOutputs, realDevices, outputSelectSupported, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE } from './audio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
-import { callAI, parseReply, buildSystemPrompt, buildGenrePrompt, isQuotaError, type Genre } from './ai';
+import { callAI, parseReply, buildSystemPrompt, buildGenrePrompt, isQuotaError, supportsAudio, type Genre } from './ai';
+import { analyzeClip, encodeWav16k } from './clip';
 import { evaluateBalance, TOL_RANGE, ALWAYS_AI_TOL } from './balance';
 import { fbParamsFor } from './config';
 import { Glasses } from './glasses';
@@ -856,14 +857,28 @@ async function analyze() {
     cooldownList: advice.cooldownTags(nowMs),
   };
   try {
-    const raw = await callAI(provider(), currentModel(), key, genreOnly ? buildGenrePrompt() : buildSystemPrompt(tol),
-      `최근 ${windowSec}초 분석 데이터(JSON):\n${JSON.stringify(payload)}`);
+    // 🎧 최근 3초 실제 오디오: 같은 구간의 단기 지표(last3s)는 항상, WAV 는 오디오를 받는 공급자(Gemini)일 때 첨부
+    const clip = engine.clipSnapshot();
+    let wav: Awaited<ReturnType<typeof encodeWav16k>> | null = null;
+    const extra: Record<string, unknown> = {};
+    if (clip) {
+      extra.last3s = analyzeClip(clip.data, clip.sr);
+      if (supportsAudio(provider())) {
+        try { wav = await encodeWav16k(clip.data, clip.sr); extra.audio = { seconds: wav.seconds, sampleRate: 16000, channels: 1, gainDb: wav.gainDb }; }
+        catch (e) { console.warn('WAV 인코딩 실패 (수치만 전송)', e); }
+      }
+    }
+    const hasAudio = !!wav;
+    const raw = await callAI(provider(), currentModel(), key, genreOnly ? buildGenrePrompt(hasAudio) : buildSystemPrompt(tol, hasAudio),
+      `${hasAudio ? `첨부 오디오: 최근 ${wav!.seconds}초 실제 소리 (16kHz 모노 WAV · 듣기 쉽게 ${wav!.gainDb >= 0 ? '+' : ''}${wav!.gainDb}dB 정규화).\n` : ''}최근 ${windowSec}초 분석 데이터(JSON):\n${JSON.stringify({ ...payload, ...extra })}`,
+      wav?.base64);
     const res = parseReply(raw);
     if (res.genre) { acceptGenre(res.genre); genreAt = Date.now(); paintGenre(); sender.update({ genre: badgeForSend(), genreAt }); }
     const added = genreOnly ? [] : advice.ingest(res.advice, Date.now());
     addHistory(added.map(a => a.text));
     const text = raw.trim().replace(/\s+/g, ' ');
-    setAiLast(`${gateInfo}\nAI 응답(${new Date().toLocaleTimeString()}): ${text || '(빈 응답)'}`);
+    const audioInfo = hasAudio ? `🎧 최근 ${wav!.seconds}초 오디오 첨부 (16kHz 모노 WAV · ${Math.round(wav!.bytes / 1024)}KB)` : clip ? '🎧 오디오 첨부 없음 (이 AI 공급자는 수치만 전송)' : '🎧 오디오 첨부 없음 (수집된 소리 1초 미만)';
+    setAiLast(`${gateInfo}\n${audioInfo}\nAI 응답(${new Date().toLocaleTimeString()}): ${text || '(빈 응답)'}`);
     setStatus(genreOnly ? `${solo ? 'Solo' : '밸런스'} 양호 · 조언 생략 (장르만 갱신)`
       : !text ? 'AI 빈 응답' : res.none ? 'AI: NONE (지적 없음)' : !res.advice.length ? 'AI 응답 형식 불일치'
       : `AI: ${added.length}건 표시` + (res.advice.length > added.length ? ` · ${res.advice.length - added.length}건 제외(중복/쿨다운)` : ''));
