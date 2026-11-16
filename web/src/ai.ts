@@ -45,11 +45,16 @@ const SENS_RULES: Record<Sensitivity, string> = {
 - 누가 들어도 즉각 조치가 필요한 심각한 라이브 음향 문제(메인 보컬이나 솔로 악기가 반주에 완전히 묻힘, 특정 저역/중저역의 심한 부밍과 머드감, 피드백/하울링 직전의 공진 피크, 귀를 찌르는 심한 하쉬니스, 특정 악기의 과도한 레벨 돌출)만 조언하라.
 - 사소한 톤 차이는 모두 무시하고, 꼭 손대야 할 핵심 문제만 0~2줄 이내로 출력하라.`,
   2: `[중간 (표준)]
-- 심각한 문제와 더불어, 손대면 믹스 선명도가 확실히 좋아질 악기 간 주파수 마스킹(예: 기타/건반과 보컬 중역 겹침, 킥과 베이스 저역 충돌), 다이나믹 불안정(컴프레서 필요), 치찰음(디에서)을 진단하여 0~3줄 이내로 조언하라.`,
+- 심각한 문제와 더불어, 손대면 믹스 선명도가 확실히 좋아질 악기 간 주파수 마스킹(예: 기타/건반과 보컬 중역 겹침, 킥과 베이스 저역 충돌), 다이나믹 불안정(컴프레서 필요), 치찰음(디에서)을 진단하여 0~3줄 이내로 조언하라.
+- mix_checklist 에서 '개선' 으로 판정한 항목 중 2~3dB 이상 손댈 만한 것이 하나라도 있으면 GOOD_BALANCE 가 아니다.`,
   3: `[세밀함 (적극적)]
 - 라이브 믹스의 완성도를 한 단계 높이기 위한 미세한 대역 정리(1.5~2dB 단위의 정밀 EQ), 어택/릴리즈 다듬기, 하이패스 필터(HPF) 정리, 공간감(리버브/딜레이) 과다 여부, 미세한 레벨 밸런스까지 세심하게 포착하여 0~4줄로 조언하라.
-- 단, 앞서 명시했듯 일반 발매 음반 수준으로 이미 밸런스와 톤이 완성된 사운드라면 이 단계에서도 억지 조언을 만들지 말고 빈 배열([])을 출력하라.`,
+- 이 단계는 "문제가 있는가"가 아니라 "더 좋아질 수 있는가"를 묻는다. mix_checklist 8개 항목을 하나씩 귀로 다시 확인하고, 1.5~2dB 수준으로라도 더 좋아질 여지가 들리는 항목이 하나라도 있으면 mix_status 를 MINOR_ISSUES 로 두고 그 항목을 1~4줄로 조언하라.
+- 실시간 라이브 콘솔 믹스는 마스터링된 상업 음원처럼 모든 항목이 완벽한 경우가 드물다. GOOD_BALANCE 는 8개 항목을 모두 '양호'로 판정했고, 그 근거를 각 항목에 구체적으로 적을 수 있을 때만 쓴다.
+- 단, 근거는 반드시 실제로 들린 것이어야 한다. 앞서 명시했듯 일반 발매 음반 수준으로 이미 밸런스와 톤이 완성된 사운드라면 이 단계에서도 억지 조언을 만들지 말고 빈 배열([])을 출력하라.`,
 };
+/** 믹스 완성도 점검 항목 (mix_checklist) — 판정 전에 항목별로 먼저 평가하게 해 '양호'로 쉽게 넘어가지 않게 한다 */
+const MIX_CHECKS = ['보컬/주선율 명료도·존재감', '킥-베이스 저역 분리·부밍', '저중역(200~500Hz) 머드·탁함', '중역 마스킹(기타/건반/브라스 vs 보컬)', '고역 하쉬니스·치찰음(2~8kHz)', '다이내믹(튀는 피크·컴프레션)', '공간감(리버브/딜레이 양)', '레벨 밸런스·스테레오/팬'];
 /** 상업 음반 / 완성형 믹스 억지 조언 방지 (절대 규칙) */
 const NO_FORCED_ADVICE = `- 너의 목적은 무조건 지적할 거리를 찾아내는 것이 아니라, 실제 라이브 현장의 미숙한 밸런스와 음향적 결함을 돕는 것이다.
 - 만약 입력된 WAV 오디오가 이미 마스터링된 일반 발매 음반(Commercial Release)처럼 각 악기의 컴프레션, 스테레오 밸런스, 대역별 밀도가 안정적으로 다듬어져 있거나, 현재 라이브 믹스 밸런스가 장르 특성에 맞게 충분히 좋다면 절대 억지로 트집을 잡지 마라.
@@ -130,7 +135,9 @@ ${LISTEN_RULES}
 
 [2단계 — 상업 음반 / 완성형 믹스 억지 조언 방지 (절대 규칙)]
 ${NO_FORCED_ADVICE}
-- mix_status: GOOD_BALANCE (조정 불필요) | MINOR_ISSUES (미세 조정 가능) | NEEDS_CORRECTION (명백한 수정 필요) 중 하나. 조언 배열이 비어 있으면 GOOD_BALANCE.
+- mix_status 를 정하기 전에 mix_checklist 에 아래 8개 항목을 하나씩 귀로 평가해 "항목: 양호|개선 — 근거(들린 것 + 수치)" 형식으로 적어라.
+  ${MIX_CHECKS.map((c, i) => `${i + 1}) ${c}`).join(' · ')}
+- mix_status: GOOD_BALANCE (조정 불필요) | MINOR_ISSUES (미세 조정 가능) | NEEDS_CORRECTION (명백한 수정 필요) 중 하나. mix_checklist 와 모순되면 안 된다 (현재 민감도 기준으로 손댈 '개선' 항목이 있으면 GOOD_BALANCE 금지). 조언 배열이 비어 있으면 GOOD_BALANCE.
 
 [3단계 — 현재 선택된 민감도별 조언 기준: ${level}단계 ${SENS_LABEL[level]}]
 ${SENS_RULES[level]}
@@ -141,6 +148,7 @@ ${areas}
   "detected_genre": "Pop, Rock, EDM, R&B/Soul, Hip-Hop, Acoustic/Folk, Jazz, Brass Band/Funk, Worship(CCM), Trot(트로트), Classical 등 실제 청취 기반 장르 (더 정확한 세부 장르 가능 · Solo 는 Solo|<악기이름> · 스피치는 스피치/설교)",
   "genre_reasoning": "WAV 오디오의 리듬 패턴, 템포, 주 악기 질감을 바탕으로 이 장르를 선택한 구체적 이유 (한국어 1~2문장)",
   "detected_active_sources": ["실제 소리가 들리는 악기/보컬 목록 (짧은 한국어 이름, 예: 브라스, 드럼, 베이스, 남성보컬)"],
+  "mix_checklist": ["항목: 양호|개선 — 근거 (8개 항목 모두, 위 순서대로)"],
   "mix_status": "GOOD_BALANCE | MINOR_ISSUES | NEEDS_CORRECTION",
   "web_detailed_advices": ["웹 화면용 상세 조언 — hud_short_advices 와 같은 순서·같은 개수. 각 2~3문장: ① 들린 증상과 근거 수치(Hz·dB) ② 콘솔에서 구체적으로 만질 방법(주파수·Q·게인, 레시오·어택·릴리즈·스레숄드, 센드 등) ③ 만진 뒤 확인할 점. 조언할 것이 없으면 빈 배열 []"],
   "hud_short_advices": ["[대상] 분류:내용 (한글 ${MAX_LINE_CHARS}자 이내, 0~${max}개, 조언할 것이 없으면 빈 배열 [])"]
@@ -208,12 +216,13 @@ export const ADVICE_SCHEMA = {
     detected_genre: { type: 'STRING' },
     genre_reasoning: { type: 'STRING' },
     detected_active_sources: { type: 'ARRAY', items: { type: 'STRING' } },
+    mix_checklist: { type: 'ARRAY', items: { type: 'STRING' } },
     mix_status: { type: 'STRING' },
     web_detailed_advices: { type: 'ARRAY', items: { type: 'STRING' } },
     hud_short_advices: { type: 'ARRAY', items: { type: 'STRING' } },
   },
-  required: ['detected_genre', 'genre_reasoning', 'detected_active_sources', 'mix_status', 'web_detailed_advices', 'hud_short_advices'],
-  propertyOrdering: ['detected_genre', 'genre_reasoning', 'detected_active_sources', 'mix_status', 'web_detailed_advices', 'hud_short_advices'],
+  required: ['detected_genre', 'genre_reasoning', 'detected_active_sources', 'mix_checklist', 'mix_status', 'web_detailed_advices', 'hud_short_advices'],
+  propertyOrdering: ['detected_genre', 'genre_reasoning', 'detected_active_sources', 'mix_checklist', 'mix_status', 'web_detailed_advices', 'hud_short_advices'],
 } as const;
 
 /** 구조화 출력(responseSchema)을 지원하지 않는 모델이 돌려주는 400 오류인지 */
@@ -284,6 +293,8 @@ export interface ParsedReply {
   rejected: string[];
   /** 웹 화면용 상세 조언 (HUD 한 줄과 짝지은 것 + 짝이 없는 상세 설명) */
   details: AdviceDetail[];
+  /** 믹스 완성도 점검 (항목: 양호|개선 — 근거) */
+  checklist: string[];
 }
 export interface AdviceDetail { text: string; detail: string; rejected: boolean }
 
@@ -317,7 +328,7 @@ export function parseReply(raw: string): ParsedReply {
       if (!advice.some(x => x.tag === text)) advice.push({ tag: text, text });
     }
   }
-  return { genre, advice, none: advice.length === 0 && (sawNone || genre !== null), rejected: [], details: [] };
+  return { genre, advice, none: advice.length === 0 && (sawNone || genre !== null), rejected: [], details: [], checklist: [] };
 }
 
 // ───────── JSON 응답 + 악기 교차 검증 ─────────
@@ -389,7 +400,8 @@ function parseJsonReply(raw: string): ParsedReply | null {
   });
   if (web.length !== hud.length) web.forEach(d => details.push({ text: '', detail: d, rejected: false }));   // 짝이 안 맞으면 상세 설명만 따로
   const none = advice.length === 0 && rejected.length === 0;
-  return { genre, advice, none, heard: { reasoning, sources }, mixStatus: none && !mixStatus ? 'GOOD_BALANCE' : mixStatus, rejected, details };
+  const checklist = arr(o.mix_checklist).map(x => String(x).trim()).filter(Boolean).slice(0, 12);
+  return { genre, advice, none, heard: { reasoning, sources }, mixStatus: none && !mixStatus ? 'GOOD_BALANCE' : mixStatus, rejected, details, checklist };
 }
 
 // ───────── Google AI Studio 모델 목록 (models.list) ─────────

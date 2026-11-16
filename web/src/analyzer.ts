@@ -4,6 +4,7 @@ import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
 import { callAI, parseReply, buildSystemPrompt, SENS_LABEL, SENS_MAX, type Sensitivity, isQuotaError, supportsAudio, listGeminiModels, type Genre, type RemoteModel, type ParsedReply } from './ai';
 import { analyzeClip, encodeWavStereo, clipRmsDb, WAV_RATE, CLIP_LEN } from './clip';
 import { evaluateBalance } from './balance';
+import { qrSvg } from './qrcode';
 import { fbParamsFor } from './config';
 import { Glasses } from './glasses';
 import { HudSender, HudReceiver, linkWatchdog, linesToShow, genCode, isCode, setLinkCode, linkCode, type BandRow, type LevelPkt, type MixState, type ReceiverInfo } from './link';
@@ -109,7 +110,15 @@ const setStatus = (s: string) => { $('status').textContent = s; sender.update({ 
 
 // ───────── 1) 헤더: 연결 코드 · 새 코드 발급 · 수신기 URL 복사 · 수신기 연결 상태 · 설정 ─────────
 const hudUrl = () => `${location.origin}${location.pathname}?mode=hud&code=${linkCode()}`;
-function paintCode() { $('pairCode').textContent = linkCode(); }
+function paintCode() {
+  $('pairCode').textContent = linkCode();
+  // 📱 수신기 접속 QR (코드가 바뀌면 다시 그림)
+  try { const svg = qrSvg(hudUrl(), 'M'); $('pairQr').innerHTML = svg; $('qrBig').innerHTML = svg; } catch (e) { console.warn('QR 생성 실패', e); }
+  $('qrCodeTxt').textContent = linkCode();
+  $('qrUrl').textContent = hudUrl();
+}
+$('pairQr').onclick = () => { const d = $<HTMLDialogElement>('qrDlg'); if (typeof d.showModal === 'function') d.showModal(); else d.setAttribute('open', ''); };
+$('qrDlg').addEventListener('click', e => { if (e.target === e.currentTarget) ($('qrDlg') as HTMLDialogElement).close(); });
 sender.onState = i => {
   const mq = i.mqtt === 'on' ? 'MQTT 연결됨' : i.mqtt === 'connecting' ? 'MQTT 연결 중…' : 'MQTT 사용 불가';
   const el = $('linkState');
@@ -1026,7 +1035,7 @@ function paintDetails(res: ParsedReply, shown: string[], hasAudio: boolean) {
     const good = res.none || res.mixStatus === 'GOOD_BALANCE';
     info.textContent = `${t} · ${good ? '조언 없음' : hasAudio ? '상세 설명 없음' : '이 AI 공급자는 한 줄 조언만 제공'}`;
     pill(res.mixStatus);
-    if (good) box.replaceChildren(Object.assign(document.createElement('div'), { className: 'mixgood', textContent: '✅ 현재 믹스 밸런스가 양호합니다 (추가 조정 불필요)' }));
+    if (good) box.replaceChildren(Object.assign(document.createElement('div'), { className: 'mixgood', textContent: '✅ 현재 믹스 밸런스가 양호합니다 (추가 조정 불필요)' }), ...checklistEl(res.checklist));
     return;
   }
   info.textContent = `${t} · ${res.details.filter(d => !d.rejected && d.text).length}건`;
@@ -1040,8 +1049,21 @@ function paintDetails(res: ParsedReply, shown: string[], hasAudio: boolean) {
     const why = document.createElement('div'); why.className = 'why'; why.textContent = d.detail || '(상세 설명 없음)';
     el.append(line, why);
     return el;
-  }));
+  }), ...checklistEl(res.checklist));
   box.scrollTop = 0;
+}
+
+/** 🔍 믹스 완성도 점검 목록 (AI 가 항목별로 양호/개선 판정한 근거) */
+function checklistEl(list: string[]): HTMLElement[] {
+  if (!list.length) return [];
+  const d = document.createElement('details'); d.className = 'checklist';
+  const sm = document.createElement('summary');
+  const bad = list.filter(x => /개선/.test(x.split(/[—-]/)[0] ?? x)).length;
+  sm.textContent = `🔍 믹스 점검 ${list.length}항목 · 개선 ${bad} · 양호 ${list.length - bad}`;
+  const ul = document.createElement('ul');
+  for (const x of list) { const li = document.createElement('li'); li.textContent = x; li.className = /개선/.test(x.split(/[—-]/)[0] ?? x) ? 'bad' : 'ok'; ul.appendChild(li); }
+  d.append(sm, ul);
+  return [d];
 }
 
 /** 🎧 AI 청취 배지: AI 가 오디오를 듣고 판단한 소스 + 음향 특성 한 줄 */

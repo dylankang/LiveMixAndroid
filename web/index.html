@@ -21,15 +21,18 @@
         <button id="settingsBtn" class="icon" type="button" aria-label="설정">⚙️</button>
       </div>
       <div class="pairbox">
-        <div class="pair-main">
-          <span class="pair-label">연결 코드</span>
-          <span id="pairCode" class="pair-code">----</span>
+        <div class="pair-top">
+          <div class="pair-main">
+            <span class="pair-label">연결 코드</span>
+            <span id="pairCode" class="pair-code">----</span>
+          </div>
+          <button id="pairQr" class="pair-qr" type="button" aria-label="수신기 접속 QR 코드 크게 보기" title="휴대폰 카메라로 찍으면 수신기(HUD)가 이 코드로 바로 열립니다 · 탭하면 크게"></button>
         </div>
         <div class="pair-btns">
           <button id="newCode" class="small" type="button">새 코드 발급</button>
           <button id="copyUrl" class="small" type="button">수신기 URL 복사</button>
         </div>
-        <div class="hint">Even G2 수신기(?mode=hud)에서 이 4자리 코드를 입력하면 네트워크가 달라도(PC 유선 LAN ↔ 폰 LTE) 연결됩니다.</div>
+        <div class="hint">📱 QR 코드를 휴대폰 카메라로 찍으면 수신기가 이 코드로 바로 열립니다. 또는 Even G2 수신기(?mode=hud)에서 이 4자리 코드를 입력하면 네트워크가 달라도(PC 유선 LAN ↔ 폰 LTE) 연결됩니다.</div>
       </div>
       <div class="top-row pills">
         <span id="linkState" class="pill off">🔴 수신기 대기</span>
@@ -128,6 +131,17 @@
       <table id="bandTable"></table>
     </section>
   </main>
+
+  <!-- 수신기 접속 QR 크게 보기 -->
+  <dialog id="qrDlg" class="qr-dlg">
+    <form method="dialog">
+      <div class="top-row"><h2 style="margin:0">📱 수신기 접속 QR</h2><button class="icon" value="close" aria-label="닫기">✕</button></div>
+      <div id="qrBig" class="qr-big"></div>
+      <div class="qr-code-big">연결 코드 <b id="qrCodeTxt">----</b></div>
+      <div id="qrUrl" class="hint qr-url"></div>
+      <div class="hint">휴대폰 카메라(또는 Even 앱의 QR 스캔)로 찍으면 수신기 HUD 화면이 이 연결 코드로 바로 열립니다.</div>
+    </form>
+  </dialog>
 
   <!-- ⚙️ 설정 모달 -->
   <dialog id="settings">
