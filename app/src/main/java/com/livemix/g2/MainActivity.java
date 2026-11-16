@@ -17,6 +17,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -58,18 +59,36 @@ public class MainActivity extends Activity {
     private static final int REQ_AUDIO_MEDIA = 5;
     private static final int MENU_RECEIVER = 1, MENU_RELOAD = 2, MENU_BATTERY = 3, MENU_EXIT = 4;
 
-    private WebView webView;
+    private LiveWebView webView;
     private PermissionRequest pendingPermission;
     private ValueCallback<Uri[]> fileCallback;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private boolean analyzing = false;
+    /** 웹 분석 루프가 마지막으로 살아 있다고 알려 온 시각 (elapsedRealtime) · 멈춤 감지 횟수 */
+    private volatile long lastJsAlive = 0;
+    private int stallCount = 0;
+    private static final long STALL_MS = 6000;
+    /** 분석 중 2초마다: 웹 루프가 멈췄으면 렌더러를 깨우고, 웹에 '네이티브 박동'을 넣어 틱을 대신 돌림 */
+    private final Runnable watchdog = new Runnable() {
+        @Override public void run() {
+            if (!analyzing || webView == null) return;
+            long now = SystemClock.elapsedRealtime();
+            if (lastJsAlive > 0 && now - lastJsAlive > STALL_MS) {
+                stallCount++;
+                webView.nudgeVisible();
+                lastJsAlive = now;      // 다음 감지까지 다시 6초
+            }
+            js("window.__lmNativeTick&&window.__lmNativeTick(" + stallCount + ")");
+            ui.postDelayed(this, 2000);
+        }
+    };
 
     @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        webView = new WebView(this);
+        webView = new LiveWebView(this);
         setContentView(webView);
 
         WebSettings s = webView.getSettings();
@@ -217,14 +236,27 @@ public class MainActivity extends Activity {
         public void setRunning(final boolean running) {
             ui.post(() -> {
                 analyzing = running;
+                webView.setKeepVisible(running);     // 분석 중: 화면이 꺼져도 페이지를 '보이는' 상태로 유지
+                ui.removeCallbacks(watchdog);
                 if (running) {
+                    lastJsAlive = SystemClock.elapsedRealtime();
+                    stallCount = 0;
                     KeepAliveService.start(MainActivity.this);
+                    ui.postDelayed(watchdog, 2000);
                     askBatteryOnce();
                 } else {
                     KeepAliveService.stop(MainActivity.this);
                 }
             });
         }
+
+        /** 웹 분석 루프 생존 신호 (1초마다) */
+        @JavascriptInterface
+        public void alive() { lastJsAlive = SystemClock.elapsedRealtime(); }
+
+        /** 배터리 최적화 제외 여부 (웹 화면 안내용) */
+        @JavascriptInterface
+        public boolean batteryExempt() { return ignoringBattery(); }
     }
 
     // ───────── 마이크 권한: 웹의 getUserMedia → 안드로이드 RECORD_AUDIO ─────────
@@ -268,7 +300,6 @@ public class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQ_PROJECTION) {
             if (resultCode == RESULT_OK && data != null) {
-                analyzing = true;
                 KeepAliveService.startMedia(this, resultCode, data);
                 askBatteryOnce();
             } else emitMedia("denied", null);
@@ -286,10 +317,12 @@ public class MainActivity extends Activity {
         return pm != null && pm.isIgnoringBatteryOptimizations(getPackageName());
     }
 
+    private boolean batteryAskedThisRun = false;
+
+    /** 배터리 최적화에서 제외되지 않았으면 앱을 켤 때마다 한 번 묻는다 (제외 전에는 화면 꺼짐 중 네트워크·CPU 가 끊길 수 있음) */
     private void askBatteryOnce() {
-        SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
-        if (ignoringBattery() || p.getBoolean(KEY_BATTERY_ASKED, false)) return;
-        p.edit().putBoolean(KEY_BATTERY_ASKED, true).apply();
+        if (ignoringBattery() || batteryAskedThisRun) return;
+        batteryAskedThisRun = true;
         new AlertDialog.Builder(this)
                 .setTitle("화면이 꺼져도 분석 유지")
                 .setMessage("화면이 꺼진 동안·다른 앱을 쓰는 동안에도 분석과 AI 호출을 멈추지 않으려면 배터리 최적화에서 이 앱을 제외해야 합니다. 다음 창에서 '허용'을 눌러 주세요.")
@@ -386,6 +419,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        ui.removeCallbacks(watchdog);
         KeepAliveService.stop(this);
         KeepAliveService.sink = null;
         LocalServer.setInbound(null);

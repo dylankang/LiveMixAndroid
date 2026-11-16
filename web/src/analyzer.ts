@@ -5,7 +5,7 @@ import { callAI, parseReply, buildSystemPrompt, setUploadMbps, timeoutFor, SENS_
 import { analyzeClip, encodeWav, clipRmsDb, CLIP_LEN, WAV_RATES, wavLabel, wavWireBytes, type WavFormat } from './clip';
 import { evaluateBalance } from './balance';
 import { qrSvg } from './qrcode';
-import { NATIVE_MEDIA_ID, NATIVE_MEDIA_LABEL, nativeMediaSupported, isApp } from './native';
+import { NATIVE_MEDIA_ID, NATIVE_MEDIA_LABEL, nativeMediaSupported, isApp, nat } from './native';
 import { fbParamsFor } from './config';
 import { Glasses } from './glasses';
 import { HudSender, HudReceiver, linkWatchdog, linesToShow, genCode, isCode, setLinkCode, linkCode, type BandRow, type LevelPkt, type MixState, type ReceiverInfo } from './link';
@@ -722,6 +722,7 @@ async function startAudio() {
   else if (st && (st.echoCancellation || st.noiseSuppression || st.autoGainControl)) parts.push('⚠ 브라우저가 음성 보정을 끄지 못했습니다 (EC/NS/AGC 일부 ON)');
   if (engine.state !== 'running') parts.push('⚠ 오디오 엔진이 대기 상태입니다. 화면을 한 번 클릭해 주세요');
   $('inputInfo').textContent = parts.join('\n');
+  paintStalls();
   paintToggles();
 }
 
@@ -880,11 +881,49 @@ function workerBackupTick() {
 }
 engine.onAudioBeat = () => { if (running) masterTick(); };
 
+// 📱 앱(안드로이드) 백그라운드 대비
+//  · 1초마다 앱에 '살아 있음'을 알림 → 6초 넘게 끊기면 앱이 렌더러를 깨움
+//  · 앱이 2초마다 넣어 주는 네이티브 박동: 워클릿·Worker 박동이 모두 멈췄을 때 대신 틱을 돌리고 오디오 엔진을 재개
+//  · 틱 사이가 3초 넘게 벌어진 '멈춤'을 기록해 장치 정보에 표시 (원인 확인용)
+let lastAliveAt = 0;
+interface Stall { at: number; gapMs: number; vis: string; ctx: string }
+const stalls: Stall[] = (() => { try { const v = JSON.parse(ls.get('lm.stalls', '[]')); return Array.isArray(v) ? v.slice(-20) : []; } catch { return []; } })();
+let nativeStalls = 0;
+function noteTickGap(gapMs: number) {
+  if (!running || gapMs < 3000) return;
+  stalls.push({ at: Date.now(), gapMs: Math.round(gapMs), vis: document.visibilityState, ctx: engine.state });
+  while (stalls.length > 20) stalls.shift();
+  ls.set('lm.stalls', JSON.stringify(stalls));
+  paintStalls();
+}
+function paintStalls() {
+  const el = document.getElementById('stallInfo');
+  if (!el) return;
+  const recent = stalls.filter(s => Date.now() - s.at < 6 * 3600_000);
+  const bat = isApp() ? (() => { try { return nat()?.batteryExempt?.() === false; } catch { return false; } })() : false;
+  const parts: string[] = [];
+  if (bat) parts.push('⚠ 배터리 최적화 제외가 꺼져 있습니다 — 화면이 꺼지면 네트워크·분석이 멈출 수 있어요 (앱 메뉴 → 배터리 최적화 제외)');
+  if (recent.length) {
+    const last = recent[recent.length - 1];
+    parts.push(`⏸ 백그라운드 멈춤 감지 ${recent.length}회 · 마지막 ${hhmmss(last.at)} ${Math.round(last.gapMs / 1000)}초 (화면 ${last.vis === 'visible' ? '보임' : '숨김'} · 오디오 ${last.ctx})${nativeStalls ? ` · 앱이 깨운 횟수 ${nativeStalls}` : ''}`);
+  }
+  el.textContent = parts.join('\n');
+  el.hidden = !parts.length;
+}
+(window as any).__lmNativeTick = (n?: number) => {
+  if (typeof n === 'number' && n !== nativeStalls) { nativeStalls = n; paintStalls(); }
+  if (!running) return;
+  engine.resumeCtx();
+  if (performance.now() - lastTickAt > 1000) masterTick();   // 워클릿·Worker 박동이 모두 멈춘 상태 → 앱 박동으로 대신 진행
+}
+
 function masterTick() {
   if (!running) return;
   const t0 = performance.now();
   if (t0 - lastTickAt < 70) return;           // 워클릿/Worker 박동이 겹치면 한 번만 실행
+  noteTickGap(t0 - lastTickAt);
   lastTickAt = t0;
+  if (t0 - lastAliveAt >= 1000) { lastAliveAt = t0; try { nat()?.alive?.(); } catch { /* ignore */ } }
   tickN++;
   void ensureWake();                          // 화면 WakeLock 이 풀려 있고 화면이 보이면 재요청
   if (pip.active) drawPip();                  // 📌 PiP 미니 모니터 갱신
