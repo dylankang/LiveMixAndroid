@@ -29,7 +29,7 @@ const DEFAULT_AUDIO: AudioDesc = { label: '44.1kHz 스테레오', stereo: true }
 const listenRules = (a: AudioDesc) => `[소스 식별 규칙 — 실제 오디오 청취]
 - 첨부된 WAV 오디오(최근 audio.seconds 초)를 직접 듣고, 지금 이 순간 실제로 연주되고 들리는 악기와 보컬만 식별하라.
 - 첨부된 ${a.label} WAV 오디오의 ${a.stereo ? '좌우 정위(Panning)와 ' : ''}고역 배음을 주의 깊게 듣고, 악기의 음색을 명확히 구분하라. 중역대 화음이 들린다고 해서 습관적으로 [피아노]로 단정 짓지 마라.
-- 믹스 전체에서 뒤로 빠져 작게 들리는 배경 악기 하나에만 계속 집착하지 말고, 현재 사운드에서 가장 에너지가 지배적인 주선율 악기(보컬, 브라스, 리드 기타 등)와 리듬 섹션(킥, 스네어, 베이스, 하이햇/오버헤드) 간의 마스킹 및 레벨 밸런스를 최우선으로 진단하라.
+- 같은 배경 악기 하나만 매 주기 반복해서 지적하지 마라(currentDisplay·cooldownList 확인). 주선율 악기(보컬, 브라스, 리드 기타 등)와 리듬 섹션(킥, 스네어, 베이스, 하이햇/오버헤드)을 포함해 믹스 전체의 레벨 밸런스를 최우선으로 진단하라.
 - 오디오에서 사람의 노래나 말소리가 실제로 들리지 않으면(연주곡·간주 구간 등), DSP 중역대 수치가 아무리 높아도 절대 [남성보컬], [여성보컬], [메인보컬], [코러스]를 출력하지 마라.
 - 실제 오디오에서 들리지 않는 악기(어쿠스틱 기타, 첼로, 스트링, 브라스, 피아노 등)를 주파수 대역 수치만 보고 추측해서 지어내는 것을 엄격히 금지한다. 확신이 없으면 그 악기는 언급하지 마라.
 - 보컬이 들리면 실제 목소리의 음색과 피치(포먼트)를 듣고 [남성보컬]과 [여성보컬]을 정확히 구분하라. 여러 명이 같이 부르면 [코러스].
@@ -55,8 +55,25 @@ const SENS_RULES: Record<Sensitivity, string> = {
 - 실시간 라이브 콘솔 믹스는 마스터링된 상업 음원처럼 모든 항목이 완벽한 경우가 드물다. GOOD_BALANCE 는 8개 항목을 모두 '양호'로 판정했고, 그 근거를 각 항목에 구체적으로 적을 수 있을 때만 쓴다.
 - 단, 근거는 반드시 실제로 들린 것이어야 한다. 앞서 명시했듯 일반 발매 음반 수준으로 이미 밸런스와 톤이 완성된 사운드라면 이 단계에서도 억지 조언을 만들지 말고 빈 배열([])을 출력하라.`,
 };
+/** 🎚️ 레벨 밸런스 최우선 · 묻힌 소리 찾기 · 개별 마이크 지목 (사용자 요청 — 모든 민감도 공통 최우선 규칙) */
+const LEVEL_FIRST = `[최우선 진단 — 레벨 밸런스와 묻힌 소리]
+- 조언의 1순위는 레벨 밸런스다. EQ·Comp 보다 먼저 "각 소스의 음량이 장르 문맥에 맞게 들리는가"를 판단하라.
+- 특히 실제로 연주되고 있지만 믹스 뒤로 너무 작게 깔려 존재감이 거의 없는 소리(엔지니어가 미처 신경 쓰지 못해 묻힌 소리)를 적극적으로 찾아라.
+  예) 코러스·백보컬, 패드·건반 컴핑, 어쿠스틱기타 스트로크, 브라스 백킹, 퍼커션·셰이커·탬버린, 탐, 하이햇·라이드, 베이스 라인
+  · 귀를 기울여야 겨우 들리거나 다른 소리에 가려 형체가 없는 소스가 있으면 반드시 detected_active_sources 에 넣고, \`[그 소스] Level:+NdB\` (보통 +2~+6dB)로 가장 먼저 조언하라.
+  · 장르 문맥상 원래 뒤에 깔리는 역할(예: 발라드의 패드)이면 "들리긴 하지만 너무 묻혔는지"를 기준으로 판단하고 과하게 올리지 마라.
+  · 반대로 혼자 튀어나와 다른 소리를 가리는 소스는 Level:-NdB 로 내리라고 하라.
+- 조언 순서: ① 묻힌 소리 올리기 ② 튀는 소리 내리기 ③ 그다음 EQ·Comp·공간계. hud_short_advices 의 첫 줄은 가능하면 레벨 조언이어야 한다.
+
+[개별 마이크 먼저 — 여러 마이크로 받는 악기]
+- 드럼은 [드럼] 으로 뭉뚱그리지 말고 문제가 들리는 개별 마이크를 먼저 지목하라: [킥], [스네어], [하이햇], [하이탐]·[미드탐]·[플로어탐](구분이 어려우면 [탐]), [오버헤드], [라이드]
+  잘못: \`[드럼] EQ:400Hz -3dB\`  →  올바름: \`[킥] EQ:400Hz -3dB\` 또는 \`[탐] Level:+3dB\`
+- [드럼버스] 는 개별 마이크로 설명할 수 없는 드럼 전체의 문제(드럼 세트 전체 음량 등)일 때만 쓴다.
+- detected_active_sources 에도 드럼은 "드럼" 대신 들리는 개별 요소로 적어라 (예: 킥, 스네어, 하이햇, 탐, 오버헤드).
+- 같은 원칙으로 퍼커션(콩가·셰이커·탬버린), 브라스 섹션(트럼펫·색소폰·트롬본), 보컬(메인보컬·코러스)도 구분해서 들리면 개별 소스로 지목하라.`;
+
 /** 믹스 완성도 점검 항목 (mix_checklist) — 판정 전에 항목별로 먼저 평가하게 해 '양호'로 쉽게 넘어가지 않게 한다 */
-const MIX_CHECKS = ['보컬/주선율 명료도·존재감', '킥-베이스 저역 분리·부밍', '저중역(200~500Hz) 머드·탁함', '중역 마스킹(기타/건반/브라스 vs 보컬)', '고역 하쉬니스·치찰음(2~8kHz)', '다이내믹(튀는 피크·컴프레션)', '공간감(리버브/딜레이 양)', '레벨 밸런스·스테레오/팬'];
+const MIX_CHECKS = ['레벨 밸런스 — 연주되는데 묻혀서 작게 깔린 소리 / 혼자 튀는 소리', '보컬/주선율 명료도·존재감', '드럼 개별 마이크(킥·스네어·하이햇·탐·오버헤드) 밸런스', '킥-베이스 저역 분리·부밍', '저중역(200~500Hz) 머드·탁함 / 중역 마스킹', '고역 하쉬니스·치찰음(2~8kHz)', '다이내믹(튀는 피크·컴프레션)', '공간감(리버브/딜레이)·스테레오/팬'];
 /** 상업 음반 / 완성형 믹스 억지 조언 방지 (절대 규칙) */
 const NO_FORCED_ADVICE = `- 너의 목적은 무조건 지적할 거리를 찾아내는 것이 아니라, 실제 라이브 현장의 미숙한 밸런스와 음향적 결함을 돕는 것이다.
 - 만약 입력된 WAV 오디오가 이미 마스터링된 일반 발매 음반(Commercial Release)처럼 각 악기의 컴프레션, 스테레오 밸런스, 대역별 밀도가 안정적으로 다듬어져 있거나, 현재 라이브 믹스 밸런스가 장르 특성에 맞게 충분히 좋다면 절대 억지로 트집을 잡지 마라.
@@ -87,7 +104,7 @@ export function buildSystemPrompt(level: Sensitivity, hasAudio = false, audio: A
 - \`[]\` 안에는 ${hasAudio ? '오디오에서 실제로 들리는' : '지표로 분명히 드러나는'} 소스 중에서 실제로 콘솔에서 조절해야 할 대상(채널·그룹·버스)을 적어라.
   · 개별 악기: 예) [킥], [스네어], [하이햇], [탐], [오버헤드], [베이스], [일렉기타], [어쿠스틱기타], [피아노], [건반], [신스], [브라스], [스트링]
   · 보컬: 남/여를 구분해라. 예) [남성보컬], [여성보컬], [메인보컬], [코러스]
-  · 그룹/버스/마스터: 특정 악기가 아니라 묶음이나 전체 출력을 만져야 할 때. 예) [드럼버스], [보컬그룹], [마스터]
+  · 그룹/버스/마스터: 개별 채널로 설명할 수 없고 묶음이나 전체 출력을 만져야 할 때만. 예) [드럼버스], [보컬그룹], [마스터] — 드럼은 개별 마이크([킥]·[스네어]·[탐] 등)를 먼저 써라
   · 위 예시는 참고일 뿐 목록 밖 대상도 허용한다. 단, ${hasAudio ? '오디오에서 들리지 않는 소스는 절대 쓰지 마라.' : '근거 없이 악기를 지어내지 마라.'}
 - \`[]\` 안에 [서브], [로우], [로우-미드], [미드], [하이-미드], [하이], [저역], [중역], [고역] 같은 주파수 대역명을 넣지 마라.`;
   const input = `입력 JSON:
@@ -95,7 +112,7 @@ export function buildSystemPrompt(level: Sensitivity, hasAudio = false, audio: A
 - sensitivityLevel: 사용자가 고른 조언 민감도 (1 필수만 · 2 중간 · 3 세밀함)
 - bands / features / peaks: 전체 분석 구간(windowSec) 평균. 6개 대역(Sub 20-60, Low 60-250, Low-Mid 250-500, Mid 500-2k, High-Mid 2k-6k, High 6k-16k Hz)의 avgDb/peakDb/crestDb, deltaDb(일반 음악 타겟 대비 편차 · 참고용, 장르 특성으로 설명되면 문제 아님), relativeSpectralBalanceDb, bandCrestDb, transientDensityPerMin, transientFluxDb, spectralCentroidHz, decayTail, fullCrestDb, subVsMidDb, voiceBandSharePct, tempo(BPM·신뢰도), longTerm(최근 약 1분 평균)
 ${hasAudio ? '- lastClip: 첨부 WAV 와 정확히 같은 구간의 단기 지표(정규화 전 원본). bands(avgDb·peakDb·relDb), crestDb, spectralCentroidHz, voiceBandSharePct, onsetsPerSec, stereo(correlation · sideToMidDb · balanceDb(+ = 왼쪽이 큼))\n- audio: 첨부 오디오 정보(seconds, sampleRate·channels(1=모노 합산 — 이때 stereo 지표·팬 정보는 없으니 Pan 조언 금지), gainDb 피크 -1dBFS 정규화 게인 — L/R 동일 게인이라 좌우 밸런스는 그대로)\n' : ''}- signal(활성 대역 등), peaks(협대역 피크 hz/levelDb/prominenceDb), currentDisplay(현재 HUD 표시 중), cooldownList(쿨다운 중)`;
-  const areas = `영역 우선순위: Level · EQ · Comp 를 먼저, 그다음 필요하면 HPF/LPF, Reverb/Delay, De-Esser, Gate, DynEQ, Pan/Width. 지속음 성격의 문제는 EQ·DynEQ, 순간 피크 성격은 Comp·Gate 를 우선 고려해라.
+  const areas = `영역 우선순위: Level(묻힌 소리 올리기·튀는 소리 내리기)을 가장 먼저, 그다음 EQ · Comp, 그다음 필요하면 HPF/LPF, Reverb/Delay, De-Esser, Gate, DynEQ, Pan/Width. 지속음 성격의 문제는 EQ·DynEQ, 순간 피크 성격은 Comp·Gate 를 우선 고려해라.
 - currentDisplay 나 cooldownList 와 같은 악기·같은 항목의 지적은 넣지 마라.`;
 
   if (!hasAudio) {
@@ -110,6 +127,8 @@ ${GENRE_GUIDE}
 
 [2단계 — 믹스 완성도 평가 (절대 규칙)]
 ${NO_FORCED_ADVICE.replace("mix_status를 'GOOD_BALANCE'로 두고 web_detailed_advices와 hud_short_advices에 빈 배열([])을 반환하라", '\`NONE\` 을 출력하라')}
+
+${LEVEL_FIRST.replace(/detected_active_sources 에 넣고, /, '').replace(/\n- detected_active_sources 에도[^\n]*/, '').replace(/hud_short_advices 의 첫 줄/, '첫 조언 줄')}
 
 [3단계 — 현재 선택된 민감도별 조언 기준: ${level}단계]
 ${SENS_RULES[level].replace('빈 배열([])을 출력하라', '\`NONE\` 을 출력하라')}
@@ -130,6 +149,7 @@ ${input}
 [1단계 — WAV 청취 기반 장르 및 악기 확정]
 - 첨부된 ${audio.label} WAV 오디오의 드럼 비트, 그루브, 악기 음색을 직접 듣고 detected_genre와 genre_reasoning을 가장 먼저 확정하라.
 - 확정한 장르 문맥에 맞춰 실제로 소리가 들리는 악기와 보컬(남성보컬/여성보컬 구분)만 detected_active_sources에 적어라.
+- 작게 묻혀 있어도 실제로 들리는 소리는 빠짐없이 적어라 (묻힌 소리를 찾는 것이 이 앱의 핵심 목적). 드럼은 개별 요소(킥·스네어·하이햇·탐·오버헤드)로 적어라.
 ${GENRE_GUIDE.replace(/\`GENRE:([^\`]+)\`/g, '\`$1\`')}
 장르는 수치보다 귀로 들은 리듬 패턴·템포·주 악기 질감을 우선하고, tempo·longTerm 같은 수치는 확인용으로만 써라.
 
@@ -137,9 +157,12 @@ ${listenRules(audio)}
 
 [2단계 — 상업 음반 / 완성형 믹스 억지 조언 방지 (절대 규칙)]
 ${NO_FORCED_ADVICE}
+- 연주되는데 묻혀서 거의 안 들리는 소스가 하나라도 있으면 어떤 민감도에서도 GOOD_BALANCE 가 아니다.
 - mix_status 를 정하기 전에 mix_checklist 에 아래 8개 항목을 하나씩 귀로 평가해 "항목: 양호|개선 — 근거(들린 것 + 수치)" 형식으로 적어라.
   ${MIX_CHECKS.map((c, i) => `${i + 1}) ${c}`).join(' · ')}
 - mix_status: GOOD_BALANCE (조정 불필요) | MINOR_ISSUES (미세 조정 가능) | NEEDS_CORRECTION (명백한 수정 필요) 중 하나. mix_checklist 와 모순되면 안 된다 (현재 민감도 기준으로 손댈 '개선' 항목이 있으면 GOOD_BALANCE 금지). 조언 배열이 비어 있으면 GOOD_BALANCE.
+
+${LEVEL_FIRST}
 
 [3단계 — 현재 선택된 민감도별 조언 기준: ${level}단계 ${SENS_LABEL[level]}]
 ${SENS_RULES[level]}
@@ -149,7 +172,7 @@ ${areas}
 {
   "detected_genre": "Pop, Rock, EDM, R&B/Soul, Hip-Hop, Acoustic/Folk, Jazz, Brass Band/Funk, Worship(CCM), Trot(트로트), Classical 등 실제 청취 기반 장르 (더 정확한 세부 장르 가능 · Solo 는 Solo|<악기이름> · 스피치는 스피치/설교)",
   "genre_reasoning": "WAV 오디오의 리듬 패턴, 템포, 주 악기 질감을 바탕으로 이 장르를 선택한 구체적 이유 (한국어 1~2문장)",
-  "detected_active_sources": ["실제 소리가 들리는 악기/보컬 목록 (짧은 한국어 이름, 예: 브라스, 드럼, 베이스, 남성보컬)"],
+  "detected_active_sources": ["실제 소리가 들리는 악기/보컬 목록 — 작게 묻힌 소리 포함, 드럼은 개별 요소로 (짧은 한국어 이름, 예: 킥, 스네어, 하이햇, 탐, 베이스, 브라스, 코러스, 남성보컬)"],
   "mix_checklist": ["항목: 양호|개선 — 근거 (8개 항목 모두, 위 순서대로)"],
   "mix_status": "GOOD_BALANCE | MINOR_ISSUES | NEEDS_CORRECTION",
   "web_detailed_advices": ["웹 화면용 상세 조언 — hud_short_advices 와 같은 순서·같은 개수. 각 2~3문장: ① 들린 증상과 근거 수치(Hz·dB) ② 콘솔에서 구체적으로 만질 방법(주파수·Q·게인, 레시오·어택·릴리즈·스레숄드, 센드 등) ③ 만진 뒤 확인할 점. 조언할 것이 없으면 빈 배열 []"],
