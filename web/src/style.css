@@ -168,3 +168,7 @@ dialog#settings::backdrop { background:rgba(0,0,0,.7); }
 
 .hint.stall { color:#ffd58a; white-space:pre-wrap; }
 .hint.stall[hidden] { display:none; }
+
+.keys { display:grid; gap:8px; margin:6px 0; }
+.keystate { font-weight:400; font-size:11px; margin-left:6px; }
+.keystate.ok { color:#9be7b4; } .keystate.no { color:#8a97a3; }

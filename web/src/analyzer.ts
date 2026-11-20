@@ -1,7 +1,7 @@
 import { PipMonitor, pipSupported } from './pip';
 import { AudioEngine, type BandStat, listInputs, listOutputs, realDevices, outputSelectSupported, requestMicPermission, DEFAULT_INPUT_ID, TRIM, GATE } from './audio';
 import { AdviceManager, COOLDOWN_DEFAULT, type CooldownScope } from './advice';
-import { callAI, parseReply, buildSystemPrompt, setUploadMbps, timeoutFor, SENS_LABEL, SENS_MAX, type Sensitivity, isQuotaError, supportsAudio, listGeminiModels, type Genre, type RemoteModel, type ParsedReply } from './ai';
+import { callAI, parseReply, buildSystemPrompt, setUploadMbps, timeoutFor, SENS_LABEL, SENS_MAX, type Sensitivity, isQuotaError, isAuthError, isModelError, supportsAudio, listModels, type Genre, type RemoteModel, type ParsedReply } from './ai';
 import { analyzeClip, encodeWav, clipRmsDb, CLIP_LEN, WAV_RATES, wavLabel, wavWireBytes, type WavFormat } from './clip';
 import { evaluateBalance } from './balance';
 import { qrSvg } from './qrcode';
@@ -11,7 +11,7 @@ import { Glasses } from './glasses';
 import { HudSender, HudReceiver, linkWatchdog, linesToShow, genCode, isCode, setLinkCode, linkCode, type BandRow, type LevelPkt, type MixState, type ReceiverInfo } from './link';
 import { renderBandTable, paintMeters, paintHud, paintCdCount, genreText, clock } from './views';
 import { setTicker, clearTicker } from './ticker';
-import { BANDS, PROVIDERS, GEMINI_GROUPS, INTERVAL_RANGE, type ProviderId } from './config';
+import { BANDS, PROVIDERS, PROVIDER_GROUPS, PROVIDER_IDS, INTERVAL_RANGE, type ProviderId } from './config';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const ls = {
@@ -160,93 +160,136 @@ const dlg = $<HTMLDialogElement>('settings');
 $('settingsBtn').onclick = () => { if (typeof dlg.showModal === 'function') dlg.showModal(); else dlg.setAttribute('open', ''); };
 dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });   // 바깥(배경) 터치로 닫기
 
-// ───────── ⚙️ 설정: AI 서비스 / 모델 / API Key ─────────
-const providerSel = $<HTMLSelectElement>('provider');
-const apiKeyInp = $<HTMLInputElement>('apiKey');
-const CUSTOM = '__custom__', NONE = '__none__';
+// ───────── ⚙️ 설정: AI 모델 1·2·3순위 (Gemini · ChatGPT · Claude 섞어서) / 서비스별 API Key ─────────
+const CUSTOM = '__custom__:', NONE = '__none__';
 const RANKS = [1, 2, 3] as const;
 const rankSel = RANKS.map(i => $<HTMLSelectElement>(`model${i}`));
 const rankCustom = RANKS.map(i => $<HTMLInputElement>(`custom${i}`));
-providerSel.innerHTML = (Object.keys(PROVIDERS) as ProviderId[]).map(p => `<option value="${p}">${PROVIDERS[p].label}</option>`).join('');
-providerSel.value = ls.get('lm.provider', 'gemini');
-const provider = () => providerSel.value as ProviderId;
-/** 공급자별 1·2·3순위 기본값 (Gemini: 3.5-flash-lite → 3.1-flash-lite → 2.5-flash-lite) */
-function defaultRanks(p: ProviderId): string[] {
-  if (p === 'gemini') return ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite'];
-  const m = PROVIDERS[p].models;
-  return [m[0], m[1] ?? NONE, NONE];
+const keyInp = Object.fromEntries(PROVIDER_IDS.map(p => [p, $<HTMLInputElement>(`key-${p}`)])) as Record<ProviderId, HTMLInputElement>;
+const apiKey = (p: ProviderId) => (keyInp[p].value || '').trim();
+const hasAnyKey = () => PROVIDER_IDS.some(p => apiKey(p));
+const short = (p: ProviderId) => PROVIDERS[p].short;
+interface RankPick { rank: number; provider: ProviderId; model: string }
+const enc = (p: ProviderId, m: string) => `${p}:${m}`;
+function dec(v: string): { provider: ProviderId; model: string } | null {
+  const i = v.indexOf(':');
+  if (i < 0) return null;
+  const p = v.slice(0, i) as ProviderId;
+  return PROVIDER_IDS.includes(p) ? { provider: p, model: v.slice(i + 1) } : null;
 }
-const rankValue = (i: number) => (rankSel[i].value === CUSTOM ? rankCustom[i].value.trim() : rankSel[i].value === NONE ? '' : rankSel[i].value);
+const DEFAULT_RANKS = ['gemini:gemini-3.5-flash-lite', 'gemini:gemini-3.1-flash-lite', 'gemini:gemini-2.5-flash-lite'];
+/** 저장된 순위 (예전 '서비스 하나 + 순위' 저장값이 있으면 이어받음) */
+function savedRank(i: number): string {
+  const v = ls.get(`lm.rankx${i + 1}`, '');
+  if (v) return v;
+  const oldP = ls.get('lm.provider', 'gemini') as ProviderId;
+  const old = ls.get(`lm.rank${i + 1}.${oldP}`, '');
+  if (old === NONE) return NONE;
+  if (old && PROVIDER_IDS.includes(oldP)) return enc(oldP, old);
+  return DEFAULT_RANKS[i];
+}
+function rankValue(i: number): { provider: ProviderId; model: string } | null {
+  const v = rankSel[i].value;
+  if (!v || v === NONE) return null;
+  if (v.startsWith(CUSTOM)) { const m = rankCustom[i].value.trim(); return m ? { provider: v.slice(CUSTOM.length) as ProviderId, model: m } : null; }
+  return dec(v);
+}
 /** 실제 호출 순서 (사용 안 함·빈 칸·중복 제외) */
-function modelChain(): { rank: number; model: string }[] {
-  const out: { rank: number; model: string }[] = [];
-  RANKS.forEach((r, i) => { const m = rankValue(i); if (m && !out.some(x => x.model === m)) out.push({ rank: r, model: m }); });
+function modelChain(): RankPick[] {
+  const out: RankPick[] = [];
+  RANKS.forEach((r, i) => {
+    const v = rankValue(i);
+    if (v && v.model && !out.some(x => x.provider === v.provider && x.model === v.model)) out.push({ rank: r, ...v });
+  });
   return out;
 }
+const pickLabel = (c: RankPick) => `[${short(c.provider)}] ${c.model}`;
 let activeIdx = 0;                        // modelChain() 안에서 지금 쓰는 위치
-// Google AI Studio 실시간 모델 목록 (models.list 결과 캐시)
-let remoteModels: RemoteModel[] = (() => { try { const v = JSON.parse(ls.get('lm.gemModels', '[]')); return Array.isArray(v) ? v : []; } catch { return []; } })();
+// 서비스별 실시간 모델 목록 캐시
+const remote = Object.fromEntries(PROVIDER_IDS.map(p => {
+  const raw = ls.get(`lm.models.${p}`, p === 'gemini' ? ls.get('lm.gemModels', '[]') : '[]');
+  try { const v = JSON.parse(raw); return [p, Array.isArray(v) ? v : []]; } catch { return [p, []]; }
+})) as Record<ProviderId, RemoteModel[]>;
 const escAttr = (t: string) => t.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
-/** 드롭다운에 넣을 모델 목록 (Gemini: 내장 그룹 + AI Studio 에서 받은 추가 모델, 중복 제거) */
-function modelOptions(p: ProviderId): { html: string; ids: string[] } {
-  if (p !== 'gemini') { const m = PROVIDERS[p].models; return { html: m.map(x => `<option>${escAttr(x)}</option>`).join(''), ids: [...m] }; }
-  const names = new Map(remoteModels.map(r => [r.id, r.displayName]));
-  const opt = (id: string) => `<option value="${escAttr(id)}">${escAttr(id)}${names.get(id) ? ` — ${escAttr(names.get(id)!)}` : ''}</option>`;
-  const ids: string[] = [];
-  let html = GEMINI_GROUPS.map(g => { ids.push(...g.models); return `<optgroup label="${escAttr(g.label)}">${g.models.map(opt).join('')}</optgroup>`; }).join('');
-  const extra = remoteModels.map(r => r.id).filter(id => !ids.includes(id)).sort((a, b) => b.localeCompare(a));
-  if (extra.length) { ids.push(...extra); html += `<optgroup label="AI Studio 실시간 목록 (추가 ${extra.length}개)">${extra.map(opt).join('')}</optgroup>`; }
-  return { html, ids };
+/** 드롭다운 목록: 서비스별 내장 묶음 + 실시간 목록에서 받은 추가 모델 + 서비스별 직접 입력 */
+function modelOptions(): { html: string; values: string[] } {
+  const values: string[] = [];
+  let html = '';
+  for (const p of PROVIDER_IDS) {
+    const names = new Map(remote[p].map(r => [r.id, r.displayName]));
+    const opt = (id: string) => { const v = enc(p, id); values.push(v); return `<option value="${escAttr(v)}">[${short(p)}] ${escAttr(id)}${names.get(id) ? ` — ${escAttr(names.get(id)!)}` : ''}</option>`; };
+    const known = PROVIDER_GROUPS[p].flatMap(g => g.models);
+    html += PROVIDER_GROUPS[p].map(g => `<optgroup label="${escAttr(g.label)}">${g.models.map(opt).join('')}</optgroup>`).join('');
+    const extra = remote[p].map(r => r.id).filter(id => !known.includes(id));
+    if (extra.length) html += `<optgroup label="${short(p)} · 실시간 목록 (추가 ${extra.length}개)">${extra.map(opt).join('')}</optgroup>`;
+  }
+  html += `<optgroup label="직접 입력">${PROVIDER_IDS.map(p => `<option value="${CUSTOM}${p}">✏️ ${short(p)} 모델 ID 직접 입력…</option>`).join('')}</optgroup>`;
+  return { html, values };
 }
 /** 1·2·3순위 드롭다운 채우기 (저장된 선택 유지) */
 function fillRankSelects() {
-  const p = provider(), { html, ids } = modelOptions(p), defs = defaultRanks(p);
+  const { html, values } = modelOptions();
   rankSel.forEach((sel, i) => {
-    sel.innerHTML = html + `<option value="${CUSTOM}">직접 입력…</option>`
-      + (i > 0 ? `<option value="${NONE}">사용 안 함 (None)</option>` : '');
-    const saved = ls.get(`lm.rank${i + 1}.${p}`, defs[i]);
-    const c = rankCustom[i];
+    sel.innerHTML = html + (i > 0 ? `<option value="${NONE}">사용 안 함 (None)</option>` : '');
+    const saved = savedRank(i), c = rankCustom[i];
     if (saved === NONE && i > 0) { sel.value = NONE; c.hidden = true; }
-    else if (ids.includes(saved)) { sel.value = saved; c.hidden = true; }
-    else { sel.value = CUSTOM; c.hidden = false; c.value = saved === NONE ? '' : saved; }
+    else if (values.includes(saved)) { sel.value = saved; c.hidden = true; }
+    else {
+      const d = dec(saved), p = d?.provider ?? 'gemini';
+      sel.value = CUSTOM + p; c.hidden = false; c.value = d?.model ?? '';
+      c.placeholder = `${i + 1}순위 ${short(p)} 모델 ID 직접 입력`;
+    }
   });
-  $('syncRow').hidden = p !== 'gemini';
   paintModelState();
 }
-function loadProviderUI() {
-  fillRankSelects();
-  apiKeyInp.value = ls.get(`lm.key.${provider()}`);
-  activeIdx = 0; paintModelState();
-  if (provider() === 'gemini' && apiKeyInp.value.trim()) void syncModels(true);
+function saveRank(i: number) {
+  const v = rankSel[i].value;
+  ls.set(`lm.rankx${i + 1}`, v.startsWith(CUSTOM) ? enc(v.slice(CUSTOM.length) as ProviderId, rankCustom[i].value.trim()) : v);
 }
-/** [🔄 AI Studio 모델 목록 불러오기] — GET v1beta/models → generateContent 지원 텍스트 모델만 병합 */
+/** 키 칸 옆 상태 + 키가 없는 서비스를 쓰는 순위 경고 */
+function paintKeys() {
+  const used = new Set(modelChain().map(c => c.provider));
+  for (const p of PROVIDER_IDS) {
+    const el = $(`keyState-${p}`), has = !!apiKey(p);
+    el.className = `keystate ${has ? 'ok' : 'no'}`;
+    el.textContent = has ? '✓ 저장됨' : used.has(p) ? '⚠️ 순위에 있는데 키 없음' : '없음';
+  }
+}
+/** [🔄 모델 목록 불러오기] — 키가 있는 서비스의 텍스트 모델 목록을 받아 드롭다운에 합침 */
 let syncing = false;
-async function syncModels(silent = false) {
-  const key = apiKeyInp.value.trim(), info = $('syncInfo');
-  if (provider() !== 'gemini') return;
-  if (!key) { if (!silent) info.textContent = '⚠️ API Key 를 먼저 입력하세요'; return; }
+async function syncModels(silent = false, only?: ProviderId[]) {
+  const info = $('syncInfo');
+  const targets = PROVIDER_IDS.filter(p => apiKey(p) && (!only || only.includes(p)));
+  if (!targets.length) { if (!silent) info.textContent = '⚠️ API 키를 먼저 입력하세요'; return; }
   if (syncing) return;
-  syncing = true; info.textContent = '🔄 AI Studio 모델 목록 불러오는 중…';
-  try {
-    const list = await listGeminiModels(key);
-    remoteModels = list; ls.set('lm.gemModels', JSON.stringify(list)); ls.set('lm.gemModelsAt', String(Date.now()));
-    const known = PROVIDERS.gemini.models, extra = list.filter(r => !known.includes(r.id)).length;
-    fillRankSelects();
-    info.textContent = `✅ ${new Date().toLocaleTimeString()} · 텍스트 출력 모델 ${list.length}개 수신 (내장 목록에 없던 ${extra}개 추가)`;
-  } catch (e) {
-    info.textContent = `⛔ 모델 목록 불러오기 실패: ${(e as Error).message.slice(0, 90)}`;
-  } finally { syncing = false; }
+  syncing = true; info.textContent = `🔄 ${targets.map(short).join(' · ')} 모델 목록 불러오는 중…`;
+  const parts: string[] = [];
+  await Promise.all(targets.map(async p => {
+    try {
+      const list = await listModels(p, apiKey(p));
+      remote[p] = list; ls.set(`lm.models.${p}`, JSON.stringify(list));
+      const known = PROVIDERS[p].models, extra = list.filter(r => !known.includes(r.id)).length;
+      parts.push(`✅ ${short(p)} ${list.length}개${extra ? ` (새 ${extra}개)` : ''}`);
+    } catch (e) {
+      parts.push(`⛔ ${short(p)} ${(e as Error).message.slice(0, 60)}`);
+    }
+  }));
+  syncing = false;
+  fillRankSelects();
+  info.textContent = `${new Date().toLocaleTimeString()} · ${parts.join(' · ')}`;
 }
 let syncTimer = 0;
-const saveRank = (i: number) => ls.set(`lm.rank${i + 1}.${provider()}`, rankSel[i].value === CUSTOM ? rankCustom[i].value.trim() : rankSel[i].value);
-const currentModel = () => modelChain()[activeIdx]?.model ?? '';
+const syncPending = new Set<ProviderId>();
+const currentModel = () => { const c = modelChain()[activeIdx]; return c ? pickLabel(c) : ''; };
 /** 메인 화면 상단: 지금 쓰는 모델 */
 function paintModelState() {
   const el = $('modelState'), chain = modelChain(), cur = chain[activeIdx];
   el.classList.toggle('fallback', !aiPaused && activeIdx > 0);
   el.classList.toggle('dead', aiPaused || !cur);
-  el.textContent = aiPaused ? '❌ 1~3순위 한도 소진 · AI 정지' : cur ? `${activeIdx === 0 ? '🟢' : '🟡'} ${cur.rank}순위: ${cur.model}` : '⚠️ 모델 미설정';
-  el.title = chain.map(c => `${c.rank}순위: ${c.model}`).join(' → ');
+  el.textContent = aiPaused ? '❌ 1~3순위 한도 소진 · AI 정지'
+    : cur ? `${activeIdx === 0 ? '🟢' : '🟡'} ${cur.rank}순위: ${pickLabel(cur)}${apiKey(cur.provider) ? '' : ' (키 없음)'}` : '⚠️ 모델 미설정';
+  el.title = chain.map(c => `${c.rank}순위: ${pickLabel(c)}`).join(' → ');
+  paintKeys();
 }
 /** 모델 설정 변경·[모델 순위 초기화] → 1순위부터 다시 */
 function resetModelRank(msg?: string) {
@@ -254,18 +297,27 @@ function resetModelRank(msg?: string) {
   if (aiPaused) resumeAi(); else paintModelState();
   if (msg) setStatus(msg);
 }
-providerSel.onchange = () => { ls.set('lm.provider', provider()); loadProviderUI(); resetModelRank(); };
 rankSel.forEach((sel, i) => {
-  sel.onchange = () => { rankCustom[i].hidden = sel.value !== CUSTOM; saveRank(i); resetModelRank('모델 순위 변경 → 1순위부터 사용'); };
+  sel.onchange = () => {
+    const custom = sel.value.startsWith(CUSTOM);
+    rankCustom[i].hidden = !custom;
+    if (custom) { const p = sel.value.slice(CUSTOM.length) as ProviderId; rankCustom[i].placeholder = `${i + 1}순위 ${short(p)} 모델 ID 직접 입력`; rankCustom[i].focus(); }
+    saveRank(i); resetModelRank('모델 순위 변경 → 1순위부터 사용');
+  };
   rankCustom[i].oninput = () => { saveRank(i); resetModelRank(); };
 });
-$('prioReset').onclick = () => { resetModelRank(`🔄 모델 순위 초기화 → 1순위(${modelChain()[0]?.model ?? '-'})부터 사용`); };
-apiKeyInp.oninput = () => {
-  ls.set(`lm.key.${provider()}`, apiKeyInp.value.trim()); if (aiPaused) resetModelRank();
-  clearTimeout(syncTimer); syncTimer = window.setTimeout(() => void syncModels(true), 1200);   // 키 입력이 끝나면 자동 동기화
-};
+$('prioReset').onclick = () => { const c = modelChain()[0]; resetModelRank(`🔄 모델 순위 초기화 → 1순위(${c ? pickLabel(c) : '-'})부터 사용`); };
+for (const p of PROVIDER_IDS) {
+  keyInp[p].value = ls.get(`lm.key.${p}`);
+  keyInp[p].oninput = () => {
+    ls.set(`lm.key.${p}`, apiKey(p)); paintModelState(); if (aiPaused) resetModelRank();
+    syncPending.add(p);   // 키 입력이 끝나면 입력한 서비스들의 목록을 한 번에 자동 동기화
+    clearTimeout(syncTimer); syncTimer = window.setTimeout(() => { const only = [...syncPending]; syncPending.clear(); void syncModels(true, only); }, 1200);
+  };
+}
 $('syncModels').onclick = () => void syncModels();
-loadProviderUI();
+fillRankSelects();
+if (hasAnyKey()) void syncModels(true);
 
 // ───────── ⚙️ 설정: 슬라이더 (왼쪽 = 둔감 · 오른쪽 = 예민) ─────────
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Number.isFinite(x) ? x : lo));
@@ -1017,8 +1069,7 @@ async function analyze() {
   // 로컬 dB 변화량/편차 필터 없음: 무음(게이트)이 아니면 매 주기 WAV + DSP 를 AI 로 보내고, 조언 기준은 민감도 단계로 AI 가 판단
   const level = sens;
   if (inFlight) return;
-  const key = apiKeyInp.value.trim();
-  if (!key) { setStatus('⚙️ 설정에서 API Key를 입력하면 AI 조언이 시작됩니다'); setAiLast(`${modeInfo}\nAPI Key 없음 → AI 호출 안 함`); return; }
+  if (!hasAnyKey()) { setStatus('⚙️ 설정에서 API Key를 입력하면 AI 조언이 시작됩니다'); setAiLast(`${modeInfo}\nAPI Key 없음 → AI 호출 안 함`); return; }
   const tempoTxt = dyn.tempo.bpm ? `템포 약 ${dyn.tempo.bpm} BPM (신뢰도 ${dyn.tempo.confidence})` : '템포 불분명';
   const gateInfo = `${modeInfo}\n측정: ${srcStat.analyser}틱${srcStat.cached ? ` (무음 캐시 대체 ${srcStat.cached}틱)` : ''} · ${tempoTxt}\n`
     + `조언 민감도 ${level}단계 · ${SENS_LABEL[level]} (최대 ${SENS_MAX[level]}줄) · 매 주기 AI 전송`;
@@ -1073,28 +1124,40 @@ async function analyze() {
       setAiLast(`${gateInfo}\n🔇 무음 차단: 최근 WAV 평균 RMS ${clipDb <= -120 ? '무음' : clipDb + ' dBFS'} (기준 ${floorDb} dBFS) → API 호출 취소`);
       return;
     }
-    let wav: Awaited<ReturnType<typeof encodeWav>> | null = null;
+    // WAV 는 오디오를 듣는 서비스(Gemini)를 실제로 부를 때만 한 번 만든다
+    let wav: Awaited<ReturnType<typeof encodeWav>> | null = null, wavTried = false;
+    const getWav = async () => {
+      if (!wavTried) { wavTried = true; try { wav = await encodeWav(clip, wavFmt); } catch (e) { console.warn('WAV 인코딩 실패 (수치만 전송)', e); } }
+      return wav;
+    };
     const extra: Record<string, unknown> = { lastClip: { ...analyzeClip(clip), rmsDbStereo: clipDb } };   // 정규화 전 원본 수치
-    if (supportsAudio(provider())) {
-      try { wav = await encodeWav(clip, wavFmt); extra.audio = { seconds: wav.seconds, sampleRate: wavFmt.rate, channels: wavFmt.channels, bitDepth: 16, gainDb: wav.gainDb }; }
-      catch (e) { console.warn('WAV 인코딩 실패 (수치만 전송)', e); }
-    }
-    const hasAudio = !!wav;
-    const sys = buildSystemPrompt(level, hasAudio, { label: wavLabel(wavFmt), stereo: wavFmt.channels === 2 });
-    const user = `${hasAudio ? `첨부 오디오: 최근 ${wav!.seconds}초 실제 소리 (${wavLabel(wavFmt)} 16-bit WAV · ${wavFmt.channels === 2 ? 'L/R 독립' : 'L+R 합산'} · 피크 -1dBFS 정규화 ${wav!.gainDb >= 0 ? '+' : ''}${wav!.gainDb}dB · 텍스트 dB 수치는 원본).\n` : ''}최근 ${windowSec}초 분석 데이터(JSON):\n${JSON.stringify({ ...payload, ...extra })}`;
-    // 1·2·3순위 자동 폴백: 한도 소진이면 다음 순위로 바꿔 같은 데이터로 즉시 재요청
-    let raw = '';
+    // 1·2·3순위 자동 폴백 (서비스 혼합): 순위마다 그 서비스의 키로 호출. 한도 소진·키 오류·모델 없음이면 다음 순위로 즉시 재요청
+    let raw = '', hasAudio = false;
     for (;;) {
-      const chain = modelChain(), cur = chain[activeIdx];
-      if (!cur) throw new Error('설정에서 1순위 모델을 입력하세요');
-      try { raw = await callAI(provider(), cur.model, key, sys, user, wav?.base64, hasAudio); break; }   // 오디오 첨부 시 2단계 JSON 응답
-      catch (e) {
-        if (!isQuotaError(e)) throw e;
-        const next = chain[activeIdx + 1];
-        if (!next) { pauseForQuota(); return; }
-        showNotice(`⚠️ ${cur.model} API 한도가 소진되어 ${next.rank}순위 모델(${next.model})로 자동 전환합니다.`);
+      const chain = modelChain(), cur = chain[activeIdx], next = chain[activeIdx + 1];
+      if (!cur) throw new Error('설정에서 1순위 모델을 고르세요');
+      const key = apiKey(cur.provider);
+      if (!key) {
+        if (!next) { setStatus(`⚙️ ${cur.rank}순위(${short(cur.provider)})의 API 키가 없습니다 — 설정에서 입력하세요`); setAiLast(`${gateInfo}\n${pickLabel(cur)} · ${short(cur.provider)} API 키 없음 → 호출 안 함`); return; }
+        showNotice(`⚠️ ${cur.rank}순위 ${pickLabel(cur)} — ${short(cur.provider)} API 키가 없어 ${next.rank}순위 모델(${pickLabel(next)})로 넘어갑니다.`);
         activeIdx++; paintModelState();
-        setStatus(`${next.rank}순위 모델(${next.model})로 재요청 중…`);
+        continue;
+      }
+      const w = supportsAudio(cur.provider) ? await getWav() : null;
+      hasAudio = !!w;
+      const ex = hasAudio ? { ...extra, audio: { seconds: w!.seconds, sampleRate: wavFmt.rate, channels: wavFmt.channels, bitDepth: 16, gainDb: w!.gainDb } } : extra;
+      const sys = buildSystemPrompt(level, hasAudio, { label: wavLabel(wavFmt), stereo: wavFmt.channels === 2 });
+      const user = `${hasAudio ? `첨부 오디오: 최근 ${w!.seconds}초 실제 소리 (${wavLabel(wavFmt)} 16-bit WAV · ${wavFmt.channels === 2 ? 'L/R 독립' : 'L+R 합산'} · 피크 -1dBFS 정규화 ${w!.gainDb >= 0 ? '+' : ''}${w!.gainDb}dB · 텍스트 dB 수치는 원본).\n` : ''}최근 ${windowSec}초 분석 데이터(JSON):\n${JSON.stringify({ ...payload, ...ex })}`;
+      try { raw = await callAI(cur.provider, cur.model, key, sys, user, w?.base64, hasAudio); break; }   // Gemini + 오디오면 JSON 응답
+      catch (e) {
+        const quota = isQuotaError(e), auth = isAuthError(e), noModel = isModelError(e);
+        if (!quota && !auth && !noModel) throw e;
+        if (!next) { if (quota) { pauseForQuota(); return; } throw e; }
+        showNotice(quota
+          ? `⚠️ ${cur.model} API 한도가 소진되어 ${next.rank}순위 모델(${next.model})로 자동 전환합니다.`
+          : `⚠️ ${pickLabel(cur)} ${auth ? `— ${short(cur.provider)} API 키 오류` : '— 모델을 찾을 수 없음'} → ${next.rank}순위 모델(${pickLabel(next)})로 자동 전환합니다.`);
+        activeIdx++; paintModelState();
+        setStatus(`${next.rank}순위 모델(${pickLabel(next)})로 재요청 중…`);
         if (!running) return;
       }
     }
@@ -1110,8 +1173,9 @@ async function analyze() {
     addHistory(good ? (wasGood ? [] : [GOOD_MIX_LINE]) : added.map(a => a.text));   // 믹스 양호는 바뀔 때 한 번만 기록
     paintDetails(res, [...added.map(a => a.text), ...advice.displayList().map(i => i.text)], hasAudio);   // 지금 HUD 에 떠 있는 것은 표시 중
     const text = raw.trim().replace(/\s+/g, ' ');
+    const wv = wav as Awaited<ReturnType<typeof encodeWav>> | null;   // getWav() 안에서 채워짐
     const audioInfo = `🤖 ${modelChain()[activeIdx]?.rank ?? '-'}순위: ${currentModel()}\n`
-      + (hasAudio ? `🎧 최근 ${wav!.seconds}초 오디오 첨부 (${wavLabel(wavFmt)} 16-bit WAV · ${Math.round(wav!.bytes / 1024)}KB · 원본 평균 ${clipDb} dBFS · 피크 -1dBFS 정규화 ${wav!.gainDb >= 0 ? '+' : ''}${wav!.gainDb}dB · ${clipHealthText()})` : '🎧 오디오 첨부 없음 (이 AI 공급자는 수치만 전송)')
+      + (hasAudio && wv ? `🎧 최근 ${wv!.seconds}초 오디오 첨부 (${wavLabel(wavFmt)} 16-bit WAV · ${Math.round(wv!.bytes / 1024)}KB · 원본 평균 ${clipDb} dBFS · 피크 -1dBFS 정규화 ${wv!.gainDb >= 0 ? '+' : ''}${wv!.gainDb}dB · ${clipHealthText()})` : '🎧 오디오 첨부 없음 (ChatGPT·Claude 는 분석 수치만 전송 · 소리는 Gemini 만 들음)')
       + (res.heard ? `\n👂 AI 청취: [${res.heard.sources.join(', ')}] · 장르 근거: ${res.heard.reasoning}` : '')
       + (res.mixStatus ? `\n🎚️ 믹스 상태: ${res.mixStatus}` : '')
       + (res.rejected.length ? `\n🚫 교차 검증 제외(들리지 않은 대상): ${res.rejected.join(' / ')}` : '');
@@ -1263,7 +1327,7 @@ mirror.onInfo = i => {
 
 // ───────── 초기 렌더 + G2 연결 ─────────
 paintGenre(); render(); renderCooldown(); renderBandTable($('bandTable'), null);
-setStatus(apiKeyInp.value.trim() ? '시작을 누르세요' : '⚙️ 설정에서 API Key를 입력한 뒤 시작을 누르세요');
+setStatus(hasAnyKey() ? '시작을 누르세요' : '⚙️ 설정에서 API Key를 입력한 뒤 시작을 누르세요');
 mirror.start();
 glasses.init().then(ok => {
   if (ok && !running && !starting) setStatus('G2 연결됨 · 시작을 누르세요');

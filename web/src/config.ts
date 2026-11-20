@@ -11,11 +11,28 @@ export const GEMINI_GROUPS: { label: string; models: string[] }[] = [
   { label: 'Gemini 2.0 · 기타 텍스트 출력', models: ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-2.0-pro-exp', 'gemini-exp-1206', 'learnlm-2.0-flash-experimental'] },
 ];
 
-export const PROVIDERS: Record<ProviderId, { label: string; models: string[] }> = {
-  gemini: { label: 'Google Gemini', models: GEMINI_GROUPS.flatMap(g => g.models) },
-  openai: { label: 'OpenAI', models: ['gpt-4o-mini', 'gpt-4o'] },
-  claude: { label: 'Anthropic Claude', models: ['claude-3-5-sonnet-latest', 'claude-3-5-haiku-latest'] },
+/** OpenAI(ChatGPT) 텍스트 출력 모델 — OpenAI 모델 문서 기준 (API Key 가 있으면 /v1/models 로 실시간 병합) */
+export const OPENAI_GROUPS: { label: string; models: string[] }[] = [
+  { label: 'ChatGPT · GPT-6', models: ['gpt-6.2-astra', 'gpt-6.2-sol', 'gpt-6.1-terra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'] },
+  { label: 'ChatGPT · GPT-5', models: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.5-pro', 'gpt-5.4', 'gpt-5.4-mini'] },
+  { label: 'ChatGPT · 이전 (종료 예정)', models: ['gpt-5.1', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4o', 'gpt-4o-mini'] },
+];
+/** Anthropic Claude 텍스트 출력 모델 — Claude 모델 문서(Models overview) 기준 (API Key 가 있으면 /v1/models 로 실시간 병합) */
+export const CLAUDE_GROUPS: { label: string; models: string[] }[] = [
+  { label: 'Claude · 최신', models: ['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5', 'claude-fable-5-2'] },
+  { label: 'Claude · 이전', models: ['claude-fable-5-1', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-opus-4-5', 'claude-sonnet-4-5', 'claude-haiku-4-5'] },
+];
+/** 공급자별 드롭다운 묶음 */
+export const PROVIDER_GROUPS: Record<ProviderId, { label: string; models: string[] }[]> = {
+  gemini: GEMINI_GROUPS, openai: OPENAI_GROUPS, claude: CLAUDE_GROUPS,
 };
+
+export const PROVIDERS: Record<ProviderId, { label: string; short: string; keyHint: string; models: string[] }> = {
+  gemini: { label: 'Google Gemini', short: 'Gemini', keyHint: 'aistudio.google.com 에서 발급', models: GEMINI_GROUPS.flatMap(g => g.models) },
+  openai: { label: 'OpenAI ChatGPT', short: 'ChatGPT', keyHint: 'platform.openai.com 에서 발급 (sk-…)', models: OPENAI_GROUPS.flatMap(g => g.models) },
+  claude: { label: 'Anthropic Claude', short: 'Claude', keyHint: 'platform.claude.com 에서 발급 (sk-ant-…)', models: CLAUDE_GROUPS.flatMap(g => g.models) },
+};
+export const PROVIDER_IDS: ProviderId[] = ['gemini', 'openai', 'claude'];
 
 export const BANDS = [
   { name: 'Sub', lo: 20, hi: 60 },

@@ -153,11 +153,24 @@
         <button class="icon" value="close" aria-label="닫기">✕</button>
       </div>
 
-      <h3>AI</h3>
-      <label>AI 서비스 <select id="provider"></select></label>
+      <h3>AI · API 키</h3>
+      <div class="keys">
+        <label>Gemini API Key <small id="keyState-gemini" class="keystate"></small>
+          <input id="key-gemini" type="password" autocomplete="off" placeholder="aistudio.google.com 에서 발급 (입력 즉시 저장)" />
+        </label>
+        <label>ChatGPT (OpenAI) API Key <small id="keyState-openai" class="keystate"></small>
+          <input id="key-openai" type="password" autocomplete="off" placeholder="platform.openai.com 에서 발급 · sk-…" />
+        </label>
+        <label>Claude (Anthropic) API Key <small id="keyState-claude" class="keystate"></small>
+          <input id="key-claude" type="password" autocomplete="off" placeholder="platform.claude.com 에서 발급 · sk-ant-…" />
+        </label>
+      </div>
+      <div class="hint">키는 이 기기(브라우저·앱)에만 저장되며 각 AI 회사 API로 직접 전송됩니다. 쓰려는 서비스의 키만 넣으면 됩니다.</div>
+
+      <h3>AI 모델 1·2·3순위 <small>Gemini · ChatGPT · Claude 섞어서 선택</small></h3>
       <div id="syncRow" class="sync-row">
-        <button id="syncModels" class="small" type="button">🔄 AI Studio 모델 목록 불러오기</button>
-        <div id="syncInfo" class="hint">API Key 가 있으면 AI Studio 에서 텍스트 출력(generateContent) 모델 목록을 자동으로 받아 아래 드롭다운에 합칩니다.</div>
+        <button id="syncModels" class="small" type="button">🔄 모델 목록 불러오기 (키가 있는 서비스)</button>
+        <div id="syncInfo" class="hint">키가 있으면 각 서비스에서 지금 쓸 수 있는 텍스트 모델 목록을 받아 아래 드롭다운에 합칩니다.</div>
       </div>
       <div class="prio">
         <label>1순위 모델 <select id="model1"></select></label>
@@ -168,11 +181,8 @@
         <input id="custom3" type="text" placeholder="3순위 모델 ID 직접 입력" hidden />
       </div>
       <button id="prioReset" class="small" type="button">🔄 모델 순위 초기화 (1순위부터 다시)</button>
-      <div class="hint">API 한도(429 · RESOURCE_EXHAUSTED · quota · rate limit)가 소진되면 다음 순위 모델로 자동 전환해 같은 데이터로 즉시 다시 요청합니다.</div>
-      <label>API Key
-        <input id="apiKey" type="password" autocomplete="off" placeholder="선택한 AI의 API Key (입력 즉시 저장)" />
-      </label>
-      <div class="hint">키는 이 브라우저(localStorage)에만 저장되며 AI 제조사 API로 직접 전송됩니다.</div>
+      <div class="hint">API 한도(429 · quota · rate limit)가 소진되거나 키·모델 오류가 나면 다음 순위 모델로 자동 전환해 같은 데이터로 즉시 다시 요청합니다.
+        🎧 소리(WAV)를 직접 듣는 것은 Gemini 만 가능하고, ChatGPT·Claude 는 분석 수치만 보고 판단합니다.</div>
 
       <h3>조언 민감도 <small id="tolInfo"></small></h3>
       <div class="sens3" role="radiogroup" aria-label="조언 민감도">

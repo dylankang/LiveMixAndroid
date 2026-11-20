@@ -200,18 +200,30 @@ export class ApiError extends Error {
 export function isQuotaError(e: unknown): boolean {
   if (e instanceof ApiError && e.status === 429) return true;
   const msg = e instanceof Error ? e.message : String(e);
-  return /RESOURCE_EXHAUSTED|quota exceeded|exceeded your current quota|insufficient_quota/i.test(msg);
+  return /RESOURCE_EXHAUSTED|quota exceeded|exceeded your current quota|insufficient_quota|rate_limit_exceeded|rate_limit_error|credit balance is too low/i.test(msg);
+}
+/** API 키가 없거나 틀림 / 권한 없음 (401·403) → 그 순위는 건너뛰고 다음 순위로 */
+export function isAuthError(e: unknown): boolean {
+  if (e instanceof ApiError && (e.status === 401 || e.status === 403)) return true;
+  const msg = e instanceof Error ? e.message : String(e);
+  return /API_KEY_INVALID|invalid_api_key|authentication_error|Incorrect API key|permission_error/i.test(msg);
+}
+/** 모델 이름이 없거나 이 키로 쓸 수 없는 모델 (404 / model_not_found) → 다음 순위로 */
+export function isModelError(e: unknown): boolean {
+  if (e instanceof ApiError && e.status === 404) return true;
+  const msg = e instanceof Error ? e.message : String(e);
+  return /model_not_found|not_found_error|does not exist|is not found for API version|not supported for generateContent/i.test(msg);
 }
 
 /**
  * 안전한 fetch: 타임아웃으로 직접 abort 한 경우와 그 외 abort 를 구분해 사람이 읽을 수 있는 오류로 바꾼다.
  * ("signal is aborted without reason" 같은 원시 메시지가 화면에 나오지 않도록)
  */
-async function post(url: string, headers: Record<string, string>, body: unknown): Promise<any> {
+async function post(url: string, headers: Record<string, string>, body: unknown, minTimeoutMs = 0): Promise<any> {
   const ctl = new AbortController();
   let timedOut = false;
   const payload = JSON.stringify(body);
-  const limit = timeoutFor(payload.length);
+  const limit = Math.max(timeoutFor(payload.length), minTimeoutMs);
   const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, limit);
   try {
     const res = await fetch(url, {
@@ -291,25 +303,40 @@ export async function callAI(provider: ProviderId, model: string, apiKey: string
       return (j.candidates?.[0]?.content?.parts ?? []).filter((p: any) => !p.thought).map((p: any) => p.text ?? '').join('');
     }
     case 'openai': {
-      const j = await post('https://api.openai.com/v1/chat/completions', { Authorization: `Bearer ${apiKey}` }, {
-        model, temperature: GEN.temperature, top_p: GEN.topP, max_tokens: 300,
-        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }],
-      });
-      return j.choices?.[0]?.message?.content ?? '';
+      // GPT-5 이후(추론 모델)는 temperature·max_tokens 대신 max_completion_tokens + reasoning_effort 를 쓴다
+      const url = 'https://api.openai.com/v1/chat/completions', h = { Authorization: `Bearer ${apiKey}` };
+      const messages = [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }];
+      const reasoning = /^(gpt-([5-9]|\d{2})|o\d)/i.test(model);
+      const body = reasoning
+        ? { model, messages, max_completion_tokens: 4000, reasoning_effort: 'low' }
+        : { model, messages, temperature: GEN.temperature, top_p: GEN.topP, max_tokens: 800 };
+      let j: any;
+      try { j = await post(url, h, body, TEXT_TIMEOUT_MS); }
+      catch (e) {
+        // 모델이 특정 파라미터를 받지 않으면(400) 최소 본문으로 한 번 더
+        if (!(e instanceof ApiError && e.status === 400 && /unsupported|not supported|unrecognized|unknown parameter|invalid_request/i.test(e.message))) throw e;
+        j = await post(url, h, { model, messages, max_completion_tokens: 4000 }, TEXT_TIMEOUT_MS);
+      }
+      const c = j.choices?.[0]?.message?.content;
+      return typeof c === 'string' ? c : Array.isArray(c) ? c.map((p: any) => p.text ?? '').join('') : '';
     }
     case 'claude': {
+      // 최신 Claude 는 생각(thinking)이 기본 → 출력 여유를 크게, temperature 는 보내지 않음(일부 모델 미지원)
       const j = await post('https://api.anthropic.com/v1/messages', {
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
         'anthropic-dangerous-direct-browser-access': 'true', // 브라우저 CORS 허용
       }, {
-        model, max_tokens: 300, temperature: GEN.temperature, system: systemPrompt,
+        model, max_tokens: 4000, system: systemPrompt,
         messages: [{ role: 'user', content: userContent }],
-      });
+      }, TEXT_TIMEOUT_MS);
       return (j.content ?? []).filter((b: any) => b.type === 'text').map((b: any) => b.text).join('');
     }
   }
 }
+
+/** ChatGPT·Claude 는 오디오 없이 텍스트만 보내지만 추론 시간이 길 수 있어 응답 대기 한도를 넉넉히 */
+const TEXT_TIMEOUT_MS = 25_000;
 
 export interface Genre { category: string; instrument?: string; kind: 'music' | 'speech' | 'solo' }
 export interface Heard { reasoning: string; sources: string[] }
@@ -439,6 +466,30 @@ function parseJsonReply(raw: string): ParsedReply | null {
 export interface RemoteModel { id: string; displayName: string }
 /** 텍스트 출력이 아닌 모델(임베딩·이미지·비디오·음성합성·AQA 등) */
 const NON_TEXT = /embed|imagen|veo|tts|aqa|image-generation|-image(-|$)|native-audio|-live-|^gemini-live/i;
+/** 공급자별 실시간 모델 목록 (텍스트 출력 모델만) */
+export async function listModels(p: ProviderId, apiKey: string): Promise<RemoteModel[]> {
+  if (p === 'gemini') return listGeminiModels(apiKey);
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 10_000);
+  try {
+    if (p === 'openai') {
+      const res = await fetch('https://api.openai.com/v1/models', { headers: { Authorization: `Bearer ${apiKey}` }, signal: ctl.signal });
+      const text = await res.text();
+      if (!res.ok) throw new ApiError(res.status, `HTTP ${res.status}: ${text.slice(0, 160)}`);
+      const ids: string[] = (JSON.parse(text).data ?? []).map((m: any) => String(m.id));
+      // 텍스트(Chat Completions) 모델만: 이미지·음성·실시간·전사·임베딩·검열·검색·전문(사이버·생명과학) 제외
+      return ids.filter(id => /^(gpt-|o\d|chatgpt-)/i.test(id)
+        && !/image|audio|realtime|tts|transcribe|whisper|embedding|moderation|search|dall-e|live|translate|cyber|rosalind|computer-use|instruct/i.test(id))
+        .sort((a, b) => b.localeCompare(a)).map(id => ({ id, displayName: '' }));
+    }
+    const res = await fetch('https://api.anthropic.com/v1/models?limit=1000', {
+      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' }, signal: ctl.signal });
+    const text = await res.text();
+    if (!res.ok) throw new ApiError(res.status, `HTTP ${res.status}: ${text.slice(0, 160)}`);
+    return (JSON.parse(text).data ?? []).map((m: any) => ({ id: String(m.id), displayName: String(m.display_name ?? '') }))
+      .filter((m: RemoteModel) => /^claude-/.test(m.id) && !/mythos/i.test(m.id));
+  } finally { clearTimeout(timer); }
+}
+
 export async function listGeminiModels(apiKey: string): Promise<RemoteModel[]> {
   const out: RemoteModel[] = [];
   let token = '';
