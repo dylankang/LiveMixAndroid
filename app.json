@@ -1,0 +1,6 @@
+{
+  "name": "Live Mix Assistant G2",
+  "version": "1.0.0",
+  "description": "FOH Live Mix Assistant for Even Realities G2",
+  "permissions": ["phone-microphone", "microphone"]
+}
