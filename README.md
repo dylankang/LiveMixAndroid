@@ -1,6 +1,7 @@
 # Live Mix Assistant G2 — Android APK (릴리즈 서명)
 
 - 최신: [LiveMixAssistant-latest.apk](https://github.com/dylankang/LiveMixAndroid/raw/apk/LiveMixAssistant-latest.apk)
+- v1.2.4: [LiveMixAssistant-v1.2.4.apk](https://github.com/dylankang/LiveMixAndroid/raw/apk/LiveMixAssistant-v1.2.4.apk) — Gemini·ChatGPT·Claude 모델 혼합 순위 + 서비스별 API 키
 - v1.2.3: [LiveMixAssistant-v1.2.3.apk](https://github.com/dylankang/LiveMixAndroid/raw/apk/LiveMixAssistant-v1.2.3.apk) — 레벨 밸런스 우선 · 묻힌 소리 찾기 · 드럼 개별 마이크
 - v1.2.2: [LiveMixAssistant-v1.2.2.apk](https://github.com/dylankang/LiveMixAndroid/raw/apk/LiveMixAssistant-v1.2.2.apk) — USB 오디오 인터페이스 스테레오 입력 (모노 인식 수정)
 - v1.2.1: [LiveMixAssistant-v1.2.1.apk](https://github.com/dylankang/LiveMixAndroid/raw/apk/LiveMixAssistant-v1.2.1.apk) — 화면 꺼짐 30초~1분 뒤 분석 멈춤 수정
